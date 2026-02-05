@@ -1,22 +1,19 @@
 use crate::{
     dbus::{
-        listener::QemuEvent,
         console::ConsoleController,
         keyboard::KeyboardController,
+        listener::QemuEvent,
         mouse::{Button as QemuButton, MouseController},
     },
     display::screen::{Screen, UpdateFlags},
 };
 use kanal::AsyncReceiver;
-use log::{warn, debug};
+use log::{debug, info, warn};
 use relm4::{
     gtk::{
-        self,
-        prelude::*,
-        glib,
-        ContentFit, Fixed, GraphicsOffload, GraphicsOffloadEnabled, Overlay, Picture,
-        EventControllerMotion, GestureClick, EventControllerKey, EventControllerScroll,
-        EventControllerScrollFlags, EventControllerFocus,
+        self, ContentFit, EventControllerFocus, EventControllerKey, EventControllerMotion, EventControllerScroll,
+        EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload, GraphicsOffloadEnabled, Overlay, Picture,
+        glib, prelude::*,
     },
     prelude::*,
 };
@@ -40,11 +37,9 @@ pub enum DisplayMsg {
 pub struct VmDisplayModel {
     pub screen: Screen,
     pub changes: UpdateFlags,
-    
     console_ctrl: ConsoleController,
     mouse_ctrl: MouseController,
     keyboard_ctrl: KeyboardController,
-
     widget_size: (f64, f64),
     last_sent_mouse: Option<(u32, u32)>,
 }
@@ -72,12 +67,7 @@ impl Component for VmDisplayModel {
     type Widgets = VmDisplayWidgets;
 
     fn init_root() -> Self::Root {
-        Overlay::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .focusable(true)
-            .can_focus(true)
-            .build()
+        Overlay::builder().hexpand(true).vexpand(true).focusable(true).can_focus(true).build()
     }
 
     fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
@@ -92,27 +82,56 @@ impl Component for VmDisplayModel {
         };
 
         let offload = GraphicsOffload::builder().enabled(GraphicsOffloadEnabled::Enabled).build();
-        let vm_picture = Picture::builder().can_shrink(true).content_fit(ContentFit::Contain).build();
+        
+        // Fix: Force Picture to fill available space even without content
+        // This prevents widget size from being 0x0 during initialization
+        let vm_picture = Picture::builder()
+            .can_shrink(true)
+            .content_fit(ContentFit::Contain)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
 
         let mut controllers = Vec::new();
 
+        // Fix: Monitor root widget allocation changes
+        // Use "allocation" not "surface" (surface only exists on Window/Native widgets)
         let sender_clone = sender.clone();
-        vm_picture.connect_notify_local(Some("allocation"), move |p, _| {
-            sender_clone.input(DisplayMsg::Resize(p.width(), p.height()));
+        root.connect_realize(move |root| {
+            let alloc = root.allocation();
+            #[allow(deprecated)]
+            sender_clone.input(DisplayMsg::Resize(alloc.width(), alloc.height()));
+        });
+        
+        // Also monitor for size changes after realization
+        let sender_clone = sender.clone();
+        root.connect_notify_local(Some("allocation"), move |obj, _| {
+            // Allocation changes when widget is resized
+            let alloc = obj.allocation();
+            #[allow(deprecated)]
+            sender_clone.input(DisplayMsg::Resize(alloc.width(), alloc.height()));
         });
 
+        // =========================================================
+        // CRITICAL FIX: Attach ALL input controllers to root instead of vm_picture
+        // This ensures mouse coordinates are in the same coordinate system
+        // as our size calculations (root.allocation), fixing coordinate mismatch
+        // =========================================================
+
+        // Motion (attached to root)
         let motion = EventControllerMotion::new();
         let sender_clone = sender.clone();
         motion.connect_motion(move |_, x, y| {
             sender_clone.input(DisplayMsg::MouseMove { x, y });
         });
-        vm_picture.add_controller(motion.clone());
+        root.add_controller(motion.clone());
         controllers.push(motion.upcast());
 
+        // Click + Focus (attached to root)
         let click = GestureClick::new();
         click.set_button(0);
         let sender_clone = sender.clone();
-        let root_clone = root.clone();
+        let root_clone = root.clone(); 
         click.connect_pressed(move |gesture, _, _, _| {
             root_clone.grab_focus();
             sender_clone.input(DisplayMsg::MouseButton { button: gesture.current_button(), pressed: true });
@@ -121,16 +140,17 @@ impl Component for VmDisplayModel {
         click.connect_released(move |gesture, _, _, _| {
             sender_clone.input(DisplayMsg::MouseButton { button: gesture.current_button(), pressed: false });
         });
-        vm_picture.add_controller(click.clone());
+        root.add_controller(click.clone());
         controllers.push(click.upcast());
 
+        // Scroll (attached to root)
         let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
         let sender_clone = sender.clone();
         scroll.connect_scroll(move |_, dx, dy| {
             sender_clone.input(DisplayMsg::Scroll { dx, dy });
             glib::Propagation::Proceed
         });
-        vm_picture.add_controller(scroll.clone());
+        root.add_controller(scroll.clone());
         controllers.push(scroll.upcast());
 
         let key = EventControllerKey::new();
@@ -157,7 +177,7 @@ impl Component for VmDisplayModel {
 
         offload.set_child(Some(&vm_picture));
         root.add_overlay(&offload);
-        
+
         let cursor_layer = Fixed::builder().can_target(false).hexpand(true).vexpand(true).build();
         let cursor_picture = Picture::builder().can_shrink(true).content_fit(ContentFit::Fill).build();
         cursor_layer.put(&cursor_picture, 0.0, 0.0);
@@ -179,15 +199,32 @@ impl Component for VmDisplayModel {
         match msg {
             DisplayMsg::Qemu(event) => {
                 if let Ok(flags) = self.screen.handle_event(event) {
-                    self.changes = flags;
+                    // IMPORTANT: Use bitwise OR accumulation (|=) not assignment (=)
+                    //
+                    // Why: QEMU sends CursorDefine and Scanout events almost simultaneously.
+                    // CursorDefine sets cursor flag, Scanout sets frame flag.
+                    // If we use assignment (=), the second event overwrites the first,
+                    // causing the cursor to never be rendered (texture exists but not applied).
+                    //
+                    // With accumulation (|=), both flags are preserved until update_view consumes them.
+                    // This ensures the cursor is always visible after initial definition.
+                    self.changes.cursor |= flags.cursor;
+                    self.changes.frame |= flags.frame;
                 }
             }
-            
+
             DisplayMsg::Resize(w, h) => {
+                // Diagnostic: Log ALL resize events to verify they're arriving
+                static RESIZE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let count = RESIZE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count < 3 {
+                    info!("[UI] Resize Event #{}: {}x{}", count + 1, w, h);
+                }
+
                 self.changes.cursor = true;
                 self.changes.frame = true;
                 self.widget_size = (w as f64, h as f64);
-                
+
                 if w > 0 && h > 0 {
                     let console = self.console_ctrl.clone();
                     let w_mm = (w as f64 * 0.264) as u16;
@@ -204,7 +241,35 @@ impl Component for VmDisplayModel {
                 let (vm_w, vm_h) = self.screen.resolution();
                 let (w, h) = self.widget_size;
 
-                if vm_w == 0 || vm_h == 0 || w <= 0.0 || h <= 0.0 { return; }
+                // WORKAROUND: If widget size is 0x0, try to get it from root
+                // This handles the case where resize events haven't fired yet
+                let (w, h) = if (w <= 0.0 || h <= 0.0) && vm_w > 0 && vm_h > 0 {
+                    // Get size from root widget via the overlay reference
+                    // We need to pass root to update, but we don't have it here
+                    // For now, just use VM resolution as fallback
+                    info!("[UI] Widget size not set yet, using VM resolution {}x{} as fallback", vm_w, vm_h);
+                    (vm_w as f64, vm_h as f64)
+                } else {
+                    (w, h)
+                };
+
+                // Diagnostic: Identify why mouse moves are being dropped
+                if vm_w == 0 || vm_h == 0 {
+                    static VM_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                    if VM_WARN.load(std::sync::atomic::Ordering::Relaxed) && w > 0.0 {
+                        warn!("[UI] DROP Move: VM Resolution is 0x0 (UI ready but no frame yet)");
+                        VM_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
+                if w <= 0.0 || h <= 0.0 {
+                    static WIDGET_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                    if WIDGET_WARN.load(std::sync::atomic::Ordering::Relaxed) {
+                        warn!("[UI] DROP Move: Widget size is {:.0}x{:.0} (Picture not allocated yet)", w, h);
+                        WIDGET_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
 
                 let scale = (w / vm_w as f64).min(h / vm_h as f64);
                 let drawn_w = vm_w as f64 * scale;
@@ -215,21 +280,28 @@ impl Component for VmDisplayModel {
                 let vm_input_x = (x - offset_x) / scale;
                 let vm_input_y = (y - offset_y) / scale;
 
-                if vm_input_x >= 0.0 && vm_input_x < vm_w as f64 && 
-                   vm_input_y >= 0.0 && vm_input_y < vm_h as f64 {
-                    
+                if vm_input_x >= 0.0 && vm_input_x < vm_w as f64 && vm_input_y >= 0.0 && vm_input_y < vm_h as f64 {
                     let target_x = vm_input_x as u32;
                     let target_y = vm_input_y as u32;
 
                     if self.last_sent_mouse != Some((target_x, target_y)) {
                         self.last_sent_mouse = Some((target_x, target_y));
-                        
+
                         let mouse = self.mouse_ctrl.clone();
                         relm4::spawn(async move {
                             if let Err(e) = mouse.set_abs_position(target_x, target_y).await {
                                 warn!("Failed to set mouse position: {}", e);
                             }
                         });
+                    }
+                } else {
+                    // Diagnostic: Mouse is in the black bars (letterbox/pillarbox area)
+                    static BOUNDS_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                    if BOUNDS_WARN.load(std::sync::atomic::Ordering::Relaxed) {
+                        debug!("[UI] DROP Move: Out of bounds ({:.1}, {:.1}) - in black bars", vm_input_x, vm_input_y);
+                        debug!("[UI] VM resolution: {}x{}, Drawn area: {:.0}x{:.0} at offset ({:.1}, {:.1})",
+                               vm_w, vm_h, drawn_w, drawn_h, offset_x, offset_y);
+                        BOUNDS_WARN.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -240,11 +312,15 @@ impl Component for VmDisplayModel {
                     1 => Some(QemuButton::Left),
                     2 => Some(QemuButton::Middle),
                     3 => Some(QemuButton::Right),
-                    _ => None
+                    _ => None,
                 };
                 if let Some(b) = btn {
                     relm4::spawn(async move {
-                        let result = if pressed { mouse.press(b).await } else { mouse.release(b).await };
+                        let result = if pressed {
+                            mouse.press(b).await
+                        } else {
+                            mouse.release(b).await
+                        };
                         if let Err(e) = result {
                             warn!("Failed to send mouse button event: {}", e);
                         }
@@ -256,7 +332,11 @@ impl Component for VmDisplayModel {
                 let mouse = self.mouse_ctrl.clone();
                 if dy.abs() > 0.1 {
                     relm4::spawn(async move {
-                        let btn = if dy > 0.0 { QemuButton::WheelDown } else { QemuButton::WheelUp };
+                        let btn = if dy > 0.0 {
+                            QemuButton::WheelDown
+                        } else {
+                            QemuButton::WheelUp
+                        };
                         if let Err(e) = mouse.press(btn).await {
                             warn!("Failed to send scroll press: {}", e);
                         }
@@ -269,12 +349,12 @@ impl Component for VmDisplayModel {
 
             DisplayMsg::Key { keyval, keycode, pressed } => {
                 let kbd = self.keyboard_ctrl.clone();
-                
+
                 const Q_KEY_RET: u32 = 0x1c;
                 const Q_KEY_ESC: u32 = 0x01;
                 const Q_KEY_BACKSPACE: u32 = 0x0e;
                 const Q_KEY_SPACE: u32 = 0x39;
-                
+
                 let qcode = match keyval {
                     0xFF0D => Q_KEY_RET,
                     0xFF1B => Q_KEY_ESC,
@@ -284,7 +364,11 @@ impl Component for VmDisplayModel {
                 };
 
                 relm4::spawn(async move {
-                    let result = if pressed { kbd.press(qcode).await } else { kbd.release(qcode).await };
+                    let result = if pressed {
+                        kbd.press(qcode).await
+                    } else {
+                        kbd.release(qcode).await
+                    };
                     if let Err(e) = result {
                         warn!("Failed to send keyboard event: {}", e);
                     }
@@ -301,7 +385,7 @@ impl Component for VmDisplayModel {
                 widgets.vm_picture.set_paintable(None::<&gtk::gdk::Texture>);
             }
         }
-        
+
         if self.changes.cursor || self.changes.frame {
             let cursor = &self.screen.cursor;
             widgets.cursor_picture.set_visible(cursor.visible);

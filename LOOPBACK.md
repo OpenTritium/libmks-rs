@@ -188,6 +188,37 @@ QemuEvent::CursorDefine {
 2. Verify you're in a non-Disable phase
 3. Check logs for mouse command reception
 
+### Cursor Invisible (Critical Bug Fix)
+
+**Symptoms:**
+- Mouse events are logged in console
+- Cursor data exists in Screen model
+- But cursor is not visible on screen
+
+**Root Cause:**
+UpdateFlags were being overwritten instead of accumulated:
+
+```rust
+// ❌ WRONG - Overwrites flags
+self.changes = flags;
+
+// ✅ CORRECT - Accumulates flags
+self.changes.cursor |= flags.cursor;
+self.changes.frame |= flags.frame;
+```
+
+**Why it matters:**
+- QEMU sends `CursorDefine` and `Scanout` events almost simultaneously
+- `CursorDefine` sets `cursor = true` (apply texture)
+- `Scanout` sets `frame = true` (update background)
+- If Scanout arrives second and overwrites CursorDefine, the cursor texture is never applied
+- Result: Cursor is invisible even though data exists
+
+**Fix:**
+Use bitwise OR accumulation (`|=`) instead of assignment (`=`) in `VmDisplayModel::update()`.
+
+See commit `e45b128` for the fix.
+
 ### Incorrect Coordinates
 
 1. Verify scale calculation in `VmDisplayModel::update()`
@@ -203,6 +234,7 @@ QemuEvent::CursorDefine {
 ## Files Modified
 
 - `examples/vm_display_with_input.rs`: Complete loopback implementation
+- `src/display/vm_display.rs`: Fixed flag accumulation bug (commit e45b128)
 
 ## Related Files
 

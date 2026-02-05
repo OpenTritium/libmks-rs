@@ -25,7 +25,8 @@ impl SimpleComponent for AppModel {
     view! {
         gtk::Window {
             set_title: Some("VM Display with Real-time Input Loopback"),
-            set_default_size: (1024, 768),
+            set_default_width: 1024,
+            set_default_height: 768,
             #[local_ref]
             display_widget -> gtk::Overlay {},
         }
@@ -143,9 +144,11 @@ async fn mock_qemu_source(
     let mut current_w = 800;
     let mut current_h = 600;
     let mut frame_count: u64 = 0;
+    let mut move_log_counter = 0;
 
     info!("Simulation Started: Phase 1 - 800x600 (Blue)");
     info!("Move your mouse over the VM display to see the cursor follow!");
+    info!("Diagnostic: Mouse moves will be logged every 60 samples");
 
     let bg_data = generate_frame(current_w, current_h, 0, 0, 255);
     tx.send(QemuEvent::Scanout {
@@ -209,6 +212,12 @@ async fn mock_qemu_source(
                 if !(360..=480).contains(&frame_count) {
                     match cmd {
                         mouse::Command::SetAbsPosition { x, y } => {
+                            // Diagnostic: Log every 60 moves to confirm data flow
+                            move_log_counter += 1;
+                            if move_log_counter % 60 == 0 {
+                                info!("[Mock] RECV SetAbsPosition: {}, {} (Sampled #{})", x, y, move_log_counter);
+                            }
+
                             tx.send(QemuEvent::MouseSet {
                                 x: x as i32,
                                 y: y as i32,
@@ -218,17 +227,17 @@ async fn mock_qemu_source(
                             .ok();
                         }
                         mouse::Command::Press(btn) => {
-                            info!("[Mouse] Press: {:?}", btn);
+                            info!("[Mock] Press: {:?}", btn);
                         }
                         mouse::Command::Release(btn) => {
-                            info!("[Mouse] Release: {:?}", btn);
+                            info!("[Mock] Release: {:?}", btn);
                         }
                         mouse::Command::RelMotion { dx, dy } => {
-                            warn!("[Mouse] RelMotion dx={}, dy={} (not supported in absolute mode)", dx, dy);
+                            warn!("[Mock] RelMotion dx={}, dy={} (not supported)", dx, dy);
                         }
                     }
                 } else {
-                    warn!("[Mouse] Command ignored during Disable phase");
+                    warn!("[Mock] Command ignored during Disable phase");
                 }
             }
         }
