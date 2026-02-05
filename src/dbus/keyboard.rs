@@ -1,6 +1,6 @@
 //! `DBus` proxy for QEMU Keyboard interface.
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Keyboard-section>
-use crate::{generate_handler, generate_watcher, impl_controller, impl_session_connect};
+use crate::{generate_handler, generate_watcher, impl_session_connect};
 use bitflags::bitflags;
 use derive_more::{AsMut, AsRef, Deref, DerefMut, From};
 use kanal::AsyncSender;

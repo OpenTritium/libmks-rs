@@ -1,9 +1,9 @@
-use kanal::{AsyncReceiver, AsyncSender};
+use kanal::AsyncSender;
 use libmks_rs::{
     dbus::{
         console::ConsoleController,
-        keyboard::{KeyboardController, Command as KbdCommand},
-        mouse::{MouseController, Command as MouseCommand},
+        keyboard::KeyboardController,
+        mouse::MouseController,
         listener::QemuEvent,
     },
     display::vm_display::{VmDisplayInit, VmDisplayModel},

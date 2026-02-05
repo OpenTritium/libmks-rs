@@ -1,6 +1,6 @@
 //! `DBus` proxy for QEMU Console interface.
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Console-section>
-use crate::{generate_handler, generate_watcher, impl_controller, impl_session_connect};
+use crate::{generate_handler, generate_watcher, impl_session_connect};
 use derive_more::{AsRef, Deref, From};
 use kanal::AsyncSender;
 use std::{convert::TryFrom, fmt};
