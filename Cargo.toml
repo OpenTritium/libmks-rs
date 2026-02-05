@@ -1,0 +1,52 @@
+[package]
+name = "libmks-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Rust port of libmks - Mouse, Keyboard, Screen for QEMU"
+repository = "https://github.com/yourusername/libmks-rs"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+anyhow = "1.0"
+bitflags = { version = "2.0", features = ["serde"] }
+bytemuck = "1.21"
+derive_more = { version = "2", features = ["full"] }
+env_logger = "0.11"
+fastrace = { version = "0.7", features = ["enable"] }
+futures-util = "0.3"
+kanal = "0.1.1"
+log = { version = "0.4", features = ["kv_unstable"] }
+num_enum = "0.7"
+# relm4 导出 gtk4，启用 v4_14 特性以支持 DMABUF
+relm4 = { version = "0.10.1", features = ["gnome_48"] }
+# socketpair 和 Unix socket 支持
+rustix = { version = "1.1.3", features = ["fs", "io_uring", "mm", "net", "param"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_repr = "0.1"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["full"] }
+zbus = "5.13.2"
+zvariant = "5"
+# [lints.clippy]
+# all = "warn"
+# pedantic = "warn"
+
+# [lints.rust]
+# unsafe_code = "warn"
+
+[dev-dependencies]
+serial_test = "3.2"
+test-log = { version = "0.2.19", features = ["log"] }
+zbus = { version = "*", features = ["p2p"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[features]
+v4_20 = [] # gnome 49
