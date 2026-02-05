@@ -3,8 +3,8 @@ use libmks_rs::{
     dbus::{
         console::ConsoleController,
         keyboard::KeyboardController,
-        mouse::{self, MouseController},
         listener::QemuEvent,
+        mouse::{self, MouseController},
     },
     display::vm_display::{VmDisplayInit, VmDisplayModel},
 };
@@ -28,7 +28,10 @@ impl SimpleComponent for AppModel {
             set_default_width: 1024,
             set_default_height: 768,
             #[local_ref]
-            display_widget -> gtk::Overlay {},
+            display_widget -> gtk::Overlay {
+                set_hexpand: true,
+                set_vexpand: true,
+            },
         }
     }
 
@@ -38,12 +41,7 @@ impl SimpleComponent for AppModel {
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx) = create_mock_controllers();
 
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit {
-                rx,
-                console_ctrl,
-                mouse_ctrl,
-                keyboard_ctrl: kbd_ctrl,
-            })
+            .launch(VmDisplayInit { rx, console_ctrl, mouse_ctrl, keyboard_ctrl: kbd_ctrl })
             .detach();
 
         let display_widget = _display.widget().clone();
@@ -57,12 +55,8 @@ impl SimpleComponent for AppModel {
     }
 }
 
-fn create_mock_controllers() -> (
-    ConsoleController,
-    MouseController,
-    KeyboardController,
-    kanal::AsyncReceiver<mouse::Command>,
-) {
+fn create_mock_controllers()
+-> (ConsoleController, MouseController, KeyboardController, kanal::AsyncReceiver<mouse::Command>) {
     let (console_tx, mut console_rx) = kanal::unbounded_async();
     let (mouse_tx, mouse_rx) = kanal::unbounded_async();
     let (kbd_tx, mut kbd_rx) = kanal::unbounded_async();
@@ -116,10 +110,7 @@ fn generate_frame(width: u32, height: u32, bg_r: u8, bg_g: u8, bg_b: u8) -> Vec<
     data
 }
 
-async fn mock_qemu_source(
-    tx: AsyncSender<QemuEvent>,
-    mouse_cmd_rx: kanal::AsyncReceiver<mouse::Command>,
-) {
+async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::AsyncReceiver<mouse::Command>) {
     let cursor_w = 64;
     let cursor_h = 64;
     let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
@@ -131,15 +122,9 @@ async fn mock_qemu_source(
         cursor_data[offset + 3] = 255;
     }
 
-    tx.send(QemuEvent::CursorDefine {
-        width: cursor_w,
-        height: cursor_h,
-        hot_x: 0,
-        hot_y: 0,
-        data: cursor_data,
-    })
-    .await
-    .ok();
+    tx.send(QemuEvent::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 0, hot_y: 0, data: cursor_data })
+        .await
+        .ok();
 
     let mut current_w = 800;
     let mut current_h = 600;
@@ -245,9 +230,7 @@ async fn mock_qemu_source(
 }
 
 fn main() {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Debug).init();
 
     let app = RelmApp::new("com.falcon.display.loopback");
     app.run::<AppModel>(());
