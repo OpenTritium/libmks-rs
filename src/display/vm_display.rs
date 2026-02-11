@@ -16,8 +16,8 @@ use relm4::{
         EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Fixed,
         GestureClick, GraphicsOffload, GraphicsOffloadEnabled, Label, Overlay, Picture,
         STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
-        gdk::{Cursor, Display, Key, MemoryFormat, MemoryTexture, ModifierType},
-        glib::{Bytes, Object, Propagation, object::Cast, translate::IntoGlib},
+        gdk::{Display, Key, ModifierType},
+        glib::{Object, Propagation, object::Cast, translate::IntoGlib},
         prelude::*,
         style_context_add_provider_for_display,
     },
@@ -105,7 +105,6 @@ pub struct VmDisplayWidgets {
     pub cursor_picture: Picture,
     pub controllers: Box<[EventController]> ,
     pub capture_hint: Label,
-    pub invisible_cursor: Cursor,
 }
 
 pub struct VmDisplayInit {
@@ -355,19 +354,6 @@ impl Component for VmDisplayModel {
             .can_target(false)
             .build();
 
-        let invisible_cursor = {
-            static TRANSPARENT_PIXEL: [u8; 4] = [0, 0, 0, 0];
-            let bytes = Bytes::from_static(&TRANSPARENT_PIXEL);
-            let texture = MemoryTexture::new(
-                1,
-                1,
-                MemoryFormat::R8g8b8a8,
-                &bytes,
-                4
-            );
-            Cursor::from_texture(&texture, 0, 0, None)
-        };
-
         let resize_handler = {
             let updater = update_monitor_info.clone();
             let sender = sender.clone();
@@ -420,7 +406,6 @@ impl Component for VmDisplayModel {
             cursor_picture,
             controllers,
             capture_hint,
-            invisible_cursor,
         };
         ComponentParts { model, widgets }
     }
@@ -609,9 +594,9 @@ impl Component for VmDisplayModel {
             widgets.capture_hint.remove_css_class("toast-visible");
         }
         if self.is_captured {
-            widgets.input_plane.set_cursor(Some(&widgets.invisible_cursor));
+            widgets.input_plane.set_cursor_from_name(Some("none"));
         } else {
-            widgets.input_plane.set_cursor(None);
+            widgets.input_plane.set_cursor_from_name(None);
         }
         if !self.changes.any() {
             return;
