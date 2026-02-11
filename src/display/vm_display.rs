@@ -103,7 +103,7 @@ pub struct VmDisplayWidgets {
     pub input_plane: DrawingArea,
     pub cursor_layer: Fixed,
     pub cursor_picture: Picture,
-    pub controllers: Box<[EventController]> ,
+    pub controllers: Box<[EventController]>,
     pub capture_hint: Label,
 }
 
@@ -461,11 +461,11 @@ impl Component for VmDisplayModel {
                 }
                 self.is_captured = should_capture;
                 if should_capture {
-                    info!("🖱️ Mouse captured - {} to release", self.grab_shortcut);
+                    info!("Mouse captured - {} to release", self.grab_shortcut);
                     self.hint_visible = true;
                     self.reset_hint_timer(sender.clone());
                 } else {
-                    info!("🖱️ Mouse released - Click to capture");
+                    info!("Mouse released - Click to capture");
                     self.hint_visible = false;
                     if let Some(handle) = self.hint_timer.take() {
                         handle.abort();
