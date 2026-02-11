@@ -1,46 +1,47 @@
 //! `DBus` proxy for QEMU Keyboard interface.
-//! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Keyboard-section>
-use crate::{generate_handler, generate_watcher, impl_session_connect};
+//! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Keyboard>
+use crate::{generate_handler, generate_watcher, impl_controller, impl_session_connect, keymaps::Qnum};
 use bitflags::bitflags;
-use derive_more::{AsMut, AsRef, Deref, DerefMut, From};
+use derive_more::{AsRef, Deref, From};
 use kanal::AsyncSender;
 use zbus::{Result, proxy};
-use zvariant::OwnedValue;
 
 #[proxy(interface = "org.qemu.Display1.Keyboard", default_service = "org.qemu", gen_blocking = false)]
 pub trait Keyboard {
-    /// **发送按键按下事件 (Press)**
+    /// Sends a key press event.
     ///
-    /// * `keycode`: 扫描码 (Scan Code)。 这是 QEMU 规定的按键数字编号（通常基于 QKeyCode 或 Linux Input Event codes）。
-    ///   比如：Q_KEY_CODE_A, Q_KEY_CODE_CTRL 等。
-    ///
-    /// 当你在 UI 上按下一个键时，调用此方法告诉虚拟机：“嘿，用户按下了 A 键”。
-    async fn press(&self, keycode: u32) -> Result<()>;
+    /// * `qnum` - The QEMU keycode (scancode).
+    async fn press(&self, qnum: Qnum) -> Result<()>;
 
-    /// **发送按键释放事件 (Release)**
+    /// Sends a key release event.
     ///
-    /// * `keycode`: 同上。
-    ///
-    /// 当你在 UI 上松开一个键时，调用此方法。
-    /// 注意：必须成对调用 press 和 release，否则虚拟机里那个键会一直卡住（连击）。
-    async fn release(&self, keycode: u32) -> Result<()>;
+    /// * `qnum` - The QEMU keycode (scancode).
+    async fn release(&self, qnum: Qnum) -> Result<()>;
 
-    /// **获取当前的修饰键状态 (Modifiers)**
-    ///
-    /// * 返回值: `Result<Modifiers>` (通常是 u32)。
-    ///
-    /// 这个属性告诉你：**虚拟机当前认为哪些修饰键（Ctrl/Alt/Shift）是处于“按下”状态的。**
-    ///
-    /// # 它是干啥的？
-    /// 1. **状态同步**：当 UI 刚连接上来时，需要知道虚拟机里是不是已经按着 Ctrl 了。
-    /// 2. **组合键逻辑**：虽然通常由虚拟机处理组合键，但在某些高级场景下， UI 可能需要知道当前状态来改变鼠标行为（比如
-    ///    Ctrl+Click 多选）。
+    /// The current keyboard modifier state (NumLock, CapsLock, ScrollLock).
     #[zbus(property)]
     fn modifiers(&self) -> Result<LockState>;
 }
 
+#[derive(Debug)]
+pub enum Command {
+    Press(Qnum),
+    Release(Qnum),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deref, AsRef)]
+pub struct Event(pub LockState);
+
+#[derive(AsRef, Deref, From, Clone)]
+pub struct KeyboardController(pub AsyncSender<Command>);
+
+impl_controller!(KeyboardController, Command, {
+    pub async fn press(keycode: Qnum) => Press(keycode);
+    pub async fn release(keycode: Qnum) => Release(keycode);
+});
+
 bitflags! {
-    /// 没错这玩意儿只用来表示 LED 状态
+    /// Represents the state of keyboard LEDs/modifiers.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
     pub struct LockState: u32 {
         const SCROLL = 1 << 0;
@@ -49,41 +50,26 @@ bitflags! {
     }
 }
 
-impl TryFrom<OwnedValue> for LockState {
+impl TryFrom<zvariant::OwnedValue> for LockState {
     type Error = zvariant::Error;
 
-    fn try_from(value: OwnedValue) -> std::result::Result<Self, Self::Error> {
+    #[inline]
+    fn try_from(value: zvariant::OwnedValue) -> zvariant::Result<Self> {
         let val: u32 = value.try_into()?;
         Ok(LockState::from_bits_retain(val))
     }
 }
 
-#[derive(Debug)]
-pub enum Command {
-    Press(u32),
-    Release(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, AsRef, AsMut, DerefMut, Deref, From)]
-pub struct Event(pub LockState);
-
-#[derive(AsRef, Deref, From)]
-#[derive(Clone)]
-pub struct KeyboardController(AsyncSender<Command>);
-
-impl KeyboardController {
-    pub async fn press(&self, keycode: u32) -> crate::MksResult {
-        self.0.send(Command::Press(keycode)).await?;
-        Ok(())
-    }
-
-    pub async fn release(&self, keycode: u32) -> crate::MksResult {
-        self.0.send(Command::Release(keycode)).await?;
-        Ok(())
-    }
-}
-
-impl_session_connect!(KeyboardSession, KeyboardProxy<'static>, KeyboardController, Command, Event);
+impl_session_connect!(
+    KeyboardSession,
+    KeyboardProxy<'static>,
+    KeyboardController,
+    Command,
+    Event,
+    watch_proxy_changes,
+    handle_commands,
+    256
+);
 
 generate_watcher!(
     watch_proxy_changes,
@@ -91,7 +77,7 @@ generate_watcher!(
     Event,
     "keyboard",
     {
-        modifiers => receive_modifiers_changed => Event
+        modifiers => receive_modifiers_changed => Event,
     }
 );
 
@@ -101,8 +87,8 @@ generate_handler!(
     Command,
     "keyboard",
     |p| {
-        Command::Press(keycode) => p.press(keycode).await,
-        Command::Release(keycode) => p.release(keycode).await,
+        Command::Press(qnum) => p.press(qnum).await,
+        Command::Release(qnum) => p.release(qnum).await,
     }
 );
 
@@ -122,6 +108,7 @@ mod tests {
     /// Mock QEMU Keyboard 服务
     struct MockQemuKeyboard {
         state: std::sync::Arc<Mutex<MockState>>,
+        notify: std::sync::Arc<tokio::sync::Notify>,
     }
 
     #[interface(name = "org.qemu.Display1.Keyboard")]
@@ -133,21 +120,25 @@ mod tests {
         // --- Methods ---
         async fn press(&self, keycode: u32) -> zbus::fdo::Result<()> {
             self.state.lock().unwrap().last_press = Some(keycode);
+            self.notify.notify_waiters();
             Ok(())
         }
 
         async fn release(&self, keycode: u32) -> zbus::fdo::Result<()> {
             self.state.lock().unwrap().last_release = Some(keycode);
+            self.notify.notify_waiters();
             Ok(())
         }
     }
 
     impl MockQemuKeyboard {
-        fn new(state: std::sync::Arc<Mutex<MockState>>) -> Self { Self { state } }
+        fn new(state: std::sync::Arc<Mutex<MockState>>, notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+            Self { state, notify }
+        }
     }
 
     /// 搭建测试环境
-    async fn setup_env() -> (zbus::Connection, std::sync::Arc<Mutex<MockState>>) {
+    async fn setup_env() -> (zbus::Connection, std::sync::Arc<Mutex<MockState>>, std::sync::Arc<tokio::sync::Notify>) {
         use zbus::Guid;
 
         let state = std::sync::Arc::new(Mutex::new(MockState {
@@ -156,7 +147,8 @@ mod tests {
             last_release: None,
         }));
 
-        let mock = MockQemuKeyboard::new(state.clone());
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mock = MockQemuKeyboard::new(state.clone(), notify.clone());
 
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().expect("Failed to create socket pair");
 
@@ -180,15 +172,15 @@ mod tests {
             .await
             .expect("Failed to build client connection");
 
-        (client_conn, state)
+        (client_conn, state, notify)
     }
 
     /// 连接与初始状态同步测试
     #[tokio::test]
     async fn test_initial_state_sync() {
-        let (conn, _state) = setup_env().await;
+        let (conn, _state, _notify) = setup_env().await;
         let session =
-            connect(&conn, "/org/qemu/Display1/Keyboard_0".to_string()).await.expect("Failed to create session");
+            KeyboardSession::connect(&conn, "/org/qemu/Display1/Keyboard_0").await.expect("Failed to create session");
 
         // 验证：应当收到 modifiers 的初始事件
         let event = session.rx.recv().await.expect("Should receive initial event");
@@ -200,21 +192,23 @@ mod tests {
     /// 按键测试
     #[tokio::test]
     async fn test_press_and_release() {
-        let (conn, state) = setup_env().await;
+        let (conn, state, notify) = setup_env().await;
         let session =
-            connect(&conn, "/org/qemu/Display1/Keyboard_0".to_string()).await.expect("Failed to create session");
+            KeyboardSession::connect(&conn, "/org/qemu/Display1/Keyboard_0").await.expect("Failed to create session");
 
         // 消耗初始事件
         let _ = session.rx.recv().await;
 
         // 测试按键
-        session.tx.press(0x1e).await.expect("Failed to send press");
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let notified = notify.notified();
+        session.tx.press(Qnum::from(0x1e)).await.unwrap();
+        notified.await;
         assert_eq!(state.lock().unwrap().last_press, Some(0x1e));
 
         // 测试释放
-        session.tx.release(0x1e).await.expect("Failed to send release");
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let notified = notify.notified();
+        session.tx.release(Qnum::from(0x1e)).await.unwrap();
+        notified.await;
         assert_eq!(state.lock().unwrap().last_release, Some(0x1e));
     }
 
@@ -255,7 +249,7 @@ mod tests {
     #[test]
     fn test_modifiers_from_owned_value() {
         let val = zvariant::Value::new(0b101u32); // SCROLL | CAPS
-        let owned = OwnedValue::try_from(val).unwrap();
+        let owned = zvariant::OwnedValue::try_from(val).unwrap();
         let modifiers = LockState::try_from(owned).unwrap();
         assert!(modifiers.contains(LockState::SCROLL));
         assert!(!modifiers.contains(LockState::NUM));

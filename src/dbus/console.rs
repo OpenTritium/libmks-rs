@@ -1,121 +1,66 @@
 //! `DBus` proxy for QEMU Console interface.
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Console-section>
-use crate::{generate_handler, generate_watcher, impl_session_connect};
+use crate::{generate_handler, generate_watcher, impl_controller, impl_session_connect};
 use derive_more::{AsRef, Deref, From};
 use kanal::AsyncSender;
-use std::{convert::TryFrom, fmt};
+use serde::Deserialize;
 use zbus::{Result, proxy};
-use zvariant::{OwnedFd, OwnedValue, Signature};
-
-// 先创建命名 socket,记得避免路径重复
-// 然后创建匿名 socket 用于画面更新
+use zvariant::{OwnedFd, OwnedValue, Type, Value};
 
 // path: /org/qemu/Display1/Console_$id.
 #[proxy(interface = "org.qemu.Display1.Console", default_service = "org.qemu", gen_blocking = false)]
 trait Console {
-    /// Register a console listener, which will receive display updates, until it is disconnected.
-    /// Multiple listeners may be registered simultaneously.
-    /// The listener is expected to implement the org.qemu.Display1.Listener interface.
+    /// Registers a listener to receive display updates.
+    ///
+    /// The listener must implement the `org.qemu.Display1.Listener` interface.
     async fn register_listener(&self, listener: &OwnedFd) -> Result<()>;
 
-    /// Modify the dimensions and display settings.
+    /// Sets the UI dimensions and display settings.
     #[zbus(name = "SetUIInfo")]
     async fn set_ui_info(
         &self, width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32,
     ) -> Result<()>;
 
-    /// **控制台名称（用于 UI 显示）**
-    ///
-    /// 这里的字符串通常是显卡设备的名称，如 "VGA", "QXL", "virtio-gpu" 等。
-    /// **用途**：可以作为你 GUI 窗口的标题或 Tab 页的标签，告诉用户这是哪个屏幕。
+    /// The console name (e.g., "VGA", "QXL", "virtio-gpu").
     #[zbus(property)]
     fn label(&self) -> Result<String>;
 
-    /// **多显示器索引 (Head Number)**
-    ///
-    /// 如果一个虚拟显卡有多个输出端口（多屏显示），这个数字区分它们（0, 1, 2...）。
-    /// **用途**：配合 `device_address` 唯一确定"这是哪张显卡的第几个屏幕"。
+    /// The head number (0, 1, 2...), distinguishing multiple outputs on the same device.
     #[zbus(property)]
     fn head(&self) -> Result<u32>;
 
-    /// **控制台内容类型**
-    ///
-    /// 区分这是**图形画面**还是**纯文本终端**。
-    /// - `Graphic`: 传输像素数据，需要 OpenGL/纹理渲染。
-    /// - `Text`: 传输字符网格（如 BIOS 界面或串口控制台），需要通过字体渲染。
-    /// **用途**：决定你的 UI 应该创建一个图形渲染画布，还是一个模拟终端窗口。
+    /// The console type (`Graphic` or `Text`).
     #[zbus(property)]
     fn r#type(&self) -> Result<ConsoleType>;
 
-    /// **当前画面宽度 (Pixels)**
-    ///
-    /// 虚拟机当前输出图像的实际像素宽度。
-    /// **用途**：收到 `PropertiesChanged` 信号更新此值时，你需要调整你的本地窗口大小或重绘纹理。
+    /// Current display width in pixels.
     #[zbus(property)]
     fn width(&self) -> Result<u32>;
 
-    /// **当前画面高度 (Pixels)**
-    ///
-    /// 虚拟机当前输出图像的实际像素高度。
+    /// Current display height in pixels.
     #[zbus(property)]
     fn height(&self) -> Result<u32>;
 
-    /// **硬件设备地址**
-    ///
-    /// 虚拟显卡在虚拟机总线上的物理位置，例如 "pci/0000/02.0"。
-    /// **用途**：当虚拟机有多个显卡时，用来区分这个 Console 属于哪个物理设备。
+    /// The hardware device address (e.g., "pci/0000/02.0").
     #[zbus(property)]
     fn device_address(&self) -> Result<String>;
 
-    /// **能力发现 (Capabilities Discovery)**
+    /// List of additional interfaces implemented by this console.
     ///
-    /// 返回该 Console 对象还实现了哪些**额外接口**的列表。
-    /// 常见值包括：
-    /// - `"org.qemu.Display1.Keyboard"`: 支持键盘输入。
-    /// - `"org.qemu.Display1.Mouse"`: 支持鼠标输入。
-    /// - `"org.qemu.Display1.MultiTouch"`: 支持多点触控。
+    /// Common values: `"org.qemu.Display1.Mouse"`, `"org.qemu.Display1.Keyboard"`.
     ///
-    /// **用途**：**极其重要**。你不应该盲目发送鼠标事件，而应先检查这里是否包含 Mouse 接口。
-    /// 这让你能根据服务端的能力，动态启用/禁用 UI 上的输入功能。
+    /// # Note
+    /// You **must** verify the presence of the relevant interface here before sending
+    /// input events (e.g., mouse clicks) to the server.
     #[zbus(property)]
     fn interfaces(&self) -> Result<Vec<String>>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type, Deserialize, Value, OwnedValue)]
+#[zvariant(signature = "s")]
 pub enum ConsoleType {
     Text,
     Graphic,
-}
-
-const TYPE_TEXT: &str = "Text";
-const TYPE_GRAPHIC: &str = "Graphic";
-
-impl fmt::Display for ConsoleType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ConsoleType::*;
-        match self {
-            Text => write!(f, "{TYPE_TEXT}",),
-            Graphic => write!(f, "{TYPE_GRAPHIC}",),
-        }
-    }
-}
-
-impl zvariant::Type for ConsoleType {
-    const SIGNATURE: &'static Signature = <&str>::SIGNATURE;
-}
-
-impl TryFrom<OwnedValue> for ConsoleType {
-    type Error = zvariant::Error;
-
-    fn try_from(value: OwnedValue) -> std::result::Result<Self, Self::Error> {
-        use ConsoleType::*;
-        let s: String = value.try_into()?;
-        match s.as_str() {
-            TYPE_TEXT => Ok(Text),
-            TYPE_GRAPHIC => Ok(Graphic),
-            _ => Err(zvariant::Error::IncorrectType),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -135,23 +80,26 @@ pub enum Event {
     Interfaces(Vec<String>),
 }
 
-#[derive(AsRef, Deref, From)]
-#[derive(Clone)]
-pub struct ConsoleController(AsyncSender<Command>);
+#[derive(AsRef, Deref, From, Clone)]
+pub struct ConsoleController(pub AsyncSender<Command>);
 
-impl ConsoleController {
-    pub async fn set_ui_info(&self, width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32) -> crate::MksResult {
-        self.0.send(Command::SetUiInfo { width_mm, height_mm, xoff, yoff, width, height }).await?;
-        Ok(())
-    }
+impl_controller!(ConsoleController, Command, {
+    pub async fn set_ui_info(width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32)
+        => SetUiInfo { width_mm, height_mm, xoff, yoff, width, height };
+    pub async fn register_listener(fd: OwnedFd)
+        => RegisterListener(fd);
+});
 
-    pub async fn register_listener(&self, fd: OwnedFd) -> crate::MksResult {
-        self.0.send(Command::RegisterListener(fd)).await?;
-        Ok(())
-    }
-}
-
-impl_session_connect!(ConsoleSession, ConsoleProxy<'static>, ConsoleController, Command, Event);
+impl_session_connect!(
+    ConsoleSession,
+    ConsoleProxy<'static>,
+    ConsoleController,
+    Command,
+    Event,
+    watch_proxy_changes,
+    handle_commands,
+    32
+);
 
 generate_watcher!(
     watch_proxy_changes,
@@ -194,6 +142,7 @@ mod tests {
         width: u32,
         height: u32,
         label: String,
+        console_type_raw: String, // 模拟 QEMU 内部存储的原始字符串
         last_ui_info: Option<(u32, u32)>,
         listener_registered: bool,
     }
@@ -213,7 +162,7 @@ mod tests {
         fn head(&self) -> u32 { 0 }
 
         #[zbus(property)]
-        fn r#type(&self) -> String { "Graphic".to_string() }
+        fn r#type(&self) -> String { self.state.lock().unwrap().console_type_raw.clone() }
 
         #[zbus(property)]
         fn width(&self) -> u32 { self.state.lock().unwrap().width }
@@ -254,6 +203,7 @@ mod tests {
             width: 800,
             height: 600,
             label: "VGA-1".to_string(),
+            console_type_raw: "Graphic".to_string(), // 模拟 QEMU 发送的原始字符串
             last_ui_info: None,
             listener_registered: false,
         }));
@@ -299,7 +249,7 @@ mod tests {
 
         // 连接到 Mock 服务
         let session =
-            connect(&conn, "/org/qemu/Display1/Console_0".to_string()).await.expect("Failed to create session");
+            ConsoleSession::connect(&conn, "/org/qemu/Display1/Console_0").await.expect("Failed to create session");
 
         // 验证：应当收到所有属性的初始事件
         // select_all 产生的流顺序不确定，需要收集后验证
@@ -333,19 +283,29 @@ mod tests {
     /// ConsoleType 解析单元测试（无需 DBus 环境）
     #[tokio::test]
     async fn test_console_type_parsing() {
-        // ===== 基本解析测试 =====
+        // ===== 反序列化测试 (Deserialize): String -> Enum =====
+        // 这是验证：如果我们从 QEMU 收到了 "Graphic"，我们能否正确转为 Enum
 
-        // Test Graphic
         let val = zvariant::Value::new("Graphic");
         let owned = OwnedValue::try_from(val).unwrap();
         let ct = ConsoleType::try_from(owned).unwrap();
         assert_eq!(ct, ConsoleType::Graphic);
 
-        // Test Text
         let val = zvariant::Value::new("Text");
         let owned = OwnedValue::try_from(val).unwrap();
         let ct = ConsoleType::try_from(owned).unwrap();
         assert_eq!(ct, ConsoleType::Text);
+
+        // ===== 序列化测试 (Serialize): Enum -> String =====
+        // 验证：如果我们发送 ConsoleType::Graphic，zbus 是否会将其转为 "Graphic" 字符串
+        // 这直接测试了 serde 序列化层，确保了如果我们需要发送这个枚举，它确实会变成字符串 "Graphic"
+
+        let v = zvariant::Value::from(ConsoleType::Graphic);
+        // zvariant::Value 实现了 PartialEq，可以直接与字符串比较
+        assert_eq!(v, zvariant::Value::new("Graphic"));
+
+        let v = zvariant::Value::from(ConsoleType::Text);
+        assert_eq!(v, zvariant::Value::new("Text"));
 
         // ===== 大小写敏感测试 =====
         // 注意：QEMU 协议中是大小写敏感的
@@ -407,31 +367,6 @@ mod tests {
             let owned = OwnedValue::try_from(val).unwrap();
             assert!(ConsoleType::try_from(owned).is_err(), "'{invalid}' 应该解析失败");
         }
-
-        // ===== 特征实现测试 =====
-
-        // Test Display
-        let display_str = format!("{}", ConsoleType::Graphic);
-        assert_eq!(display_str, "Graphic");
-
-        let display_str = format!("{}", ConsoleType::Text);
-        assert_eq!(display_str, "Text");
-
-        // Test zvariant::Type (检查签名是否正确)
         assert_eq!(ConsoleType::SIGNATURE, "s"); // 字符串类型
-
-        // ===== 反向转换测试（通过 Display） =====
-        // 验证 Display 输出可以被正确解析回原始类型
-        let graphic_display = ConsoleType::Graphic.to_string();
-        let val = zvariant::Value::new(&graphic_display);
-        let owned = OwnedValue::try_from(val).unwrap();
-        let parsed_back = ConsoleType::try_from(owned).unwrap();
-        assert_eq!(parsed_back, ConsoleType::Graphic);
-
-        let text_display = ConsoleType::Text.to_string();
-        let val = zvariant::Value::new(&text_display);
-        let owned = OwnedValue::try_from(val).unwrap();
-        let parsed_back = ConsoleType::try_from(owned).unwrap();
-        assert_eq!(parsed_back, ConsoleType::Text);
     }
 }

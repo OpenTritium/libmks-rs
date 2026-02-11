@@ -1,3 +1,7 @@
+use derive_more::{From, Into};
+use serde::Serialize;
+use zvariant::Type;
+
 #[inline]
 pub const fn xorg_keycode_to_qnum(keycode: u32) -> u32 {
     let idx = keycode as usize;
@@ -5,6 +9,14 @@ pub const fn xorg_keycode_to_qnum(keycode: u32) -> u32 {
         return 0;
     }
     XORG_EVDEV_TO_QNUM[idx] as u32
+}
+
+#[derive(Debug, From, Into, Type, Serialize)]
+pub struct Qnum(u32);
+
+impl Qnum {
+    #[inline]
+    pub const fn from_xorg_keycode(keycode: u32) -> Self { Self(xorg_keycode_to_qnum(keycode)) }
 }
 
 pub const XORG_EVDEV_TO_QNUM: [u16; 533] = [

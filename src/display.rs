@@ -1,8 +1,10 @@
-// pub mod compositor;
-// pub mod display;
-// pub mod compositor;
-pub mod framebuffer;
+pub mod direct_map;
+pub mod error;
 pub mod pixman_4cc;
 pub mod screen;
+pub mod software_rasterizer;
 pub mod udma;
 pub mod vm_display;
+
+pub use error::Error;
+pub use vm_display::ScalingMode;

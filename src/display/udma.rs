@@ -1,10 +1,14 @@
 //! https://github.com/torvalds/linux/blob/master/include/uapi/linux/udmabuf.h
+pub mod utils;
 use rustix::{
     fd::{FromRawFd, OwnedFd, RawFd},
     io::Result,
     ioctl::{Ioctl, IoctlOutput, Opcode, opcode},
 };
 use std::ffi::c_void;
+pub use utils::{DRM_FORMAT_MOD_LINEAR, Damage, DmabufPlane, build_dmabuf_texture_planar, create_udmabuf_fd};
+
+const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -17,7 +21,9 @@ pub struct UdmabufCreate {
 
 impl UdmabufCreate {
     #[inline]
-    pub const fn new(memfd: RawFd, size: u64) -> Self { Self { memfd: memfd as u32, flags: 0, offset: 0, size } }
+    pub const fn new(memfd: RawFd, offset: u64, size: u64) -> Self {
+        Self { memfd: memfd as u32, flags: UDMABUF_FLAGS_CLOEXEC, offset, size }
+    }
 }
 
 const UDMABUF_MAGIC: u8 = b'u';
@@ -36,6 +42,8 @@ unsafe impl Ioctl for UdmabufCreate {
 
     #[inline]
     unsafe fn output_from_ptr(out: IoctlOutput, _ptr: *mut c_void) -> Result<Self::Output> {
+        // SAFETY: UDMABUF_CREATE returns a new file descriptor on success.
+        // We take ownership of this FD, so wrapping it in OwnedFd is safe.
         unsafe { Ok(OwnedFd::from_raw_fd(out as RawFd)) }
     }
 }
@@ -73,7 +81,7 @@ mod tests {
     /// 我们不依赖内核，而是验证生成的 u32 数值是否符合预期。
     #[test]
     fn test_opcode_generation() {
-        let req = UdmabufCreate::new(0, 1024);
+        let req = UdmabufCreate::new(0, 0, 1024);
         let op = req.opcode();
 
         // 打印生成的 opcode 方便调试
@@ -107,7 +115,7 @@ mod tests {
         let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) };
 
         // 构造请求
-        let req = UdmabufCreate::new(100, 4096); // 这里的 memfd 100 是假的
+        let req = UdmabufCreate::new(100, 0, 4096); // 这里的 memfd 100 是假的
 
         // 执行 ioctl
         // 因为 fd 指向 /dev/null，内核找不到对应的 ioctl handler，
@@ -144,7 +152,7 @@ mod tests {
         let _ = fake_kernel_file.into_raw_fd();
 
         // 2. 准备你的 IOCTL 结构体
-        let mut req = UdmabufCreate::new(0, 4096);
+        let mut req = UdmabufCreate::new(0, 0, 4096);
 
         // 3. 【核心黑魔法】手动扮演 rustix
         // 我们不调用 ioctl()，而是直接调用 trait 方法 output_from_ptr()。

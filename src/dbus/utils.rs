@@ -1,41 +1,53 @@
 use futures_util::{
-    Stream, StreamExt,
+    Future, Stream, StreamExt,
     stream::{BoxStream, once},
 };
 use zbus::proxy::PropertyChanged;
 use zvariant::OwnedValue;
 
 #[inline]
-pub fn fetch_then_update<Fut, S, T, U>(
-    getter: Fut, updates: S, ctor: fn(T) -> U,
-) -> BoxStream<'static, std::result::Result<U, zbus::Error>>
+pub fn fetch_then_update<Fut, S, T, U, F>(getter: Fut, updates: S, ctor: F) -> BoxStream<'static, zbus::Result<U>>
 where
     T: TryFrom<OwnedValue> + Send + Sync + 'static,
     T::Error: Into<zbus::Error>,
     Fut: Future<Output = zbus::Result<T>> + Send + 'static,
     S: Stream<Item = PropertyChanged<'static, T>> + Send + 'static,
     U: Send + 'static,
+    F: Fn(T) -> U + Clone + Send + Sync + 'static,
 {
-    let initial_stream = once(async move { getter.await.map(ctor) });
-    let update_stream = updates.then(move |msg| async move { msg.get().await.map(ctor) });
+    let ctor_init = ctor.clone();
+    let initial_stream = once(async move { getter.await.map(ctor_init) });
+    let update_stream = updates
+        .map(move |msg| {
+            let ctor = ctor.clone();
+            async move { msg.get().await.map(ctor) }
+        })
+        .buffer_unordered(16);
     initial_stream.chain(update_stream).boxed()
 }
 
 #[macro_use]
 pub mod macros {
+    /// Generates async methods for controller that send commands to channel.
+    ///
+    /// Generates `impl $controller { async fn $method(&self, ...) }` methods
+    /// that send `$cmd_type::$variant` to the internal channel.
+    ///
+    /// # Arguments
+    /// * `$controller` - Controller struct name
+    /// * `$cmd_type` - Command enum type
+    /// * Methods: `$vis fn $method($arg: $type) => $variant($args)`
     #[macro_export]
     macro_rules! impl_controller {
         ($controller:ident, $cmd_type:ident, {
             $(
                 $(#[$meta:meta])*
-                // 重点：在这里增加 $vis:vis 匹配
-                $vis:vis fn $method:ident($($arg:ident : $type:ty),* $(,)?) => $variant:ident $constructor:tt;
+                $vis:vis async fn $method:ident($($arg:ident : $type:ty),* $(,)?) => $variant:ident $constructor:tt;
             )*
         }) => {
             impl $controller {
                 $(
                     $(#[$meta])*
-                    // 将匹配到的可见性填在这里
                     $vis async fn $method(&self, $($arg : $type),*) -> $crate::MksResult {
                         self.0.send($cmd_type::$variant $constructor).await?;
                         Ok(())
@@ -45,6 +57,17 @@ pub mod macros {
         };
     }
 
+    /// Generates async function that watches D-Bus properties and emits events.
+    ///
+    /// Generates `async fn $fn_name(proxy, event_tx) -> JoinHandle`
+    /// that fetches initial values and subscribes to property change signals.
+    ///
+    /// # Arguments
+    /// * `$fn_name` - Generated function name
+    /// * `$proxy_type` - zbus proxy type
+    /// * `$event_type` - Event enum type
+    /// * `$log_context` - Log context string
+    /// * Mappings: `$getter => $signal => $map_fn`
     #[macro_export]
     macro_rules! generate_watcher {
         (
@@ -59,24 +82,33 @@ pub mod macros {
             }
         ) => {
             async fn $fn_name(
-                proxy: std::sync::Arc<$proxy_type>,
-                event_tx: kanal::AsyncSender<$event_type>,
-            ) -> $crate::MksResult<tokio::task::JoinHandle<()>> {
+                proxy: $proxy_type,
+                event_tx: ::kanal::AsyncSender<$event_type>,
+            ) -> $crate::MksResult<::tokio::task::JoinHandle<()>> {
                 $(
                     let $signal = proxy.$signal().await;
                 )*
+
                 let fut = async move {
-                    let mut streams = Vec::new();
+                    let mut streams = ::std::vec::Vec::new();
                     $(
                         let p = proxy.clone();
-                        streams.push($crate::dbus::utils::fetch_then_update(
+                        streams.push($crate::fetch_then_update(
                             async move { p.$getter().await },
                             $signal,
                             $map_fn,
                         ));
                     )*
-                    let mut agg_stream = futures_util::stream::select_all(streams);
-                    while let Some(res) = futures_util::StreamExt::next(&mut agg_stream).await {
+
+                    if streams.is_empty() {
+                        ::log::warn!("No properties to watch for {}", $log_context);
+                        return;
+                    }
+
+                    use ::futures_util::StreamExt;
+                    let mut agg_stream = ::futures_util::stream::select_all(streams);
+
+                    while let Some(res) = agg_stream.next().await {
                         match res {
                             Ok(event) => {
                                 if event_tx.send(event).await.is_err() {
@@ -84,16 +116,27 @@ pub mod macros {
                                 }
                             }
                             Err(e) => {
-                                log::warn!(error:? = e; "Error reading {} property", $log_context);
+                                ::log::error!(error:? = e; "Error reading {} property", $log_context);
                             }
                         }
                     }
                 };
-                Ok(tokio::spawn(fut))
+                Ok(::tokio::spawn(fut))
             }
         };
     }
 
+    /// Generates async function that handles commands by calling D-Bus methods.
+    ///
+    /// Generates `async fn $fn_name(proxy, cmd_rx) -> JoinHandle`
+    /// that receives commands and calls corresponding D-Bus methods.
+    ///
+    /// # Arguments
+    /// * `$fn_name` - Generated function name
+    /// * `$proxy_type` - zbus proxy type
+    /// * `$cmd_type` - Command enum type
+    /// * `$log_context` - Log context string
+    /// * Patterns: `$pattern => $dbus_call`
     #[macro_export]
     macro_rules! generate_handler {
         (
@@ -108,9 +151,9 @@ pub mod macros {
             }
         ) => {
             async fn $fn_name(
-                $p: std::sync::Arc<$proxy_type>,
-                cmd_rx: kanal::AsyncReceiver<$cmd_type>,
-            ) -> $crate::MksResult<tokio::task::JoinHandle<()>> {
+                $p: $proxy_type,
+                cmd_rx: ::kanal::AsyncReceiver<$cmd_type>,
+            ) -> $crate::MksResult<::tokio::task::JoinHandle<()>> {
                 let fut = async move {
                     while let Ok(cmd) = cmd_rx.recv().await {
                         let res = match cmd {
@@ -119,32 +162,92 @@ pub mod macros {
                             )*
                         };
                         if let Err(e) = res {
-                            log::error!(error:? = e; "{} failed to call method", $log_context);
+                            ::log::error!(error:? = e; "{} failed to call method", $log_context);
                         }
                     }
                 };
-                Ok(tokio::spawn(fut))
+                Ok(::tokio::spawn(fut))
             }
         };
     }
 
+    /// Generates session struct and `connect()` for D-Bus interface.
+    ///
+    /// Generates:
+    /// - `pub struct $session_name { tx, rx, watch_task, cmd_handler }`
+    /// - `impl $session_name { pub async fn connect(conn, path) -> Result<Self> }`
+    /// - `Drop` impl that aborts tasks and closes channels
+    ///
+    /// Bounded channel if `$backpressure > 0`, otherwise unbounded.
+    ///
+    /// # Example
+    /// ```ignore
+    /// impl_session_connect!(
+    ///     ConsoleSession, ConsoleProxy<'static>, ConsoleController,
+    ///     Command, Event, watch_proxy_changes, handle_commands, 32
+    /// );
+    /// let session = ConsoleSession::connect(&conn, "/org/qemu/Display1/Console_0").await?;
+    /// ```
     #[macro_export]
     macro_rules! impl_session_connect {
-        ($session_name:ident, $proxy_type:ty, $controller_type:ty, $command_type:ty, $event_type:ty) => {
+        (
+            $session_name:ident,
+            $proxy_type:ty,
+            $controller_type:ty,
+            $command_type:ty,
+            $event_type:ty,
+            $watcher_fn:ident,
+            $handler_fn:ident
+        ) => {
+            $crate::impl_session_connect!(
+                $session_name,
+                $proxy_type,
+                $controller_type,
+                $command_type,
+                $event_type,
+                $watcher_fn,
+                $handler_fn,
+                0
+            );
+        };
+        (
+            $session_name:ident,
+            $proxy_type:ty,
+            $controller_type:ty,
+            $command_type:ty,
+            $event_type:ty,
+            $watcher_fn:ident,
+            $handler_fn:ident,
+            $backpressure:expr
+        ) => {
             pub struct $session_name {
                 pub tx: $controller_type,
-                pub rx: kanal::AsyncReceiver<$event_type>,
-                pub watch_task: tokio::task::JoinHandle<()>,
-                pub cmd_handler: tokio::task::JoinHandle<()>,
+                pub rx: ::kanal::AsyncReceiver<$event_type>,
+                pub watch_task: ::tokio::task::JoinHandle<()>,
+                pub cmd_handler: ::tokio::task::JoinHandle<()>,
             }
-            pub async fn connect(conn: &zbus::Connection, path: String) -> $crate::MksResult<$session_name> {
-                let proxy = std::sync::Arc::new(<$proxy_type>::new(conn, path).await?);
-                let (event_tx, event_rx) = kanal::unbounded_async::<$event_type>();
-                let (cmd_tx, cmd_rx) = kanal::unbounded_async::<$command_type>();
-                let controller = <$controller_type>::from(cmd_tx);
-                let watch_task = watch_proxy_changes(proxy.clone(), event_tx).await?;
-                let cmd_handler = handle_commands(proxy.clone(), cmd_rx).await?;
-                Ok($session_name { tx: controller, rx: event_rx, watch_task, cmd_handler })
+
+            impl Drop for $session_name {
+                fn drop(&mut self) {
+                    self.watch_task.abort();
+                    self.cmd_handler.abort();
+                }
+            }
+
+            impl $session_name {
+                pub async fn connect(conn: &zbus::Connection, path: impl Into<String>) -> $crate::MksResult<Self> {
+                    let proxy = <$proxy_type>::new(conn, path.into()).await?;
+                    let (event_tx, event_rx) = ::kanal::unbounded_async::<$event_type>();
+                    let (cmd_tx, cmd_rx) = if $backpressure > 0 {
+                        ::kanal::bounded_async::<$command_type>($backpressure)
+                    } else {
+                        ::kanal::unbounded_async::<$command_type>()
+                    };
+                    let controller = <$controller_type>::from(cmd_tx);
+                    let watch_task = $watcher_fn(proxy.clone(), event_tx).await?;
+                    let cmd_handler = $handler_fn(proxy, cmd_rx).await?;
+                    Ok(Self { tx: controller, rx: event_rx, watch_task, cmd_handler })
+                }
             }
         };
     }

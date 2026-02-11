@@ -2,7 +2,7 @@
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.VM-section>
 use crate::generate_watcher;
 use kanal::AsyncReceiver;
-use std::sync::Arc;
+use tokio::task::JoinHandle;
 use zbus::{Connection, Result, proxy};
 
 #[proxy(
@@ -43,12 +43,16 @@ pub enum Event {
 /// VM event listener and its watch task.
 pub struct VmListener {
     pub rx: AsyncReceiver<Event>,
-    pub watch_task: tokio::task::JoinHandle<()>,
+    pub watch_task: JoinHandle<()>,
+}
+
+impl Drop for VmListener {
+    fn drop(&mut self) { self.watch_task.abort(); }
 }
 
 /// Connect to the VM interface and return an event listener with its watch task.
 pub async fn connect(conn: &Connection) -> crate::MksResult<VmListener> {
-    let proxy: Arc<VmProxy<'static>> = Arc::new(VmProxy::new(conn).await?);
+    let proxy = VmProxy::new(conn).await?;
     let (event_tx, event_rx) = kanal::unbounded_async::<Event>();
     let watch_task = watch_proxy_changes(proxy, event_tx).await?;
     Ok(VmListener { rx: event_rx, watch_task })

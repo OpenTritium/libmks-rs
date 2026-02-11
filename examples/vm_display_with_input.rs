@@ -3,10 +3,10 @@ use libmks_rs::{
     dbus::{
         console::ConsoleController,
         keyboard::KeyboardController,
-        listener::QemuEvent,
+        listener::Event,
         mouse::{self, MouseController},
     },
-    display::vm_display::{VmDisplayInit, VmDisplayModel},
+    display::vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
 };
 use log::{info, warn};
 use relm4::{Controller, gtk::prelude::*, prelude::*};
@@ -36,12 +36,12 @@ impl SimpleComponent for AppModel {
     }
 
     fn init(_: (), root: Self::Root, _sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let (tx, rx) = kanal::unbounded_async::<QemuEvent>();
+        let (tx, rx) = kanal::unbounded_async::<Event>();
 
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx) = create_mock_controllers();
 
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit { rx, console_ctrl, mouse_ctrl, keyboard_ctrl: kbd_ctrl })
+            .launch(VmDisplayInit { rx, console_ctrl, mouse_ctrl, keyboard_ctrl: kbd_ctrl, grab_shortcut: GrabShortcut::default() })
             .detach();
 
         let display_widget = _display.widget().clone();
@@ -57,9 +57,9 @@ impl SimpleComponent for AppModel {
 
 fn create_mock_controllers()
 -> (ConsoleController, MouseController, KeyboardController, kanal::AsyncReceiver<mouse::Command>) {
-    let (console_tx, mut console_rx) = kanal::unbounded_async();
+    let (console_tx, console_rx) = kanal::unbounded_async();
     let (mouse_tx, mouse_rx) = kanal::unbounded_async();
-    let (kbd_tx, mut kbd_rx) = kanal::unbounded_async();
+    let (kbd_tx, kbd_rx) = kanal::unbounded_async();
 
     tokio::spawn(async move {
         while let Ok(cmd) = console_rx.recv().await {
@@ -110,7 +110,7 @@ fn generate_frame(width: u32, height: u32, bg_r: u8, bg_g: u8, bg_b: u8) -> Vec<
     data
 }
 
-async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::AsyncReceiver<mouse::Command>) {
+async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncReceiver<mouse::Command>) {
     let cursor_w = 64;
     let cursor_h = 64;
     let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
@@ -122,7 +122,7 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
         cursor_data[offset + 3] = 255;
     }
 
-    tx.send(QemuEvent::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 0, hot_y: 0, data: cursor_data })
+    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 0, hot_y: 0, data: cursor_data.into() })
         .await
         .ok();
 
@@ -136,12 +136,12 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
     info!("Diagnostic: Mouse moves will be logged every 60 samples");
 
     let bg_data = generate_frame(current_w, current_h, 0, 0, 255);
-    tx.send(QemuEvent::Scanout {
+    tx.send(Event::Scanout {
         width: current_w,
         height: current_h,
         stride: current_w * 4,
         pixman_format: 0x20028888,
-        data: bg_data,
+        data: bg_data.into(),
     })
     .await
     .ok();
@@ -159,12 +159,12 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
                     current_h = 720;
 
                     let bg = generate_frame(current_w, current_h, 0, 255, 0);
-                    tx.send(QemuEvent::Scanout {
+                    tx.send(Event::Scanout {
                         width: current_w,
                         height: current_h,
                         stride: current_w * 4,
                         pixman_format: 0x20028888,
-                        data: bg,
+                        data: bg.into(),
                     })
                     .await
                     .ok();
@@ -172,7 +172,7 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
 
                 if frame_count == 360 {
                     info!("Phase 3: Disable Event - Cursor should disappear");
-                    tx.send(QemuEvent::Disable).await.ok();
+                    tx.send(Event::Disable).await.ok();
                 }
 
                 if frame_count == 480 {
@@ -181,12 +181,12 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
                     current_h = 600;
 
                     let bg = generate_frame(current_w, current_h, 255, 0, 0);
-                    tx.send(QemuEvent::Scanout {
+                    tx.send(Event::Scanout {
                         width: current_w,
                         height: current_h,
                         stride: current_w * 4,
                         pixman_format: 0x20028888,
-                        data: bg,
+                        data: bg.into(),
                     })
                     .await
                     .ok();
@@ -203,7 +203,7 @@ async fn mock_qemu_source(tx: AsyncSender<QemuEvent>, mouse_cmd_rx: kanal::Async
                                 info!("[Mock] RECV SetAbsPosition: {}, {} (Sampled #{})", x, y, move_log_counter);
                             }
 
-                            tx.send(QemuEvent::MouseSet {
+                            tx.send(Event::MouseSet {
                                 x: x as i32,
                                 y: y as i32,
                                 on: 1,
