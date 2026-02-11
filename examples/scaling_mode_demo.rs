@@ -72,7 +72,13 @@ impl SimpleComponent for AppModel {
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx) = create_mock_controllers();
 
         let display = VmDisplayModel::builder()
-            .launch(VmDisplayInit { rx, console_ctrl, mouse_ctrl, keyboard_ctrl: kbd_ctrl, grab_shortcut: GrabShortcut::default() })
+            .launch(VmDisplayInit {
+                rx,
+                console_ctrl,
+                mouse_ctrl,
+                keyboard_ctrl: kbd_ctrl,
+                grab_shortcut: GrabShortcut::default(),
+            })
             .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
         let display_widget = display.widget().clone();
@@ -112,13 +118,12 @@ enum AppMsg {
     Ignore,
 }
 
-fn create_mock_controllers()
--> (
+fn create_mock_controllers() -> (
     ConsoleController,
     MouseController,
     KeyboardController,
     kanal::AsyncReceiver<mouse::Command>,
-    kanal::AsyncReceiver<console::Command>
+    kanal::AsyncReceiver<console::Command>,
 ) {
     let (console_tx, console_rx) = kanal::unbounded_async();
     let (mouse_tx, mouse_rx) = kanal::unbounded_async();
@@ -162,9 +167,8 @@ fn generate_psychedelic_frame(width: u32, height: u32, time_offset: u32) -> Vec<
 }
 
 async fn mock_qemu_backend(
-    tx: AsyncSender<Event>,
-    mouse_rx: kanal::AsyncReceiver<mouse::Command>,
-    console_rx: kanal::AsyncReceiver<console::Command>
+    tx: AsyncSender<Event>, mouse_rx: kanal::AsyncReceiver<mouse::Command>,
+    console_rx: kanal::AsyncReceiver<console::Command>,
 ) {
     info!("🎨 Mock Backend Started - Initializing psychedelic display...");
 
@@ -176,19 +180,15 @@ async fn mock_qemu_backend(
             let idx = ((y * cursor_w + x) * 4) as usize;
             let is_border = x == 0 || x == cursor_w - 1 || y == 0 || y == cursor_h - 1;
             if is_border {
-                cursor_data[idx..idx+4].copy_from_slice(&[0, 0, 0, 255]);
+                cursor_data[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]);
             } else {
-                cursor_data[idx..idx+4].copy_from_slice(&[255, 255, 255, 255]);
+                cursor_data[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
         }
     }
-    tx.send(Event::CursorDefine {
-        width: cursor_w,
-        height: cursor_h,
-        hot_x: 16,
-        hot_y: 16,
-        data: cursor_data.into(),
-    }).await.ok();
+    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 16, hot_y: 16, data: cursor_data.into() })
+        .await
+        .ok();
 
     let mut current_w = 800u32;
     let mut current_h = 600u32;
@@ -232,12 +232,10 @@ async fn mock_qemu_backend(
             }
 
             Ok(cmd) = console_rx.recv() => {
-                if let console::Command::SetUiInfo { width, height, .. } = cmd {
-                    if width > 0 && height > 0 && (width != current_w || height != current_h) {
-                        info!("📐 Guest Resizing: {}x{} → {}x{}", current_w, current_h, width, height);
-                        current_w = width;
-                        current_h = height;
-                    }
+                if let console::Command::SetUiInfo { width, height, .. } = cmd && width > 0 && height > 0 && (width != current_w || height != current_h) {
+                    info!("📐 Guest Resizing: {}x{} → {}x{}", current_w, current_h, width, height);
+                    current_w = width;
+                    current_h = height;
                 }
             }
         }
@@ -245,9 +243,7 @@ async fn mock_qemu_backend(
 }
 
 fn main() {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
 
     let app = RelmApp::new("com.falcon.display.xor");
     app.run::<AppModel>(());

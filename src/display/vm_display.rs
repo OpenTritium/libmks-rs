@@ -12,16 +12,18 @@ use kanal::{AsyncReceiver, AsyncSender};
 use log::{error, info, warn};
 use relm4::{
     gtk::{
-        Align, AspectFrame, ContentFit, DrawingArea, EventController, EventControllerFocus, EventControllerKey,
-        EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload,
-        GraphicsOffloadEnabled, Label, Overlay, Picture,
-        gdk::{ModifierType, Key},
-        glib::{Object, Propagation, object::Cast, translate::IntoGlib},
+        Align, AspectFrame, ContentFit, CssProvider, DrawingArea, EventController, EventControllerFocus,
+        EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Fixed,
+        GestureClick, GraphicsOffload, GraphicsOffloadEnabled, Label, Overlay, Picture,
+        STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
+        gdk::{Cursor, Display, Key, MemoryFormat, MemoryTexture, ModifierType},
+        glib::{Bytes, Object, Propagation, object::Cast, translate::IntoGlib},
         prelude::*,
+        style_context_add_provider_for_display,
     },
     prelude::*,
 };
-use std::{num::NonZeroU32, ops::Not, time::Duration, vec::Vec};
+use std::{fmt, num::NonZeroU32, time::Duration, vec::Vec};
 use tokio::{select, time::sleep};
 
 const INCH_TO_MM: f64 = 25.4;
@@ -36,32 +38,15 @@ pub struct GrabShortcut {
 }
 
 impl Default for GrabShortcut {
-    fn default() -> Self {
-        Self {
-            mask: ModifierType::CONTROL_MASK | ModifierType::ALT_MASK,
-            key: Key::g,
-        }
-    }
+    fn default() -> Self { Self { mask: ModifierType::CONTROL_MASK | ModifierType::ALT_MASK, key: Key::g } }
 }
 
-impl GrabShortcut {
-    /// Format shortcut for display (e.g., "Ctrl+Alt+G")
-    pub fn display_name(&self) -> String {
-        let key_name = self.key.name().map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
-        let mut parts = Vec::new();
-        
-        if self.mask.contains(ModifierType::CONTROL_MASK) {
-            parts.push("Ctrl");
-        }
-        if self.mask.contains(ModifierType::ALT_MASK) {
-            parts.push("Alt");
-        }
-        if self.mask.contains(ModifierType::SHIFT_MASK) {
-            parts.push("Shift");
-        }
-        
-        parts.push(&key_name);
-        parts.join("+")
+impl fmt::Display for GrabShortcut {
+    /// Format shortcut for display using GTK's native accelerator labeler
+    /// Supports cross-platform display (e.g., "⌃⌥G" on macOS, "Ctrl+Alt+G" on Linux)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = accelerator_get_label(self.key, self.mask);
+        write!(f, "{label}")
     }
 }
 
@@ -84,14 +69,14 @@ pub enum Message {
     CanvasResize(NonZeroU32, NonZeroU32),
     MouseMove { x: f64, y: f64 },
     MouseButton { button: u32, pressed: bool },
-    Scroll { dx: f64, dy: f64 },
+    Scroll { dy: f64 },
     Key { keyval: u32, keycode: u32, pressed: bool },
     UpdateMonitorInfo { mm_per_pixel: f64 },
     SetScalingMode(ScalingMode),
     ToggleCapture(bool),
-    ShowCaptureHint,
     HideCaptureHint,
     UpdateCaptureView,
+    CheckCaptureState,
 }
 
 pub struct VmDisplayModel {
@@ -104,11 +89,11 @@ pub struct VmDisplayModel {
     scaling_mode: ScalingMode,
     mm_per_pixel: f64,
     resize_tx: AsyncSender<ResizeCommand>,
-    scroll_acc_x: f64,
     scroll_acc_y: f64,
     grab_shortcut: GrabShortcut,
     is_captured: bool,
     hint_visible: bool,
+    hint_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct VmDisplayWidgets {
@@ -118,8 +103,9 @@ pub struct VmDisplayWidgets {
     pub input_plane: DrawingArea,
     pub cursor_layer: Fixed,
     pub cursor_picture: Picture,
-    pub controllers: Box<[EventController]>,
+    pub controllers: Box<[EventController]> ,
     pub capture_hint: Label,
+    pub invisible_cursor: Cursor,
 }
 
 pub struct VmDisplayInit {
@@ -166,6 +152,18 @@ fn spawn_resize_debouncer(rx: AsyncReceiver<ResizeCommand>, console: ConsoleCont
     });
 }
 
+impl VmDisplayModel {
+    fn reset_hint_timer(&mut self, sender: ComponentSender<Self>) {
+        if let Some(handle) = self.hint_timer.take() {
+            handle.abort();
+        }
+        self.hint_timer = Some(relm4::spawn(async move {
+            sleep(Duration::from_secs(3)).await;
+            sender.input(Message::HideCaptureHint);
+        }));
+    }
+}
+
 impl Component for VmDisplayModel {
     type CommandOutput = ();
     type Init = VmDisplayInit;
@@ -180,14 +178,10 @@ impl Component for VmDisplayModel {
     }
 
     fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let css_provider = gtk::CssProvider::new();
-        css_provider.load_from_data(include_str!("capture-hint.css"));
-        if let Some(display) = &gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                display,
-                &css_provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
+        let css_provider = CssProvider::new();
+        css_provider.load_from_string(include_str!("capture-hint.css"));
+        if let Some(display) = &Display::default() {
+            style_context_add_provider_for_display(display, &css_provider, STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
 
         let (resize_tx, resize_rx) = kanal::bounded_async(8);
@@ -202,11 +196,11 @@ impl Component for VmDisplayModel {
             scaling_mode: ScalingMode::ResizeGuest,
             mm_per_pixel: DEFAULT_MM_PER_PIXEL,
             resize_tx,
-            scroll_acc_x: 0.,
             scroll_acc_y: 0.,
             grab_shortcut: init.grab_shortcut,
             is_captured: false,
             hint_visible: false,
+            hint_timer: None,
         };
         let aspect_frame = AspectFrame::builder()
             .halign(Align::Fill)
@@ -268,12 +262,19 @@ impl Component for VmDisplayModel {
         controllers.push(motion.upcast());
 
         let leave_controller = EventControllerMotion::new();
-        let sender_clone = sender.clone();
         leave_controller.connect_leave(move |_| {
-            sender_clone.input(Message::ToggleCapture(false));
+            info!("Mouse left window, retaining capture state.");
         });
         input_plane.add_controller(leave_controller.clone());
         controllers.push(leave_controller.upcast());
+
+        let enter_controller = EventControllerMotion::new();
+        let sender_clone = sender.clone();
+        enter_controller.connect_enter(move |_, _, _| {
+            sender_clone.input(Message::CheckCaptureState);
+        });
+        input_plane.add_controller(enter_controller.clone());
+        controllers.push(enter_controller.upcast());
 
         let click = GestureClick::new();
         click.set_button(0);
@@ -291,10 +292,10 @@ impl Component for VmDisplayModel {
         input_plane.add_controller(click.clone());
         controllers.push(click.upcast());
 
-        let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
+        let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
         let sender_clone = sender.clone();
-        scroll.connect_scroll(move |_, dx, dy| {
-            sender_clone.input(Message::Scroll { dx, dy });
+        scroll.connect_scroll(move |_, _dx, dy| {
+            sender_clone.input(Message::Scroll { dy });
             Propagation::Proceed // 转发会将消息直接消费,我们其他控件还需要这个事件
         });
         input_plane.add_controller(scroll.clone());
@@ -345,7 +346,7 @@ impl Component for VmDisplayModel {
         cursor_layer.put(&cursor_picture, 0., 0.);
 
         let capture_hint = Label::builder()
-            .label(&format!("Press {} to release mouse", init.grab_shortcut.display_name()))
+            .label(format!("Press {} to release mouse", init.grab_shortcut))
             .halign(Align::Center)
             .valign(Align::Start)
             .margin_top(20)
@@ -354,27 +355,32 @@ impl Component for VmDisplayModel {
             .can_target(false)
             .build();
 
+        let invisible_cursor = {
+            static TRANSPARENT_PIXEL: [u8; 4] = [0, 0, 0, 0];
+            let bytes = Bytes::from_static(&TRANSPARENT_PIXEL);
+            let texture = MemoryTexture::new(
+                1,
+                1,
+                MemoryFormat::R8g8b8a8,
+                &bytes,
+                4
+            );
+            Cursor::from_texture(&texture, 0, 0, None)
+        };
+
         let resize_handler = {
             let updater = update_monitor_info.clone();
             let sender = sender.clone();
             move |widget: &DrawingArea| {
                 updater(widget);
-
                 let scale = widget.scale_factor();
                 let width = widget.width();
                 let height = widget.height();
-
                 let phy_w = width * scale;
                 let phy_h = height * scale;
-
-                if let (Some(w), Some(h)) = (
-                    NonZeroU32::new(phy_w.max(1) as u32),
-                    NonZeroU32::new(phy_h.max(1) as u32),
-                ) {
-                    info!(
-                        "HiDPI: scale={}, logical={}x{}, physical={}x{}",
-                        scale, width, height, phy_w, phy_h
-                    );
+                if let (Some(w), Some(h)) = (NonZeroU32::new(phy_w.max(1) as u32), NonZeroU32::new(phy_h.max(1) as u32))
+                {
+                    info!("HiDPI: scale={scale}, logical={width}x{height}, physical={phy_w}x{phy_h}");
                     sender.input(Message::CanvasResize(w, h));
                 }
             }
@@ -414,11 +420,12 @@ impl Component for VmDisplayModel {
             cursor_picture,
             controllers,
             capture_hint,
+            invisible_cursor,
         };
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, _root: &Self::Root) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         use Message::*;
         match msg {
             Qemu(event) => {
@@ -436,8 +443,10 @@ impl Component for VmDisplayModel {
                     error!(error:? =e; "Failed to send resize command");
                 }
             }
-
             MouseMove { x, y } => {
+                if !self.is_captured {
+                    return;
+                }
                 let (vm_w, vm_h) = self.screen.resolution();
                 let (canvas_w, canvas_h) = self.canvas_size;
                 if vm_w == 0 || vm_h == 0 || canvas_w <= 0. || canvas_h <= 0. {
@@ -458,45 +467,41 @@ impl Component for VmDisplayModel {
                     }
                 }
             }
-
             ToggleCapture(should_capture) => {
                 if self.is_captured == should_capture {
+                    if should_capture {
+                        self.reset_hint_timer(sender.clone());
+                    }
                     return;
                 }
-
                 self.is_captured = should_capture;
-
                 if should_capture {
-                    info!("🖱️ Mouse captured - {} to release", self.grab_shortcut.display_name());
+                    info!("🖱️ Mouse captured - {} to release", self.grab_shortcut);
                     self.hint_visible = true;
-                    _sender.input(Message::ShowCaptureHint);
+                    self.reset_hint_timer(sender.clone());
                 } else {
                     info!("🖱️ Mouse released - Click to capture");
                     self.hint_visible = false;
+                    if let Some(handle) = self.hint_timer.take() {
+                        handle.abort();
+                    }
                 }
 
-                _sender.input(Message::UpdateCaptureView);
+                sender.input(Message::UpdateCaptureView);
             }
-
-            ShowCaptureHint => {
-                let sender = _sender.clone();
-                relm4::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    sender.input(Message::HideCaptureHint);
-                });
+            CheckCaptureState => {
+                if self.is_captured {
+                    sender.input(Message::UpdateCaptureView);
+                }
             }
-
             HideCaptureHint => {
-                if self.hint_visible {
-                    self.hint_visible = false;
-                    self.changes.cursor = true;
-                }
+                self.hint_visible = false;
+                self.hint_timer = None;
+                self.changes.cursor = true;
             }
-
             UpdateCaptureView => {
                 self.changes.cursor = true;
             }
-
             Message::MouseButton { button, pressed } => {
                 let Some(btn) = QemuButton::from_xorg(button) else {
                     warn!("Ignored unsupported X11 mouse button {button}: no mapping to QEMU protocol.");
@@ -514,10 +519,12 @@ impl Component for VmDisplayModel {
                     }
                 });
             }
-
-            Message::Scroll { dx, dy } => {
-                self.scroll_acc_x += dx;
+            Scroll { dy } => {
+                if !self.is_captured {
+                    return;
+                }
                 self.scroll_acc_y += dy;
+
                 while self.scroll_acc_y.abs() >= 1. {
                     let btn = if self.scroll_acc_y > 0. {
                         QemuButton::WheelDown
@@ -535,27 +542,11 @@ impl Component for VmDisplayModel {
                     });
                     self.scroll_acc_y -= if self.scroll_acc_y > 0. { 1. } else { -1. };
                 }
-
-                while self.scroll_acc_x.abs() >= 1. {
-                    let btn = if self.scroll_acc_x > 0. {
-                        QemuButton::Side
-                    } else {
-                        QemuButton::Extra
-                    };
-                    let ctrl = self.mouse_ctrl.clone();
-                    relm4::spawn(async move {
-                        if let Err(e) = ctrl.press(btn).await {
-                            error!(error:? = e; "Failed to send scroll press");
-                        }
-                        if let Err(e) = ctrl.release(btn).await {
-                            error!(error:? = e; "Failed to send scroll release");
-                        }
-                    });
-                    self.scroll_acc_x -= if self.scroll_acc_x > 0. { 1. } else { -1. };
-                }
             }
-
-            Message::Key { keyval: _, keycode, pressed } => {
+            Key { keyval: _, keycode, pressed } => {
+                if !self.is_captured {
+                    return;
+                }
                 let qnum = Qnum::from_xorg_keycode(keycode);
                 let ctrl = self.keyboard_ctrl.clone();
                 relm4::spawn(async move {
@@ -569,8 +560,7 @@ impl Component for VmDisplayModel {
                     }
                 });
             }
-
-            Message::UpdateMonitorInfo { mm_per_pixel } => {
+            UpdateMonitorInfo { mm_per_pixel } => {
                 self.mm_per_pixel = mm_per_pixel;
                 info!(
                     "Updated monitor DPI info: {:.6} mm/px (approx {:.1} DPI)",
@@ -578,8 +568,7 @@ impl Component for VmDisplayModel {
                     INCH_TO_MM / mm_per_pixel
                 );
             }
-
-            Message::SetScalingMode(mode) => {
+            SetScalingMode(mode) => {
                 self.scaling_mode = mode;
                 info!("Scaling mode set to: {:?}", mode);
                 if mode == ScalingMode::ResizeGuest {
@@ -612,7 +601,6 @@ impl Component for VmDisplayModel {
                 widgets.vm_picture.set_paintable(None::<&gtk::gdk::Texture>);
             }
         }
-
         if self.hint_visible {
             widgets.capture_hint.add_css_class("toast-visible");
             widgets.capture_hint.remove_css_class("toast-hidden");
@@ -620,17 +608,14 @@ impl Component for VmDisplayModel {
             widgets.capture_hint.add_css_class("toast-hidden");
             widgets.capture_hint.remove_css_class("toast-visible");
         }
-
         if self.is_captured {
-            widgets.input_plane.set_cursor_from_name(Some("none"));
+            widgets.input_plane.set_cursor(Some(&widgets.invisible_cursor));
         } else {
-            widgets.input_plane.set_cursor_from_name(None);
+            widgets.input_plane.set_cursor(None);
         }
-
-        if self.changes.any().not() {
+        if !self.changes.any() {
             return;
         }
-
         let ui_scale = widgets.input_plane.scale_factor() as f64;
         let (vm_w, vm_h) = self.screen.resolution();
         let (canvas_w, canvas_h) = self.canvas_size;
@@ -641,38 +626,34 @@ impl Component for VmDisplayModel {
         let cursor = &self.screen.cursor;
         widgets.cursor_picture.set_visible(cursor.visible);
         if !cursor.visible {
+            if widgets.cursor_picture.paintable().is_some() {
+                widgets.cursor_picture.set_paintable(None::<&gtk::gdk::Texture>);
+            }
             return;
         }
         let scale_x = canvas_w / vm_w as f64;
         let scale_y = canvas_h / vm_h as f64;
         let scale = scale_x.min(scale_y);
-
         let final_x_phy = (cursor.x - cursor.hot_x) as f64 * scale;
         let final_y_phy = (cursor.y - cursor.hot_y) as f64 * scale;
-
         widgets.cursor_layer.move_(&widgets.cursor_picture, final_x_phy / ui_scale, final_y_phy / ui_scale);
-
-        if let Some(tex) = &cursor.texture {
-            let tex_obj = tex.clone().upcast::<Object>();
-            let tex_ptr = tex_obj.as_ptr();
-            let should_update_texture =
-                widgets.cursor_picture.paintable().is_none_or(|p| p.upcast::<Object>().as_ptr() != tex_ptr);
-            if should_update_texture {
-                widgets.cursor_picture.set_paintable(Some(tex));
-            }
-
-            let cursor_w_phy = tex.width() as f64 * scale;
-            let cursor_h_phy = tex.height() as f64 * scale;
-
-            let cursor_w_logical = (cursor_w_phy / ui_scale).ceil() as i32;
-            let cursor_h_logical = (cursor_h_phy / ui_scale).ceil() as i32;
-
-            if widgets.cursor_picture.width_request() != cursor_w_logical
-                || widgets.cursor_picture.height_request() != cursor_h_logical
-            {
-                widgets.cursor_picture.set_width_request(cursor_w_logical);
-                widgets.cursor_picture.set_height_request(cursor_h_logical);
-            }
+        let Some(tex) = &cursor.texture else { return };
+        let tex_obj = tex.clone().upcast::<Object>();
+        let tex_ptr = tex_obj.as_ptr();
+        let should_update_texture =
+            widgets.cursor_picture.paintable().is_none_or(|p| p.upcast::<Object>().as_ptr() != tex_ptr);
+        if should_update_texture {
+            widgets.cursor_picture.set_paintable(Some(tex));
+        }
+        let cursor_w_phy = tex.width() as f64 * scale;
+        let cursor_h_phy = tex.height() as f64 * scale;
+        let cursor_w_logical = (cursor_w_phy / ui_scale).ceil() as i32;
+        let cursor_h_logical = (cursor_h_phy / ui_scale).ceil() as i32;
+        if widgets.cursor_picture.width_request() != cursor_w_logical
+            || widgets.cursor_picture.height_request() != cursor_h_logical
+        {
+            widgets.cursor_picture.set_width_request(cursor_w_logical);
+            widgets.cursor_picture.set_height_request(cursor_h_logical);
         }
     }
 }
