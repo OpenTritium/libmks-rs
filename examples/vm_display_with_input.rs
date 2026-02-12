@@ -8,7 +8,7 @@ use libmks_rs::{
     },
     display::vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 use relm4::{Controller, gtk::prelude::*, prelude::*};
 use std::time::Duration;
 
@@ -41,7 +41,13 @@ impl SimpleComponent for AppModel {
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx) = create_mock_controllers();
 
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit { rx, console_ctrl, mouse_ctrl, keyboard_ctrl: kbd_ctrl, grab_shortcut: GrabShortcut::default() })
+            .launch(VmDisplayInit {
+                rx,
+                console_ctrl,
+                mouse_ctrl,
+                keyboard_ctrl: kbd_ctrl,
+                grab_shortcut: GrabShortcut::default(),
+            })
             .detach();
 
         let display_widget = _display.widget().clone();
@@ -114,26 +120,36 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
     let cursor_w = 64;
     let cursor_h = 64;
     let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
-    for i in 0..(cursor_w * cursor_h) as usize {
-        let offset = i * 4;
-        cursor_data[offset] = 0;
-        cursor_data[offset + 1] = 255;
-        cursor_data[offset + 2] = 255;
-        cursor_data[offset + 3] = 255;
+    for y in 0..cursor_h {
+        for x in 0..cursor_w {
+            let i = ((y * cursor_w + x) * 4) as usize;
+            let is_center_line = x == 31 || y == 31;
+            let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
+
+            if is_center_line {
+                cursor_data[i..i+4].copy_from_slice(&[255, 255, 255, 255]);
+            } else if is_border {
+                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 255]);
+            } else {
+                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
     }
 
-    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 0, hot_y: 0, data: cursor_data.into() })
+    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 31, hot_y: 31, data: cursor_data.into() })
         .await
         .ok();
 
     let mut current_w = 800;
     let mut current_h = 600;
     let mut frame_count: u64 = 0;
-    let mut move_log_counter = 0;
+
+    // === 新增：模拟光标的内部状态 ===
+    let mut mock_cursor_x = 400; // 初始位置
+    let mut mock_cursor_y = 300;
 
     info!("Simulation Started: Phase 1 - 800x600 (Blue)");
     info!("Move your mouse over the VM display to see the cursor follow!");
-    info!("Diagnostic: Mouse moves will be logged every 60 samples");
 
     let bg_data = generate_frame(current_w, current_h, 0, 0, 255);
     tx.send(Event::Scanout {
@@ -190,6 +206,25 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
                     })
                     .await
                     .ok();
+
+                    // 重新定义光标（Disable 事件清空了光标纹理）
+                    let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
+                    for i in 0..(cursor_w * cursor_h) as usize {
+                        let offset = i * 4;
+                        cursor_data[offset] = 0;
+                        cursor_data[offset + 1] = 255;
+                        cursor_data[offset + 2] = 255;
+                        cursor_data[offset + 3] = 255;
+                    }
+                    tx.send(Event::CursorDefine {
+                        width: cursor_w,
+                        height: cursor_h,
+                        hot_x: 0,
+                        hot_y: 0,
+                        data: cursor_data.into(),
+                    })
+                    .await
+                    .ok();
                 }
             }
 
@@ -197,11 +232,9 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
                 if !(360..=480).contains(&frame_count) {
                     match cmd {
                         mouse::Command::SetAbsPosition { x, y } => {
-                            // Diagnostic: Log every 60 moves to confirm data flow
-                            move_log_counter += 1;
-                            if move_log_counter % 60 == 0 {
-                                info!("[Mock] RECV SetAbsPosition: {}, {} (Sampled #{})", x, y, move_log_counter);
-                            }
+                            // 收到绝对坐标（非捕获模式）
+                            mock_cursor_x = x as i32;
+                            mock_cursor_y = y as i32;
 
                             tx.send(Event::MouseSet {
                                 x: x as i32,
@@ -211,14 +244,35 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
                             .await
                             .ok();
                         }
+                        mouse::Command::RelMotion { dx, dy } => {
+                            // === 核心修改：处理相对位移（Wayland 锁定模式）===
+
+                            // 1. 更新模拟光标的内部位置
+                            mock_cursor_x = (mock_cursor_x + dx).clamp(0, current_w as i32);
+                            mock_cursor_y = (mock_cursor_y + dy).clamp(0, current_h as i32);
+
+                            // 2. 发送 MouseSet 消息回 UI，让光标真的动起来
+                            tx.send(Event::MouseSet {
+                                x: mock_cursor_x,
+                                y: mock_cursor_y,
+                                on: 1,
+                            })
+                            .await
+                            .ok();
+
+                            // 3. 打印日志证明我们在使用相对移动
+                            // 使用 debug 级别防止刷屏，或者使用 periodic log
+                            if frame_count % 30 == 0 { // 减少日志刷屏
+                                info!("[Mock] Wayland RelMotion ({}, {}) -> Pos ({}, {})", dx, dy, mock_cursor_x, mock_cursor_y);
+                            } else {
+                                debug!("[Mock] Wayland RelMotion ({}, {})", dx, dy);
+                            }
+                        }
                         mouse::Command::Press(btn) => {
                             info!("[Mock] Press: {:?}", btn);
                         }
                         mouse::Command::Release(btn) => {
                             info!("[Mock] Release: {:?}", btn);
-                        }
-                        mouse::Command::RelMotion { dx, dy } => {
-                            warn!("[Mock] RelMotion dx={}, dy={} (not supported)", dx, dy);
                         }
                     }
                 } else {

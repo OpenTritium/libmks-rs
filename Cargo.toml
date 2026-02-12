@@ -27,12 +27,11 @@ tokio = { version = "1.49", features = ["full"] }
 zbus = "5.13.2"
 zvariant = "5"
 typed-builder = "0.23"
-# [lints.clippy]
-# all = "warn"
-# pedantic = "warn"
 
-# [lints.rust]
-# unsafe_code = "warn"
+# Wayland pointer constraints support
+wayland-client = { version = "0.31" }
+wayland-protocols = { version = "0.32", features = ["unstable", "wayland-client"] }
+gdk4-wayland = { version = "0.10.3", features = ["wayland_crate", "v4_18"] }
 
 [dev-dependencies]
 serial_test = "3.2"
@@ -47,5 +46,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
-[features]
-v4_20 = [] # gnome 49
+
+[lints.clippy]
+all = "warn"
+# pedantic = "warn"

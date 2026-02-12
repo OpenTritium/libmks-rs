@@ -1,8 +1,21 @@
-//! Example demonstrating the new ScalingMode feature.
+//! Example demonstrating both ScalingMode and InputMode features with interactive UI.
 //!
-//! This example shows how to switch between two scaling modes:
-//! - ResizeGuest: Window resize triggers VM resolution change (default)
-//! - FixedGuest: VM resolution stays fixed, window only scales the display
+//! Features:
+//! - Scaling: Resize vs Fixed
+//! - Input: Seamless (Absolute) vs Locked (Relative/Wayland)
+//! - Backend: A psychedelic pattern generator that responds to mouse input mock events.
+//!
+//! How to test:
+//! 1. Launch the application - defaults to "Seamless (Tablet)" mode.
+//! 2. **Testing Seamless mode**: Mouse enters window -> red semi-transparent cursor appears and follows. Mouse exits
+//!    window -> cursor disappears. No clicking needed.
+//! 3. **Switch mode**: Select "Locked (Gaming)" from dropdown menu.
+//! 4. **Testing Locked mode**: Mouse enters window -> cursor stays as system arrow (not locked yet). **Click** window
+//!    -> system cursor disappears, red cursor appears.
+//! 5. **Move** mouse -> red cursor should move according to your movement (this is where the Mock Backend processes
+//!    `RelMotion` events).
+//! 6. **Release**: Press `Ctrl+Alt+G` -> system cursor reappears, red cursor stays in place.
+
 use kanal::AsyncSender;
 use libmks_rs::{
     dbus::{
@@ -13,7 +26,7 @@ use libmks_rs::{
     },
     display::{
         ScalingMode,
-        vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
+        vm_display::{GrabShortcut, InputCaptureMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::info;
@@ -21,7 +34,14 @@ use relm4::{Controller, gtk::prelude::*, prelude::*};
 use std::time::Duration;
 
 struct AppModel {
-    display: Controller<VmDisplayModel>,
+    _display: Controller<VmDisplayModel>,
+}
+
+#[derive(Debug)]
+enum AppMsg {
+    SetScalingMode(ScalingMode),
+    SetInputMode(InputCaptureMode),
+    Ignore,
 }
 
 #[relm4::component]
@@ -32,19 +52,24 @@ impl SimpleComponent for AppModel {
 
     view! {
         gtk::Window {
-            set_title: Some("Psychedelic XOR Pattern Test (Interactive)"),
-            set_default_width: 800,
-            set_default_height: 600,
+            set_title: Some("VM Display: Dual-Mode Input Test"),
+            set_default_width: 1024,
+            set_default_height: 768,
+
             gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
+
+                // --- Toolbar ---
                 gtk::Box {
                     set_orientation: gtk::Orientation::Horizontal,
                     set_spacing: 10,
-                    set_margin_all: 5,
+                    set_margin_all: 10,
+
+                    // Scaling Mode Dropdown
                     gtk::Label {
-                        set_label: "Mode:",
+                        set_label: "Scaling:",
                     },
-                    #[name = "dropdown"]
+                    #[name = "scale_dropdown"]
                     gtk::DropDown {
                         set_model: Some(&gtk::StringList::new(&[
                             "Resize Guest (Auto)",
@@ -52,11 +77,32 @@ impl SimpleComponent for AppModel {
                         ])),
                         set_selected: 0,
                     },
+
+                    gtk::Separator {
+                        set_orientation: gtk::Orientation::Vertical,
+                    },
+
+                    // Input Mode Dropdown
                     gtk::Label {
-                        set_label: "Tip: Drag window to test resize. Move mouse to test loopback.",
-                        set_opacity: 0.7,
+                        set_label: "Input:",
+                    },
+                    #[name = "input_dropdown"]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&[
+                            "Seamless (Office/Tablet)",
+                            "Locked (Gaming/FPS)",
+                        ])),
+                        set_selected: 1, // Corresponds to AbsoluteSeamless (see init logic below)
+                    },
+
+                    gtk::Label {
+                        set_label: "💡 Hint: In Locked mode, click to capture, Ctrl+Alt+G to release.",
+                        set_opacity: 0.6,
+                        set_margin_start: 10,
                     },
                 },
+
+                // --- Display Area ---
                 #[local_ref]
                 display_widget -> gtk::Overlay {
                     set_hexpand: true,
@@ -71,7 +117,7 @@ impl SimpleComponent for AppModel {
 
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx, kbd_rx) = create_mock_controllers();
 
-        let display = VmDisplayModel::builder()
+        let _display = VmDisplayModel::builder()
             .launch(VmDisplayInit {
                 rx,
                 console_ctrl,
@@ -81,22 +127,36 @@ impl SimpleComponent for AppModel {
             })
             .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
-        let display_widget = display.widget().clone();
+        let display_widget = _display.widget().clone();
 
+        // Start enhanced Mock Backend with relative motion cursor tracking
         tokio::spawn(mock_qemu_backend(tx, mouse_rx, console_rx, kbd_rx));
 
-        let model = AppModel { display };
+        let model = AppModel { _display };
         let widgets = view_output!();
 
-        // Connect dropdown signal manually
-        widgets.dropdown.connect_selected_item_notify(move |dropdown| {
+        // 1. Scaling Mode Logic
+        let sender_clone = sender.clone();
+        widgets.scale_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
                 0 => ScalingMode::ResizeGuest,
                 1 => ScalingMode::FixedGuest,
                 _ => return,
             };
-            info!("Switching to scaling mode: {:?}", mode);
-            sender.input(AppMsg::SetScalingMode(mode));
+            info!("UI: Switching scaling mode to {:?}", mode);
+            sender_clone.input(AppMsg::SetScalingMode(mode));
+        });
+
+        // 2. Input Mode Logic (NEW)
+        let sender_clone = sender.clone();
+        widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
+            let mode = match dropdown.selected() {
+                0 => InputCaptureMode::Seamless,
+                1 => InputCaptureMode::Locked,
+                _ => return,
+            };
+            info!("UI: Switching input mode to {:?}", mode);
+            sender_clone.input(AppMsg::SetInputMode(mode));
         });
 
         ComponentParts { model, widgets }
@@ -105,18 +165,18 @@ impl SimpleComponent for AppModel {
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
         match msg {
             AppMsg::SetScalingMode(mode) => {
-                self.display.emit(libmks_rs::display::vm_display::Message::SetScalingMode(mode));
+                self._display.emit(libmks_rs::display::vm_display::Message::SetScalingMode(mode));
+            }
+            AppMsg::SetInputMode(mode) => {
+                // Forward mode switch to VmDisplayModel
+                self._display.emit(libmks_rs::display::vm_display::Message::SetInputCaptureMode(mode));
             }
             AppMsg::Ignore => {}
         }
     }
 }
 
-#[derive(Debug)]
-enum AppMsg {
-    SetScalingMode(ScalingMode),
-    Ignore,
-}
+// --- Controller Helpers ---
 
 fn create_mock_controllers() -> (
     ConsoleController,
@@ -136,6 +196,8 @@ fn create_mock_controllers() -> (
 
     (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx, kbd_rx)
 }
+
+// --- Psychedelic Backend Logic ---
 
 fn generate_psychedelic_frame(width: u32, height: u32, time_offset: u32) -> Vec<u8> {
     let stride = width * 4;
@@ -296,7 +358,6 @@ async fn mock_qemu_backend(
 
 fn main() {
     env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
-
-    let app = RelmApp::new("com.falcon.display.xor");
+    let app = RelmApp::new("com.falcon.display.dual_mode");
     app.run::<AppModel>(());
 }
