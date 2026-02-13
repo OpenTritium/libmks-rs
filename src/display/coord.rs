@@ -65,15 +65,12 @@ impl CoordinateSystem {
     #[inline]
     pub const fn calculate_contain_transform(&self) -> Option<(f32, f32, f32)> {
         let (vm_w, vm_h) = self.vm_resolution;
-        let (widget_w_logical, widget_h_logical) = self.widget_size_logical;
-        if vm_w == 0 || vm_h == 0 || widget_w_logical <= 0.0 || widget_h_logical <= 0.0 {
+        let (widget_w, widget_h) = self.widget_size_logical;
+        if vm_w == 0 || vm_h == 0 || widget_w <= 0.0 || widget_h <= 0.0 {
             return None;
         }
         let vm_w = vm_w as f32;
         let vm_h = vm_h as f32;
-
-        let widget_w = widget_w_logical * self.scale_factor;
-        let widget_h = widget_h_logical * self.scale_factor;
 
         if widget_w * vm_h < widget_h * vm_w {
             let scale = widget_w / vm_w;
@@ -112,11 +109,8 @@ impl CoordinateSystem {
         }
         let (scale, offset_x, offset_y) = self.calculate_contain_transform()?;
 
-        let phys_x = logical_x * self.scale_factor;
-        let phys_y = logical_y * self.scale_factor;
-
-        let gx = ((phys_x - offset_x) / scale).clamp(0., (vm_w - 1) as f32) as u32;
-        let gy = ((phys_y - offset_y) / scale).clamp(0., (vm_h - 1) as f32) as u32;
+        let gx = ((logical_x - offset_x) / scale).clamp(0., (vm_w - 1) as f32) as u32;
+        let gy = ((logical_y - offset_y) / scale).clamp(0., (vm_h - 1) as f32) as u32;
 
         Some((gx, gy))
     }
@@ -158,9 +152,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_widget_to_guest_with_scale_factor() {
-        let mut coord = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
-        coord.set_scale_factor(2.0);
+    fn test_widget_to_guest_pure_logical_mapping() {
+        let coord = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
 
         let result = coord.widget_to_guest(480.0, 270.0);
         assert!(result.is_some());
@@ -183,7 +176,6 @@ mod tests {
     #[test]
     fn test_surface_to_guest_mapping() {
         let mut coord = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
-        coord.set_scale_factor(2.0);
 
         use relm4::gtk::graphene::Rect;
         let bounds = Rect::new(0.0, 0.0, 960.0, 540.0);
@@ -199,7 +191,6 @@ mod tests {
     #[test]
     fn test_guest_to_surface_mapping() {
         let mut coord = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
-        coord.set_scale_factor(2.0);
 
         use relm4::gtk::graphene::Rect;
         let bounds = Rect::new(0.0, 0.0, 960.0, 540.0);
@@ -210,5 +201,17 @@ mod tests {
         let (sx, sy) = result.unwrap();
         assert!(sx >= 0.0 && sx <= 960.0);
         assert!(sy >= 0.0 && sy <= 540.0);
+    }
+
+    #[test]
+    fn test_scale_factor_does_not_affect_widget_to_guest() {
+        let coord1 = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
+        let mut coord2 = CoordinateSystem::new(1920, 1080, 960.0, 540.0);
+        coord2.set_scale_factor(2.0);
+
+        let result1 = coord1.widget_to_guest(480.0, 270.0);
+        let result2 = coord2.widget_to_guest(480.0, 270.0);
+
+        assert_eq!(result1, result2, "scale_factor should not affect coordinate mapping");
     }
 }

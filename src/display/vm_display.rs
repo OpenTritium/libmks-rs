@@ -695,23 +695,18 @@ impl Component for VmDisplayModel {
                 if let Some(texture) = &cursor.texture {
                     widgets.cursor_picture.set_paintable(Some(texture));
 
-                    let scale = self.cursor_scale;
-                    let (offset_x, offset_y) = self.cursor_offset;
+                    let logical_scale = self.cursor_scale;
+                    let (logical_offset_x, logical_offset_y) = self.cursor_offset;
 
-                    let scale_factor = self.coord_system.get_scale_factor();
-                    let display_scale = scale / scale_factor;
-                    let logical_offset_x = offset_x / scale_factor;
-                    let logical_offset_y = offset_y / scale_factor;
-
-                    let draw_x = logical_offset_x + (cursor.x as f32 * display_scale) - (cursor.hot_x as f32 * display_scale);
-                    let draw_y = logical_offset_y + (cursor.y as f32 * display_scale) - (cursor.hot_y as f32 * display_scale);
+                    let draw_x = logical_offset_x + (cursor.x as f32 * logical_scale) - (cursor.hot_x as f32 * logical_scale);
+                    let draw_y = logical_offset_y + (cursor.y as f32 * logical_scale) - (cursor.hot_y as f32 * logical_scale);
 
                     widgets.cursor_fixed.move_(&widgets.cursor_picture, draw_x as f64, draw_y as f64);
 
                     let tex_w = texture.width();
                     let tex_h = texture.height();
-                    let target_w = (tex_w as f32 * display_scale).round() as i32;
-                    let target_h = (tex_h as f32 * display_scale).round() as i32;
+                    let target_w = (tex_w as f32 * logical_scale).round() as i32;
+                    let target_h = (tex_h as f32 * logical_scale).round() as i32;
                     widgets.cursor_picture.set_size_request(target_w, target_h);
                 } else {
                     widgets.cursor_picture.set_paintable(None::<&Texture>);
