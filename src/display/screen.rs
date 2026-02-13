@@ -3,19 +3,19 @@ use super::pixman_4cc::{FourCC, Pixman};
 use crate::{
     dbus::listener::Event,
     display::{
+        Error,
         direct_map::ImportedTexture,
         software_rasterizer::Swapchain,
-        udma::{build_dmabuf_texture_planar, DmabufPlane},
-        Error,
+        udma::{DmabufPlane, build_dmabuf_texture_planar},
     },
 };
+use RenderBackend::*;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
     prelude::*,
 };
 use std::os::fd::{AsRawFd, OwnedFd};
-use RenderBackend::*;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UpdateFlags {

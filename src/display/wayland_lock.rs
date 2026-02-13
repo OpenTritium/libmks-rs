@@ -2,7 +2,12 @@
 use crate::dbus::mouse::MouseController;
 use gdk4_wayland::WaylandDisplay;
 use log::{info, warn};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    ops::DerefMut,
+    os::unix::io::{AsFd, RawFd},
+    rc::Rc,
+};
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     protocol::{
@@ -53,7 +58,7 @@ pub struct WaylandLock {
 }
 
 impl WaylandLock {
-    pub fn new_from_gdk(gdk_display: &WaylandDisplay, mouse_ctrl: MouseController) -> Self {
+    pub fn from_gdk(gdk_display: &WaylandDisplay, mouse_ctrl: MouseController) -> Self {
         info!("Initializing WaylandLock using GDK safe bridge");
         let wl_display = gdk_display.wl_display().expect("Failed to get WlDisplay");
         let backend = wl_display.backend().upgrade().expect("Wayland connection is dead");
@@ -65,17 +70,17 @@ impl WaylandLock {
         let display_proxy = conn.display();
         let _registry = display_proxy.get_registry(&qh, ());
         // 等待服务器发回 Global 列表 (拿到 Seat 和 Constraints)
-        if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
+        if let Err(e) = event_queue.roundtrip(state.borrow_mut().deref_mut()) {
             warn!(error:? = e; "Roundtrip 1 failed");
         }
         // 等待 Seat 发回 Capabilities -> 触发我们去拿 Pointer
-        if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
+        if let Err(e) = event_queue.roundtrip(state.borrow_mut().deref_mut()) {
             warn!(error:? = e; "Roundtrip 2 failed");
         }
         Self { conn, event_queue: RefCell::new(event_queue), qh, state }
     }
 
-    pub fn lock_pointer(&mut self, surface: &WlSurface) {
+    pub fn lock_pointer(&self, surface: &WlSurface) {
         let state = self.state.borrow();
         let Some(constraints) = state.pointer_constraints.as_ref() else {
             warn!("pointer constraints missing. Locking aborted.");
@@ -104,51 +109,23 @@ impl WaylandLock {
         }
     }
 
-    pub fn unlock_pointer(&mut self) {
+    pub fn unlock(&self, hint: Option<(&WlSurface, f64, f64)>) {
         let mut state = self.state.borrow_mut();
-        if state.locked_session.is_some() {
-            info!("Wayland pointer lock released");
-            state.locked_session = None;
-            if let Err(e) = self.conn.flush() {
-                warn!(error:? = e; "Failed to flush connection");
-            }
-        } else {
-            warn!("You should not unlock a pointer that is not locked");
-        }
-    }
 
-    pub fn set_cursor_position_hint(&mut self, x: f64, y: f64) {
-        let state = self.state.borrow();
         if let Some(session) = &state.locked_session {
-            session.locked.set_cursor_position_hint(x, y);
-            if let Err(e) = self.conn.flush() {
-                warn!(error:? = e; "Failed to flush connection after setting cursor hint");
-            }
-        }
-    }
-
-    pub fn unlock_with_hint(&mut self, surface: Option<&WlSurface>, x: f64, y: f64) {
-        let has_session = {
-            let state = self.state.borrow();
-            state.locked_session.is_some()
-        };
-
-        if has_session {
-            let state = self.state.borrow();
-            if let Some(session) = &state.locked_session {
+            if let Some((surface, x, y)) = hint {
                 session.locked.set_cursor_position_hint(x, y);
-                if let Some(proxy) = surface {
-                    proxy.commit();
-                    info!("🔒 Unlocking: Hint ({:.1}, {:.1}) committed to surface", x, y);
-                } else {
-                    warn!("⚠️ Cannot commit cursor hint: Wayland surface missing, cursor may jump");
-                }
-                if let Err(e) = self.conn.flush() {
-                    warn!(error:? = e; "Failed to flush connection after setting hint");
-                }
+                surface.commit();
+                info!("🔒 Wayland hint set to ({:.1}, {:.1}) and committed", x, y);
             }
+
+            state.locked_session = None;
+
+            if let Err(e) = self.conn.flush() {
+                warn!(error:? = e; "Failed to flush connection during unlock");
+            }
+            info!("Wayland pointer lock released");
         }
-        self.unlock_pointer();
     }
 
     pub fn dispatch_pending(&self) {
@@ -159,6 +136,11 @@ impl WaylandLock {
         if let Err(e) = self.conn.flush() {
             warn!(error:? = e; "Failed to flush connection");
         }
+    }
+
+    pub fn get_fd(&self) -> RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.conn.as_fd().as_raw_fd()
     }
 }
 

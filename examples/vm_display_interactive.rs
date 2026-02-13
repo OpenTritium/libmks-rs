@@ -217,7 +217,7 @@ fn generate_psychedelic_frame(width: u32, height: u32, time_offset: u32) -> Vec<
                 let g = x.wrapping_add(time_offset.wrapping_mul(2)) as u8;
                 let b = y.wrapping_add(time_offset.wrapping_mul(3)) as u8;
 
-                data[offset] = b;     // B
+                data[offset] = b; // B
                 data[offset + 1] = g; // G
                 data[offset + 2] = r; // R
                 data[offset + 3] = 255; // Alpha
@@ -228,8 +228,7 @@ fn generate_psychedelic_frame(width: u32, height: u32, time_offset: u32) -> Vec<
 }
 
 async fn mock_qemu_backend(
-    tx: AsyncSender<Event>,
-    mouse_rx: kanal::AsyncReceiver<mouse::Command>,
+    tx: AsyncSender<Event>, mouse_rx: kanal::AsyncReceiver<mouse::Command>,
     console_rx: kanal::AsyncReceiver<console::Command>,
     kbd_rx: kanal::AsyncReceiver<libmks_rs::dbus::keyboard::Command>,
 ) {
@@ -246,21 +245,17 @@ async fn mock_qemu_backend(
             let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
 
             if is_center_line {
-                cursor_data[i..i+4].copy_from_slice(&[255, 255, 255, 255]);
+                cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
             } else if is_border {
-                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 255]);
+                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
             } else {
-                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 0]);
+                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
             }
         }
     }
-    tx.send(Event::CursorDefine {
-        width: cursor_w,
-        height: cursor_h,
-        hot_x: 31,
-        hot_y: 31,
-        data: cursor_data.into()
-    }).await.ok();
+    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 31, hot_y: 31, data: cursor_data.into() })
+        .await
+        .ok();
 
     // 2. 状态变量
     let mut current_w = 800u32;

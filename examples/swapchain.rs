@@ -1,7 +1,7 @@
 use libmks_rs::display::{pixman_4cc::Pixman, software_rasterizer::Swapchain};
 use relm4::{
-    gtk::{self, gdk::Texture, glib, prelude::*},
     ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent,
+    gtk::{self, gdk::Texture, glib, prelude::*},
 };
 use std::{
     cmp::{max, min},

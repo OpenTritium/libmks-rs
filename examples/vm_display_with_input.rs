@@ -127,11 +127,11 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
             let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
 
             if is_center_line {
-                cursor_data[i..i+4].copy_from_slice(&[255, 255, 255, 255]);
+                cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
             } else if is_border {
-                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 255]);
+                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
             } else {
-                cursor_data[i..i+4].copy_from_slice(&[0, 0, 0, 0]);
+                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
             }
         }
     }

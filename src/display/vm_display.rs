@@ -3,7 +3,7 @@ use crate::{
         console::ConsoleController,
         keyboard::KeyboardController,
         listener::Event as QemuEvent,
-        mouse::{Button as QemuButton, MouseController},
+        mouse::{self, MouseController},
     },
     display::{
         screen::{Screen, UpdateFlags},
@@ -11,7 +11,7 @@ use crate::{
     },
     keymaps::Qnum,
 };
-use gdk4_wayland::{WaylandDisplay, WaylandSurface, gdk::Texture, prelude::*};
+use gdk4_wayland::{WaylandDisplay, WaylandSurface, gdk::Texture, glib::SourceId, prelude::*};
 use kanal::AsyncReceiver;
 use log::{error, info, warn};
 use relm4::{
@@ -20,19 +20,21 @@ use relm4::{
         EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload,
         GraphicsOffloadEnabled, Label, Overlay, Picture, STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
         gdk::{Display, Key, ModifierType},
-        glib::{Propagation, object::Cast, translate::IntoGlib},
+        glib::{self, Propagation, translate::IntoGlib},
+        graphene::Rect,
         prelude::*,
         style_context_add_provider_for_display,
     },
     prelude::*,
 };
-use std::{fmt, num::NonZeroU32, sync::Once, time::Duration, vec::Vec};
+use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration, vec::Vec};
 use tokio::{task::AbortHandle, time::sleep};
 
 const INCH_TO_MM: f64 = 25.4;
 const WINDOWS_DEFAULT_DPI: f64 = 96.;
 const DEFAULT_MM_PER_PIXEL: f64 = INCH_TO_MM / WINDOWS_DEFAULT_DPI;
 
+/// 确保 css provider 只被初始化一次，因为它不是 sync 的所以我们没有使用 LazyCell
 #[inline]
 fn ensure_css_loaded() {
     static INIT: Once = Once::new();
@@ -45,6 +47,7 @@ fn ensure_css_loaded() {
     });
 }
 
+/// 捕获输入的快捷键配置
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrabShortcut {
     pub mask: ModifierType,
@@ -62,33 +65,37 @@ impl fmt::Display for GrabShortcut {
     }
 }
 
+/// 输入捕获模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputCaptureMode {
+    /// 强捕获模式，该模式下鼠标无法逃逸虚拟机画面
     Locked,
+    /// 弱捕获模式，光标会自动切换到虚拟机光标，离开虚拟机画面自动切换回宿主光标
     Seamless,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalingMode {
+    /// 根据宿主窗口大小自动缩放虚拟机分辨率
     ResizeGuest,
+    /// 固定虚拟机分辨率，将虚拟机画面按照宿主窗口大小进行缩放
     FixedGuest,
 }
 
 #[derive(Debug)]
 pub enum Message {
     Qemu(QemuEvent),
-    CanvasResize(NonZeroU32, NonZeroU32),
+    CanvasResize { width: NonZeroU32, height: NonZeroU32 },
     MouseMove { x: f64, y: f64 },
     MouseButton { button: u32, pressed: bool },
     Scroll { dy: f64 },
     Key { keyval: u32, keycode: u32, pressed: bool },
     UpdateMonitorInfo { mm_per_pixel: f64 },
     SetScalingMode(ScalingMode),
-    ToggleCapture(bool, Option<(f64, f64)>),
+    ToggleCapture { should_capture: bool, click_position: Option<(f64, f64)> },
     HideCaptureHint,
-    UpdateCaptureView, // 通知视图层（View）根据当前的捕获状态（Captured/Uncaptured）重绘光标和提示 UI
+    UpdateCaptureView,
     CheckCaptureState,
-    WaylandPoll,
     MouseLeave,
     SetInputCaptureMode(InputCaptureMode),
 }
@@ -99,7 +106,6 @@ pub struct VmDisplayModel {
     console_ctrl: ConsoleController,
     mouse_ctrl: MouseController,
     keyboard_ctrl: KeyboardController,
-    canvas_size: Option<(f64, f64)>,
     last_sent_mouse: Option<(u32, u32)>,
     scaling_mode: ScalingMode,
     mm_per_pixel: f64,
@@ -109,9 +115,10 @@ pub struct VmDisplayModel {
     hint_visible: bool,
     hint_timer: Option<AbortHandle>,
     input_widget: DrawingArea,
-    wayland_lock: Option<WaylandLock>,
+    wayland_lock: Option<Rc<RefCell<WaylandLock>>>,
+    wayland_poll_source: Option<SourceId>, // wayland监听句柄
     input_mode: InputCaptureMode,
-    is_mouse_over: bool,
+    is_mouse_over: bool, // 鼠标是否在画面上
 }
 
 pub struct VmDisplayWidgets {
@@ -185,37 +192,91 @@ impl VmDisplayModel {
     }
 
     #[inline]
-    fn ensure_wayland_lock(&mut self) -> Option<&WaylandLock> {
+    fn ensure_wayland_lock(&mut self) -> Option<Rc<RefCell<WaylandLock>>> {
         if self.wayland_lock.is_some() {
-            return self.wayland_lock.as_ref();
+            return self.wayland_lock.clone();
         }
         if let Some(display) = Display::default() {
             if let Ok(wl_display) = display.downcast::<WaylandDisplay>() {
                 info!("Wayland environment detected. Initializing pointer lock lazily.");
-                let lock = WaylandLock::new_from_gdk(&wl_display, self.mouse_ctrl.clone());
-                self.wayland_lock = Some(lock);
+                let lock = WaylandLock::from_gdk(&wl_display, self.mouse_ctrl.clone());
+                let rc_lock = Rc::new(RefCell::new(lock));
+
+                let fd = rc_lock.borrow().get_fd();
+                let rc_clone = Rc::clone(&rc_lock);
+
+                let source_id = glib::source::unix_fd_add_local(fd, glib::IOCondition::IN, move |_fd, _condition| {
+                    rc_clone.borrow().dispatch_pending();
+                    glib::ControlFlow::Continue
+                });
+
+                self.wayland_poll_source = Some(source_id);
+                self.wayland_lock = Some(rc_lock);
+                info!("✅ Wayland fd monitor attached to GLib main context");
             } else {
                 error!("Pointer lock requested but not running on Wayland.");
             }
         }
-        self.wayland_lock.as_ref()
+        self.wayland_lock.clone()
     }
 
-    #[inline]
-    fn map_input_to_vm(&self, x: f64, y: f64) -> Option<(u32, u32)> {
-        let (vm_w, vm_h) = self.screen.resolution();
-        let (canvas_w, canvas_h) = self.canvas_size?;
+    fn get_widget_bounds(&self) -> Option<Rect> {
+        let native = self.input_widget.native()?;
+        self.input_widget.compute_bounds(&native)
+    }
 
-        if vm_w == 0 || vm_h == 0 || canvas_w <= 0. || canvas_h <= 0. {
+    fn guest_to_surface_pos(&self, x: u32, y: u32) -> Option<(f64, f64)> {
+        let (vm_w, vm_h) = self.screen.resolution();
+        if vm_w == 0 || vm_h == 0 {
             return None;
         }
 
-        let raw_x = (x / canvas_w) * vm_w as f64;
-        let raw_y = (y / canvas_h) * vm_h as f64;
-        let target_x = raw_x.clamp(0., vm_w as f64 - 1.) as u32;
-        let target_y = raw_y.clamp(0., vm_h as f64 - 1.) as u32;
+        let bounds = self.get_widget_bounds()?;
+        let px = x as f32 / vm_w as f32;
+        let py = y as f32 / vm_h as f32;
 
-        Some((target_x, target_y))
+        let sx = bounds.x() + (px * bounds.width());
+        let sy = bounds.y() + (py * bounds.height());
+
+        Some((sx as f64, sy as f64))
+    }
+
+    fn widget_to_guest_pos(&self, x: f64, y: f64) -> Option<(u32, u32)> {
+        let (vm_w, vm_h) = self.screen.resolution();
+        if vm_w == 0 || vm_h == 0 {
+            return None;
+        }
+
+        let w = self.input_widget.width() as f32;
+        let h = self.input_widget.height() as f32;
+
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+
+        let rel_x = x as f32 / w;
+        let rel_y = y as f32 / h;
+
+        let gx = (rel_x * vm_w as f32).clamp(0.0, vm_w as f32 - 1.0) as u32;
+        let gy = (rel_y * vm_h as f32).clamp(0.0, vm_h as f32 - 1.0) as u32;
+
+        Some((gx, gy))
+    }
+
+    fn surface_to_guest_pos(&self, x: f64, y: f64) -> Option<(u32, u32)> {
+        let (vm_w, vm_h) = self.screen.resolution();
+        if vm_w == 0 || vm_h == 0 {
+            return None;
+        }
+
+        let bounds = self.get_widget_bounds()?;
+        let rel_x = (x as f32 - bounds.x()) / bounds.width();
+        let rel_y = (y as f32 - bounds.y()) / bounds.height();
+
+        let gx = (rel_x * vm_w as f32).clamp(0.0, vm_w as f32 - 1.0) as u32;
+        let gy = (rel_y * vm_h as f32).clamp(0.0, vm_h as f32 - 1.0) as u32;
+
+        Some((gx, gy))
     }
 }
 
@@ -235,18 +296,6 @@ impl Component for VmDisplayModel {
     fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         use Message::*;
         ensure_css_loaded();
-        // todo lazy loading
-        // let wayland_lock = if let Some(display) = Display::default() {
-        //     if let Ok(wl_display) = display.downcast::<WaylandDisplay>() {
-        //         info!("Detecting Wayland environment. Initializing native pointer lock.");
-        //         Some(WaylandLock::new_from_gdk(&wl_display, init.mouse_ctrl.clone()))
-        //     } else {
-        //         info!("Not running on Wayland. Pointer lock disabled.");
-        //         None
-        //     }
-        // } else {
-        //     None
-        // };
 
         let input_plane =
             DrawingArea::builder().focusable(true).focus_on_click(true).hexpand(true).vexpand(true).build();
@@ -259,7 +308,6 @@ impl Component for VmDisplayModel {
             console_ctrl: init.console_ctrl,
             mouse_ctrl: init.mouse_ctrl,
             keyboard_ctrl: init.keyboard_ctrl,
-            canvas_size: None,
             last_sent_mouse: None,
             scaling_mode: ScalingMode::ResizeGuest,
             mm_per_pixel: DEFAULT_MM_PER_PIXEL,
@@ -270,6 +318,7 @@ impl Component for VmDisplayModel {
             hint_timer: None,
             input_widget: input_plane.clone(),
             wayland_lock: None,
+            wayland_poll_source: None,
             input_mode: InputCaptureMode::Seamless,
             is_mouse_over: false,
         };
@@ -318,10 +367,8 @@ impl Component for VmDisplayModel {
 
         let motion_ctrl = EventControllerMotion::new();
         let sender_clone = sender.clone();
-        let input_plane_clone = input_plane.clone();
         motion_ctrl.connect_motion(move |_, x, y| {
-            let scale = input_plane_clone.scale_factor() as f64;
-            sender_clone.input(MouseMove { x: x * scale, y: y * scale });
+            sender_clone.input(MouseMove { x, y });
         });
         let sender_c = sender.clone();
         motion_ctrl.connect_leave(move |_| sender_c.input(MouseLeave));
@@ -331,11 +378,10 @@ impl Component for VmDisplayModel {
         let click = GestureClick::new();
         click.set_button(0);
         let sender_clone = sender.clone();
-        let input_plane_clone = input_plane.clone();
+        let input_plane_click = input_plane.clone();
         click.connect_pressed(move |gesture, _, x, y| {
-            input_plane_clone.grab_focus();
-            let scale = input_plane_clone.scale_factor() as f64;
-            sender_clone.input(ToggleCapture(true, Some((x * scale, y * scale))));
+            input_plane_click.grab_focus();
+            sender_clone.input(Message::ToggleCapture { should_capture: true, click_position: Some((x, y)) });
             sender_clone.input(MouseButton { button: gesture.current_button(), pressed: true });
         });
         let sender_clone = sender.clone();
@@ -360,7 +406,7 @@ impl Component for VmDisplayModel {
         let sender_for_key = sender.clone();
         key.connect_key_pressed(move |_, keyval, keycode, modifiers| {
             if modifiers.contains(grab_shortcut.mask) && keyval == grab_shortcut.key {
-                sender_for_release.input(ToggleCapture(false, None));
+                sender_for_release.input(Message::ToggleCapture { should_capture: false, click_position: None });
                 return Propagation::Stop;
             }
             let keyval_raw: u32 = keyval.into_glib();
@@ -400,14 +446,11 @@ impl Component for VmDisplayModel {
             let sender = sender.clone();
             move |widget: &DrawingArea| {
                 updater(widget);
-                let scale = widget.scale_factor();
-                let width = widget.width();
-                let height = widget.height();
-                let phy_w = width * scale;
-                let phy_h = height * scale;
-                if let (Some(w), Some(h)) = (NonZeroU32::new(phy_w.max(1) as u32), NonZeroU32::new(phy_h.max(1) as u32))
-                {
-                    sender.input(CanvasResize(w, h));
+                let scale = widget.scale_factor() as f64;
+                let w = (widget.width() as f64 * scale).max(1.0) as u32;
+                let h = (widget.height() as f64 * scale).max(1.0) as u32;
+                if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(w), NonZeroU32::new(h)) {
+                    sender.input(Message::CanvasResize { width: w_nz, height: h_nz });
                 }
             }
         };
@@ -447,7 +490,6 @@ impl Component for VmDisplayModel {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         use InputCaptureMode::*;
         use Message::*;
-        use ScalingMode::*;
         match msg {
             SetInputCaptureMode(mode) => {
                 if self.input_mode == mode {
@@ -456,9 +498,9 @@ impl Component for VmDisplayModel {
                 info!("Switching Input Mode to: {mode:?}");
                 if self.input_mode == Locked
                     && self.is_captured
-                    && let Some(ref mut wl_lock) = self.wayland_lock
+                    && let Some(wl_lock) = &self.wayland_lock
                 {
-                    wl_lock.unlock_pointer();
+                    wl_lock.borrow_mut().unlock(None);
                     info!("Mode switch: Wayland pointer unlocked");
                 }
                 self.input_mode = mode;
@@ -494,10 +536,11 @@ impl Component for VmDisplayModel {
                 match self.input_mode {
                     Locked => {}
                     Seamless => {
-                        if let Some((target_x, target_y)) = self.map_input_to_vm(x, y) {
+                        if let Some((target_x, target_y)) = self.widget_to_guest_pos(x, y) {
                             let new_mouse_pos = (target_x, target_y);
                             if self.last_sent_mouse.is_none_or(|old| old != new_mouse_pos) {
                                 self.last_sent_mouse = Some(new_mouse_pos);
+                                info!("🖱️ MouseMove: Surface({:.1},{:.1}) → VM({},{})", x, y, target_x, target_y);
                                 if let Err(e) = self.mouse_ctrl.try_set_abs_position(target_x, target_y) {
                                     error!(error:? = e; "Failed to set mouse position");
                                 }
@@ -507,7 +550,7 @@ impl Component for VmDisplayModel {
                 }
             }
 
-            ToggleCapture(should_capture, click_pos) => {
+            ToggleCapture { should_capture, click_position } => {
                 if self.input_mode == Seamless || self.is_captured == should_capture {
                     if should_capture {
                         self.reset_hint_timer(sender.clone());
@@ -515,64 +558,50 @@ impl Component for VmDisplayModel {
                     return;
                 }
 
-                let wl_surface_proxy = self.input_widget.native()
+                let wl_surface_proxy = self
+                    .input_widget
+                    .native()
                     .and_then(|n| n.surface())
                     .and_then(|s| s.downcast::<WaylandSurface>().ok())
                     .and_then(|ws| ws.wl_surface());
 
                 let target_vm_coords = if should_capture {
-                    click_pos.and_then(|(x, y)| self.map_input_to_vm(x, y))
+                    click_position.and_then(|(x, y)| self.widget_to_guest_pos(x, y))
+                } else {
+                    None
+                };
+
+                let hint_params = if !should_capture {
+                    wl_surface_proxy.as_ref().and_then(|proxy| {
+                        let cursor = &self.screen.cursor;
+                        let cx = cursor.x.max(0) as u32;
+                        let cy = cursor.y.max(0) as u32;
+                        self.guest_to_surface_pos(cx, cy).map(|(hx, hy)| (proxy, hx, hy, cursor.x, cursor.y))
+                    })
                 } else {
                     None
                 };
 
                 self.ensure_wayland_lock();
-                if let Some(ref mut wl_lock) = self.wayland_lock {
-                    wl_lock.dispatch_pending();
+                if let Some(wl_lock) = &self.wayland_lock {
+                    wl_lock.borrow().dispatch_pending();
                     if should_capture {
                         if let Some((target_x, target_y)) = target_vm_coords {
                             let _ = self.mouse_ctrl.try_set_abs_position(target_x, target_y);
                             self.last_sent_mouse = Some((target_x, target_y));
+                            info!("🎯 Capture: Widget({:?}) → VM({}, {})", click_position, target_x, target_y);
                         }
                         if let Some(proxy) = &wl_surface_proxy {
-                            wl_lock.lock_pointer(proxy);
-                            sender.input(WaylandPoll);
+                            wl_lock.borrow_mut().lock_pointer(proxy);
                             info!("Pointer locked");
                         }
                     } else {
-                        let cursor = &self.screen.cursor;
-                        let (vm_w, vm_h) = self.screen.resolution();
-
-                        if vm_w > 0 && vm_h > 0 {
-                            if let Some(native) = self.input_widget.native() {
-                                let bounds = self.input_widget.compute_bounds(&native).unwrap_or_default();
-
-                                let widget_x = bounds.x() as f64;
-                                let widget_y = bounds.y() as f64;
-                                let widget_w = bounds.width() as f64;
-                                let widget_h = bounds.height() as f64;
-
-                                let internal_x = (cursor.x as f64 / vm_w as f64) * widget_w;
-                                let internal_y = (cursor.y as f64 / vm_h as f64) * widget_h;
-
-                                let final_hint_x = widget_x + internal_x;
-                                let final_hint_y = widget_y + internal_y;
-
-                                wl_lock.unlock_with_hint(wl_surface_proxy.as_ref(), final_hint_x, final_hint_y);
-                                info!(
-                                    "🎯 High-Precision Unlock: VM({:?}) bounds=({:.2},{:.2},{:.2}x{:.2}) internal=({:.2},{:.2}) surface=({:.2},{:.2})",
-                                        (cursor.x, cursor.y),
-                                        widget_x, widget_y, widget_w, widget_h,
-                                        internal_x, internal_y,
-                                        final_hint_x, final_hint_y
-                                );
-                            } else {
-                                wl_lock.unlock_pointer();
-                                info!("Pointer unlocked (no native for bounds calculation)");
-                            }
+                        if let Some((proxy, hx, hy, orig_x, orig_y)) = hint_params {
+                            wl_lock.borrow_mut().unlock(Some((proxy, hx, hy)));
+                            info!("🎯 Unlock: VM({:?}) → Surface({:.1},{:.1})", (orig_x, orig_y), hx, hy);
                         } else {
-                            wl_lock.unlock_pointer();
-                            info!("Pointer unlocked (no valid VM resolution)");
+                            wl_lock.borrow_mut().unlock(None);
+                            info!("Pointer unlocked (no valid coordinates)");
                         }
                     }
                 }
@@ -586,21 +615,6 @@ impl Component for VmDisplayModel {
                 sender.input(UpdateCaptureView);
             }
 
-            WaylandPoll => {
-                if self.input_mode == Locked
-                    && self.is_captured
-                    && let Some(wl_lock) = &self.wayland_lock
-                {
-                    wl_lock.dispatch_pending();
-                    let sender = sender.clone();
-                    relm4::spawn(async move {
-                        // 1000ms / 8ms ≈ 125 Hz
-                        sleep(Duration::from_millis(8)).await;
-                        sender.input(WaylandPoll);
-                    });
-                }
-            }
-
             Qemu(event) => {
                 if let Ok(flags) = self.screen.handle_event(event) {
                     self.changes.cursor |= flags.cursor;
@@ -608,21 +622,23 @@ impl Component for VmDisplayModel {
                 }
             }
 
-            CanvasResize(w, h) => {
-                self.canvas_size = Some((w.get() as f64, h.get() as f64));
-                self.changes.cursor = true;
-                if self.scaling_mode == ResizeGuest {
-                    self.reset_resize_timer(w, h);
+            SetScalingMode(mode) => {
+                self.scaling_mode = mode;
+                if mode == ScalingMode::ResizeGuest {
+                    if let Some(_native) = self.input_widget.native() {
+                        let scale = self.input_widget.scale_factor() as f64;
+                        let w = (self.input_widget.width() as f64 * scale).max(1.0) as u32;
+                        let h = (self.input_widget.height() as f64 * scale).max(1.0) as u32;
+                        if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(w), NonZeroU32::new(h)) {
+                            self.reset_resize_timer(w_nz, h_nz);
+                        }
+                    }
                 }
             }
 
-            SetScalingMode(mode) => {
-                self.scaling_mode = mode;
-                if mode == ResizeGuest
-                    && let Some((w, h)) = self.canvas_size
-                    && let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(w as u32), NonZeroU32::new(h as u32))
-                {
-                    self.reset_resize_timer(w_nz, h_nz);
+            CanvasResize { width, height } => {
+                if self.scaling_mode == ScalingMode::ResizeGuest {
+                    self.reset_resize_timer(width, height);
                 }
             }
 
@@ -643,7 +659,7 @@ impl Component for VmDisplayModel {
             }
 
             MouseButton { button, pressed } => {
-                let Some(btn) = QemuButton::from_xorg(button) else { return };
+                let Some(btn) = mouse::Button::from_xorg(button) else { return };
                 let ctrl = self.mouse_ctrl.clone();
                 relm4::spawn(async move {
                     let res = if pressed {
@@ -670,9 +686,9 @@ impl Component for VmDisplayModel {
                     relm4::spawn(async move {
                         for _ in 0..steps.abs() {
                             let btn = if steps.is_positive() {
-                                QemuButton::WheelDown
+                                mouse::Button::WheelDown
                             } else {
-                                QemuButton::WheelUp
+                                mouse::Button::WheelUp
                             };
                             if let Err(e) = ctrl.press(btn).await {
                                 error!(error:? = e; "Failed to press mouse button");
@@ -725,9 +741,11 @@ impl Component for VmDisplayModel {
         if self.changes.frame {
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
         }
-        let ui_scale = widgets.input_plane.scale_factor() as f64;
         let (vm_w, vm_h) = self.screen.resolution();
-        let Some((canvas_w, canvas_h)) = self.canvas_size else { return };
+        let bounds = match self.get_widget_bounds() {
+            Some(b) => b,
+            None => return,
+        };
         let cursor = &self.screen.cursor;
         let show_vm_cursor = cursor.visible
             && match self.input_mode {
@@ -739,24 +757,39 @@ impl Component for VmDisplayModel {
             widgets.cursor_picture.set_paintable(None::<&Texture>);
             return;
         }
-        if vm_w == 0 || vm_h == 0 || canvas_w <= 0. || canvas_h <= 0. {
+        if vm_w == 0 || vm_h == 0 {
             return;
         }
         widgets.aspect_frame.set_ratio(vm_w as f32 / vm_h as f32);
-        let scale_x = canvas_w / vm_w as f64;
-        let scale_y = canvas_h / vm_h as f64;
-        let scale = scale_x.min(scale_y);
-        let final_x_phy = (cursor.x - cursor.hot_x) as f64 * scale;
-        let final_y_phy = (cursor.y - cursor.hot_y) as f64 * scale;
-        widgets.cursor_layer.move_(&widgets.cursor_picture, final_x_phy / ui_scale, final_y_phy / ui_scale);
+
+        let px = (cursor.x - cursor.hot_x) as f32 / vm_w as f32;
+        let py = (cursor.y - cursor.hot_y) as f32 / vm_h as f32;
+
+        let internal_x = px * bounds.width();
+        let internal_y = py * bounds.height();
+
+        widgets.cursor_layer.move_(&widgets.cursor_picture, internal_x as f64, internal_y as f64);
 
         let Some(tex) = &cursor.texture else { return };
         widgets.cursor_picture.set_paintable(Some(tex));
-        let cursor_w_phy = tex.width() as f64 * scale;
-        let cursor_h_phy = tex.height() as f64 * scale;
-        let cursor_w_logical = (cursor_w_phy / ui_scale).ceil() as i32;
-        let cursor_h_logical = (cursor_h_phy / ui_scale).ceil() as i32;
-        widgets.cursor_picture.set_width_request(cursor_w_logical);
-        widgets.cursor_picture.set_height_request(cursor_h_logical);
+        let scale = (bounds.width() / vm_w as f32).min(bounds.height() / vm_h as f32);
+        let cursor_w = (tex.width() as f32 * scale).ceil() as i32;
+        let cursor_h = (tex.height() as f32 * scale).ceil() as i32;
+        widgets.cursor_picture.set_width_request(cursor_w);
+        widgets.cursor_picture.set_height_request(cursor_h);
+    }
+
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        // 1. 移除 Wayland 监听源
+        if let Some(source_id) = self.wayland_poll_source.take() {
+            source_id.remove(); // 👈 必须调用这个！
+            info!("Wayland poll source removed");
+        }
+
+        // 2. 清理计时器
+        self.try_cancel_hint_timer();
+        if let Some(handle) = self.resize_timer.take() {
+            handle.abort();
+        }
     }
 }
