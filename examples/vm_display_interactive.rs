@@ -24,10 +24,7 @@ use libmks_rs::{
         listener::Event,
         mouse::{self, MouseController},
     },
-    display::{
-        ScalingMode,
-        vm_display::{GrabShortcut, InputCaptureMode, VmDisplayInit, VmDisplayModel},
-    },
+    display::vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
 };
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};
@@ -40,7 +37,7 @@ struct AppModel {
 #[derive(Debug)]
 enum AppMsg {
     SetScalingMode(ScalingMode),
-    SetInputMode(InputCaptureMode),
+    SetInputMode(InputMode),
     Ignore,
 }
 
@@ -151,8 +148,8 @@ impl SimpleComponent for AppModel {
         let sender_clone = sender.clone();
         widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
-                0 => InputCaptureMode::Seamless,
-                1 => InputCaptureMode::Locked,
+                0 => InputMode::Seamless,
+                1 => InputMode::Confined,
                 _ => return,
             };
             info!("UI: Switching input mode to {:?}", mode);
@@ -226,7 +223,6 @@ fn generate_psychedelic_frame(width: u32, height: u32, time_offset: u32) -> Vec<
     }
     data
 }
-
 async fn mock_qemu_backend(
     tx: AsyncSender<Event>, mouse_rx: kanal::AsyncReceiver<mouse::Command>,
     console_rx: kanal::AsyncReceiver<console::Command>,
@@ -234,42 +230,83 @@ async fn mock_qemu_backend(
 ) {
     info!("🎨 Mock Backend Started");
 
-    // 1. 初始化光标 (白色十字准星 with 黑色描边)
-    let cursor_w = 64;
-    let cursor_h = 64;
+    // 1. 初始化光标 (白色大号 FPS 风格)
+    // -------------------------------------------------------------
+    // 增大尺寸到 128x128
+    let cursor_w = 128;
+    let cursor_h = 128;
+    let cx = 64i32; // 中心点 X
+    let cy = 64i32; // 中心点 Y
+
+    // 样式参数 (按比例放大)
+    let line_length = 24; // 十字线长度 (之前是12)
+    let line_width = 3; // 线条半宽 (总宽 = 1 + 2*width = 7px)
+    let circle_radius = 6; // 中心圆半径 (直径 13px)
+    let border = 2; // 描边宽度 (更粗的黑边，增强白色在亮背景下的对比度)
+
     let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
+
     for y in 0..cursor_h {
         for x in 0..cursor_w {
-            let i = ((y * cursor_w + x) * 4) as usize;
-            let is_center_line = x == 31 || y == 31;
-            let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
+            let offset = ((y * cursor_w + x) * 4) as usize;
 
-            if is_center_line {
-                cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            let dx = x as i32 - cx;
+            let dy = y as i32 - cy;
+            let dist_sq = dx * dx + dy * dy;
+
+            // --- 形状判定 ---
+
+            // 1. 中心圆
+            let in_circle = dist_sq <= (circle_radius * circle_radius);
+
+            // 2. 十字线
+            let in_horz_line = dx.abs() <= line_length && dy.abs() <= line_width; // 粗线
+            let in_vert_line = dy.abs() <= line_length && dx.abs() <= line_width; // 粗线
+
+            let is_shape = in_circle || in_horz_line || in_vert_line;
+
+            // --- 描边判定 ---
+            let b_radius = circle_radius + border;
+            let in_circle_border = dist_sq <= (b_radius * b_radius);
+
+            let b_width = line_width + border;
+            let b_len = line_length + border;
+            let in_horz_border = dx.abs() <= b_len && dy.abs() <= b_width;
+            let in_vert_border = dy.abs() <= b_len && dx.abs() <= b_width;
+
+            let is_border = in_circle_border || in_horz_border || in_vert_border;
+
+            // --- 颜色填充 ---
+            if is_shape {
+                // ✅ 改为白色
+                cursor_data[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
             } else if is_border {
-                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
+                // 黑色描边 (保持不变，用于对比)
+                cursor_data[offset..offset + 4].copy_from_slice(&[0, 0, 0, 255]);
             } else {
-                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
+                // 透明背景
+                cursor_data[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0]);
             }
         }
     }
-    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: 31, hot_y: 31, data: cursor_data.into() })
+
+    tx.send(Event::CursorDefine { width: cursor_w, height: cursor_h, hot_x: cx, hot_y: cy, data: cursor_data.into() })
         .await
         .ok();
+    // -------------------------------------------------------------
 
     // 2. 状态变量
     let mut current_w = 800u32;
     let mut current_h = 600u32;
-    let mut frame_timer = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
+    let mut frame_timer = tokio::time::interval(Duration::from_millis(16));
     let mut time_offset = 0u32;
 
-    // 虚拟光标位置 (服务器端真值)
+    // 虚拟光标位置
     let mut v_cursor_x = 400i32;
     let mut v_cursor_y = 300i32;
 
     loop {
         tokio::select! {
-            // A. 渲染循环 (发送图像数据)
             _ = frame_timer.tick() => {
                 time_offset = time_offset.wrapping_add(1);
                 let data = generate_psychedelic_frame(current_w, current_h, time_offset);
@@ -279,74 +316,37 @@ async fn mock_qemu_backend(
                     stride: current_w * 4,
                     pixman_format: 0x20028888,
                     data: data.into(),
-                })
-                .await
-                .ok();
+                }).await.ok();
             }
 
-            // B. 处理鼠标指令
             Ok(cmd) = mouse_rx.recv() => {
                 match cmd {
-                    // 无缝模式 / 初始捕获校准
                     mouse::Command::SetAbsPosition { x, y } => {
                         v_cursor_x = x as i32;
                         v_cursor_y = y as i32;
-                        // 打印重置日志，方便调试 "跳变" 问题
-                        info!("🔄 Cursor Reset: ({}, {})", v_cursor_x, v_cursor_y);
-                        // 回显给前端绘制红色光标
                         tx.send(Event::MouseSet { x: v_cursor_x, y: v_cursor_y, on: 1 }).await.ok();
                     }
-
-                    // 锁定模式 (相对移动)
                     mouse::Command::RelMotion { dx, dy } => {
-                        // 1. 核心逻辑：累加 Delta 并限制在屏幕范围内
                         v_cursor_x = (v_cursor_x + dx).clamp(0, current_w as i32);
                         v_cursor_y = (v_cursor_y + dy).clamp(0, current_h as i32);
-
-                        // 2. 网格命中检测 (Grid Hit Test)
-                        let hit_x = v_cursor_x % 50 == 0;
-                        let hit_y = v_cursor_y % 50 == 0;
-
-                        // 3. 智能日志：只在关键时刻打印
-                        if hit_x || hit_y {
-                            info!("🎯 GRID HIT: ({:4}, {:4}) {}{}",
-                                v_cursor_x, v_cursor_y,
-                                if hit_x { " | COL" } else { "" }, // 撞到竖线
-                                if hit_y { " - ROW" } else { "" }  // 撞到横线
-                            );
-                        } else if dx.abs() > 10 || dy.abs() > 10 {
-                            // 快速甩动时偶尔打印
-                            // info!("💨 Fast Move: ({}, {})", v_cursor_x, v_cursor_y);
-                        }
-
-                        // 4. 回显给前端
                         tx.send(Event::MouseSet { x: v_cursor_x, y: v_cursor_y, on: 1 }).await.ok();
                     }
-
-                    mouse::Command::Press(btn) => info!("🖱️ Click: ({}, {}) - Btn {:?}", v_cursor_x, v_cursor_y, btn),
-                    mouse::Command::Release(btn) => info!("🖱️ Release: {:?}", btn),
+                    mouse::Command::Press(_) | mouse::Command::Release(_) => {}
                 }
             }
 
-            // C. 处理 Resize 指令
             Ok(cmd) = console_rx.recv() => {
                 if let console::Command::SetUiInfo { width, height, .. } = cmd {
-                    if width > 0 && height > 0 && (width != current_w || height != current_h) {
-                        info!("📏 Resize: {}x{}", width, height);
+                    if width > 0 && height > 0 {
                         current_w = width;
                         current_h = height;
-                        // Resize 后重置到中心，防止越界
                         v_cursor_x = (current_w / 2) as i32;
                         v_cursor_y = (current_h / 2) as i32;
                     }
                 }
             }
 
-            // D. 处理键盘指令 (Drain Channel)
-            // 必须接收，否则发送端会 BrokenPipe 报错
-            Ok(_cmd) = kbd_rx.recv() => {
-                // 这里可以加 info! 来调试键盘
-            }
+            Ok(_) = kbd_rx.recv() => {}
         }
     }
 }

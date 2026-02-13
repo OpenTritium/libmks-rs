@@ -1,11 +1,13 @@
+pub mod capture_state;
+pub mod coord;
 pub mod direct_map;
-pub mod error;
+mod error;
+pub mod input_handler;
 pub mod pixman_4cc;
 pub mod screen;
 pub mod software_rasterizer;
 pub mod udma;
 pub mod vm_display;
-pub mod wayland_lock;
+pub mod wayland_confine;
 
 pub use error::Error;
-pub use vm_display::ScalingMode;

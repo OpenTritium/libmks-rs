@@ -11,10 +11,7 @@ use libmks_rs::{
         listener::Event,
         mouse::{self, MouseController},
     },
-    display::{
-        ScalingMode,
-        vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
-    },
+    display::vm_display::{GrabShortcut, ScalingMode, VmDisplayInit, VmDisplayModel},
 };
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};

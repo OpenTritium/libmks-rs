@@ -3,27 +3,27 @@ use super::pixman_4cc::{FourCC, Pixman};
 use crate::{
     dbus::listener::Event,
     display::{
-        Error,
         direct_map::ImportedTexture,
         software_rasterizer::Swapchain,
-        udma::{DmabufPlane, build_dmabuf_texture_planar},
+        udma::{build_dmabuf_texture_planar, DmabufPlane},
+        Error,
     },
 };
-use RenderBackend::*;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
     prelude::*,
 };
 use std::os::fd::{AsRawFd, OwnedFd};
+use RenderBackend::*;
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct UpdateFlags {
+pub struct DirtyFlags {
     pub frame: bool,
     pub cursor: bool,
 }
 
-impl UpdateFlags {
+impl DirtyFlags {
     pub fn any(&self) -> bool { self.frame || self.cursor }
 }
 
@@ -135,9 +135,9 @@ pub struct Screen {
 impl Screen {
     pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None } }
 
-    pub fn handle_event(&mut self, event: Event) -> Result<UpdateFlags, Error> {
+    pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
         use Event::*;
-        let mut flags = UpdateFlags::default();
+        let mut flags = DirtyFlags::default();
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
                 let pixman = Pixman::from(pixman_format);
