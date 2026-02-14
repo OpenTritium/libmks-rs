@@ -89,7 +89,7 @@ impl SimpleComponent for AppModel {
                             "Seamless (Office/Tablet)",
                             "Locked (Gaming/FPS)",
                         ])),
-                        set_selected: 1, // Corresponds to AbsoluteSeamless (see init logic below)
+                        set_selected: 0, // Matches initial confine_state: None (Seamless mode)
                     },
 
                     gtk::Label {
@@ -322,16 +322,23 @@ async fn mock_qemu_backend(
             Ok(cmd) = mouse_rx.recv() => {
                 match cmd {
                     mouse::Command::SetAbsPosition { x, y } => {
+                        log::info!("🖱️ Mock: Abs Move to x={}, y={}", x, y);
                         v_cursor_x = x as i32;
                         v_cursor_y = y as i32;
                         tx.send(Event::MouseSet { x: v_cursor_x, y: v_cursor_y, on: 1 }).await.ok();
                     }
                     mouse::Command::RelMotion { dx, dy } => {
+                        log::info!("🖱️ Mock: Rel Move by dx={}, dy={}", dx, dy);
                         v_cursor_x = (v_cursor_x + dx).clamp(0, current_w as i32);
                         v_cursor_y = (v_cursor_y + dy).clamp(0, current_h as i32);
                         tx.send(Event::MouseSet { x: v_cursor_x, y: v_cursor_y, on: 1 }).await.ok();
                     }
-                    mouse::Command::Press(_) | mouse::Command::Release(_) => {}
+                    mouse::Command::Press(btn) => {
+                        log::info!("🖱️ Mock: Button {:?} Pressed", btn);
+                    }
+                    mouse::Command::Release(btn) => {
+                        log::info!("🖱️ Mock: Button {:?} Released", btn);
+                    }
                 }
             }
 
