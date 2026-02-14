@@ -90,6 +90,7 @@ impl_controller!(MouseController, Command, {
 });
 
 impl MouseController {
+    #[inline]
     pub fn try_set_abs_position(&self, x: u32, y: u32) -> MksResult<()> {
         self.0.try_send_realtime(Command::SetAbsPosition { x, y })?;
         Ok(())

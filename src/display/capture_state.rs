@@ -1,9 +1,8 @@
-//! 指针捕获状态机
 use super::vm_display::InputMode::{self, *};
-use CaptureState::*;
+use Capture::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CaptureState {
+pub enum Capture {
     #[default]
     Idle,
     Hover,
@@ -11,15 +10,15 @@ pub enum CaptureState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CaptureStateMachine {
-    state: CaptureState,
+pub struct CaptureState {
+    state: Capture,
 }
 
-impl CaptureStateMachine {
-    pub fn new() -> Self { Self { state: CaptureState::Idle } }
+impl CaptureState {
+    pub fn new() -> Self { Self { state: Capture::Idle } }
 
     #[inline]
-    pub fn on_mouse_enter(&mut self, mode: InputMode) -> CaptureState {
+    pub fn on_mouse_enter(&mut self, mode: InputMode) -> Capture {
         if mode == Seamless {
             self.state = Hover;
         }
@@ -27,7 +26,7 @@ impl CaptureStateMachine {
     }
 
     #[inline]
-    pub fn on_mouse_leave(&mut self, mode: InputMode) -> CaptureState {
+    pub fn on_mouse_leave(&mut self, mode: InputMode) -> Capture {
         if mode == Seamless {
             self.state = Idle;
         }
@@ -35,7 +34,7 @@ impl CaptureStateMachine {
     }
 
     #[inline]
-    pub fn on_click(&mut self, mode: InputMode) -> CaptureState {
+    pub fn on_click(&mut self, mode: InputMode) -> Capture {
         if mode == Confined {
             self.state = Exclusive;
         }
@@ -43,7 +42,7 @@ impl CaptureStateMachine {
     }
 
     #[inline]
-    pub fn on_release(&mut self) -> CaptureState {
+    pub fn on_release(&mut self) -> Capture {
         self.state = Idle;
         self.state
     }
@@ -58,5 +57,5 @@ impl CaptureStateMachine {
     }
 
     #[inline]
-    pub const fn current(&self) -> CaptureState { self.state }
+    pub const fn current(&self) -> Capture { self.state }
 }

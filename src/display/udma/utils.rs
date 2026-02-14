@@ -102,6 +102,7 @@ pub fn build_dmabuf_texture_planar(
     });
     unsafe { builder.build() }
 }
+
 #[cfg(test)]
 mod tests {
     use crate::display::pixman_4cc::drm_4cc::ARGB8888;
