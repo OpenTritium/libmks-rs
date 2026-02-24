@@ -1,12 +1,11 @@
 use super::vm_display::InputMode::{self, *};
-use Capture::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Capture {
     #[default]
-    Idle,
-    Hover,
-    Exclusive,
+    Idle, // 既未进入 Seamless 区域，也未在 Confined 模式下点击
+    Seamless, // 处于 Seamless 模式且鼠标在画面内
+    Confined, // 处于 Confined 模式且已点击捕获
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -15,44 +14,39 @@ pub struct CaptureState {
 }
 
 impl CaptureState {
-    pub fn new() -> Self { Self { state: Capture::Idle } }
+    pub fn new() -> Self { Self::default() }
 
     #[inline]
-    pub fn on_mouse_enter(&mut self, mode: InputMode) -> Capture {
+    pub const fn reset(&mut self) { self.state = Capture::Idle; }
+
+    #[inline]
+    pub fn on_mouse_enter(&mut self, mode: InputMode) {
         if mode == Seamless {
-            self.state = Hover;
+            self.state = Capture::Seamless;
         }
-        self.state
     }
 
     #[inline]
-    pub fn on_mouse_leave(&mut self, mode: InputMode) -> Capture {
-        if mode == Seamless {
-            self.state = Idle;
-        }
-        self.state
-    }
+    pub const fn on_mouse_leave(&mut self) { self.reset(); }
 
     #[inline]
-    pub fn on_click(&mut self, mode: InputMode) -> Capture {
+    pub fn on_click(&mut self, mode: InputMode) {
         if mode == Confined {
-            self.state = Exclusive;
+            self.state = Capture::Confined;
         }
-        self.state
     }
 
     #[inline]
-    pub fn on_release(&mut self) -> Capture {
-        self.state = Idle;
-        self.state
+    pub const fn on_release(&mut self) -> Capture {
+        self.reset();
+        self.current()
     }
 
     #[inline]
-    pub fn should_forward(&self, mode: InputMode) -> bool {
+    pub fn should_forward(&self) -> bool {
         match self.state {
-            Idle => false,
-            Hover => mode == Seamless,
-            Exclusive => true,
+            Capture::Idle => false,
+            Capture::Seamless | Capture::Confined => true,
         }
     }
 

@@ -59,7 +59,7 @@ pub mod macros {
 
     /// Generates async function that watches D-Bus properties and emits events.
     ///
-    /// Generates `async fn $fn_name(proxy, event_tx) -> JoinHandle`
+    /// Generates `async fn $fn_name(proxy, event_tx) -> AbortHandle`
     /// that fetches initial values and subscribes to property change signals.
     ///
     /// # Arguments
@@ -84,7 +84,7 @@ pub mod macros {
             async fn $fn_name(
                 proxy: $proxy_type,
                 event_tx: ::kanal::AsyncSender<$event_type>,
-            ) -> $crate::MksResult<::tokio::task::JoinHandle<()>> {
+            ) -> $crate::MksResult<::tokio::task::AbortHandle> {
                 $(
                     let $signal = proxy.$signal().await;
                 )*
@@ -121,14 +121,14 @@ pub mod macros {
                         }
                     }
                 };
-                Ok(::tokio::spawn(fut))
+                Ok(::tokio::spawn(fut).abort_handle())
             }
         };
     }
 
     /// Generates async function that handles commands by calling D-Bus methods.
     ///
-    /// Generates `async fn $fn_name(proxy, cmd_rx) -> JoinHandle`
+    /// Generates `async fn $fn_name(proxy, cmd_rx) -> AbortHandle`
     /// that receives commands and calls corresponding D-Bus methods.
     ///
     /// # Arguments
@@ -153,7 +153,7 @@ pub mod macros {
             async fn $fn_name(
                 $p: $proxy_type,
                 cmd_rx: ::kanal::AsyncReceiver<$cmd_type>,
-            ) -> $crate::MksResult<::tokio::task::JoinHandle<()>> {
+            ) -> $crate::MksResult<::tokio::task::AbortHandle> {
                 let fut = async move {
                     while let Ok(cmd) = cmd_rx.recv().await {
                         let res = match cmd {
@@ -166,7 +166,7 @@ pub mod macros {
                         }
                     }
                 };
-                Ok(::tokio::spawn(fut))
+                Ok(::tokio::spawn(fut).abort_handle())
             }
         };
     }
@@ -223,8 +223,8 @@ pub mod macros {
             pub struct $session_name {
                 pub tx: $controller_type,
                 pub rx: ::kanal::AsyncReceiver<$event_type>,
-                pub watch_task: ::tokio::task::JoinHandle<()>,
-                pub cmd_handler: ::tokio::task::JoinHandle<()>,
+                pub watch_task: ::tokio::task::AbortHandle,
+                pub cmd_handler: ::tokio::task::AbortHandle,
             }
 
             impl Drop for $session_name {

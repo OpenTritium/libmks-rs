@@ -24,7 +24,10 @@ use libmks_rs::{
         listener::Event,
         mouse::{self, MouseController},
     },
-    display::vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
+    display::{
+        input_handler::InputHandler,
+        vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
+    },
 };
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};
@@ -114,14 +117,10 @@ impl SimpleComponent for AppModel {
 
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx, kbd_rx) = create_mock_controllers();
 
+        let input_handler = InputHandler::builder().mouse(mouse_ctrl).keyboard(kbd_ctrl).build();
+
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit {
-                rx,
-                console_ctrl,
-                mouse_ctrl,
-                keyboard_ctrl: kbd_ctrl,
-                grab_shortcut: GrabShortcut::default(),
-            })
+            .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
             .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
         let display_widget = _display.widget().clone();
@@ -250,8 +249,8 @@ async fn mock_qemu_backend(
         for x in 0..cursor_w {
             let offset = ((y * cursor_w + x) * 4) as usize;
 
-            let dx = x as i32 - cx;
-            let dy = y as i32 - cy;
+            let dx = x - cx;
+            let dy = y - cy;
             let dist_sq = dx * dx + dy * dy;
 
             // --- 形状判定 ---
@@ -343,13 +342,13 @@ async fn mock_qemu_backend(
             }
 
             Ok(cmd) = console_rx.recv() => {
-                if let console::Command::SetUiInfo { width, height, .. } = cmd {
-                    if width > 0 && height > 0 {
-                        current_w = width;
-                        current_h = height;
-                        v_cursor_x = (current_w / 2) as i32;
-                        v_cursor_y = (current_h / 2) as i32;
-                    }
+                if let console::Command::SetUiInfo { width, height, .. } = cmd
+                    && width > 0 && height > 0
+                {
+                    current_w = width;
+                    current_h = height;
+                    v_cursor_x = (current_w / 2) as i32;
+                    v_cursor_y = (current_h / 2) as i32;
                 }
             }
 

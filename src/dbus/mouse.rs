@@ -5,7 +5,7 @@ use derive_more::{AsRef, Deref, From};
 use kanal::{AsyncReceiver, AsyncSender};
 use log::error;
 use serde_repr::Serialize_repr;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 use zbus::{Result, proxy};
 use zvariant::Type;
 
@@ -118,9 +118,7 @@ generate_watcher!(
     }
 );
 
-async fn debounce_mouse_commands(
-    proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>,
-) -> MksResult<JoinHandle<()>> {
+async fn debounce_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
     use Command::*;
     let fut = async move {
         let mut pending_cmd: Option<Command> = None;
@@ -181,7 +179,7 @@ async fn debounce_mouse_commands(
             }
         }
     };
-    Ok(tokio::spawn(fut))
+    Ok(tokio::spawn(fut).abort_handle())
 }
 
 #[cfg(test)]

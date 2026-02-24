@@ -2,76 +2,76 @@ use crate::{
     dbus::{
         keyboard::KeyboardController,
         mouse::{Button, MouseController},
+        multitouch::{Kind, MultiTouchController},
     },
-    display::{coord::CoordinateSystem, vm_display::InputMode},
+    display::coordinate::Coordinate,
     keymaps::Qnum,
 };
 use log::{error, warn};
+use typed_builder::TypedBuilder;
 
-#[derive(Clone)]
+#[derive(Clone, TypedBuilder)]
 pub struct InputHandler {
+    #[builder(default = 0.)]
     scroll_accumulator_y: f64,
-    pub mouse_ctrl: MouseController,
-    pub keyboard_ctrl: KeyboardController,
+    #[builder(default, setter(strip_option))]
+    pub mouse: Option<MouseController>,
+    #[builder(default, setter(strip_option))]
+    pub keyboard: Option<KeyboardController>,
+    #[builder(default, setter(strip_option))]
+    pub multitouch: Option<MultiTouchController>,
 }
 
 impl InputHandler {
-    pub fn new(mouse_ctrl: MouseController, keyboard_ctrl: KeyboardController) -> Self {
-        Self { scroll_accumulator_y: 0., mouse_ctrl, keyboard_ctrl }
-    }
-
     #[inline]
-    pub const fn should_forward(&self, mode: InputMode, is_captured: bool, is_mouse_over: bool) -> bool {
-        match mode {
-            InputMode::Confined => is_captured,
-            InputMode::Seamless => is_mouse_over,
+    pub fn move_mouse_to(&mut self, x: f32, y: f32, coord: &Coordinate) {
+        if let Some(ctrl) = &self.mouse
+            && let Some((x, y)) = coord.widget_to_guest(x, y)
+            && let Err(e) = ctrl.try_set_abs_position(x, y)
+        {
+            warn!(error:? = e; "Lost mouse move event")
         }
     }
 
-    #[inline]
-    pub fn move_mouse_to(&mut self, x: f32, y: f32, coord: &CoordinateSystem) {
-        if let Some((x, y)) = coord.widget_to_guest(x, y)
-            && let Err(e) = self.mouse_ctrl.try_set_abs_position(x, y)
-        {
-            warn!(error:? = e; "Lost mouse move event")
-        };
-    }
-
-    pub fn scroll_mouse(&mut self, dy: f64) -> i64 {
-        self.scroll_accumulator_y += dy;
-        let scroll_accumulator_y = self.scroll_accumulator_y;
-        let steps = scroll_accumulator_y.trunc() as i64;
-        self.scroll_accumulator_y -= steps as f64;
+    pub const fn cache_mouse_scroll(&mut self, dy: f64) -> i64 {
+        let acc = &mut self.scroll_accumulator_y;
+        *acc += dy;
+        let steps = acc.trunc() as i64;
+        *acc -= steps as f64;
         steps
     }
 
-    pub async fn send_scroll_events(&self, steps: i64) {
-        for _ in 0..steps.abs() {
-            let btn = if steps.is_positive() {
-                Button::WheelDown
-            } else {
-                Button::WheelUp
-            };
-            if let Err(e) = self.mouse_ctrl.press(btn).await {
-                error!(error:? = e; "Failed to press mouse button")
-            };
-            if let Err(e) = self.mouse_ctrl.release(btn).await {
-                error!(error:? = e; "Failed to release mouse button")
-            };
+    pub async fn scroll_mouse(&self, steps: i64) {
+        if let Some(ctrl) = &self.mouse {
+            for _ in 0..steps.abs() {
+                let btn = if steps.is_positive() {
+                    Button::WheelDown
+                } else {
+                    Button::WheelUp
+                };
+                if let Err(e) = ctrl.press(btn).await {
+                    error!(error:? = e; "Failed to press mouse button")
+                };
+                if let Err(e) = ctrl.release(btn).await {
+                    error!(error:? = e; "Failed to release mouse button")
+                };
+            }
         }
     }
 
     /// 处理键盘事件
     pub async fn press_keyboard(&self, keycode: u32, pressed: bool) {
-        let qnum = Qnum::from_xorg_keycode(keycode);
-        if pressed {
-            if let Err(e) = self.keyboard_ctrl.press(qnum).await {
-                error!(error:? = e; "Failed to press keyboard key")
-            };
-        } else {
-            if let Err(e) = self.keyboard_ctrl.release(qnum).await {
-                error!(error:? = e; "Failed to release keyboard key")
-            };
+        if let Some(ctrl) = &self.keyboard {
+            let qnum = Qnum::from_xorg_keycode(keycode);
+            if pressed {
+                if let Err(e) = ctrl.press(qnum).await {
+                    error!(error:? = e; "Failed to press keyboard key")
+                };
+            } else {
+                if let Err(e) = ctrl.release(qnum).await {
+                    error!(error:? = e; "Failed to release keyboard key")
+                };
+            }
         }
     }
 
@@ -89,5 +89,21 @@ impl InputHandler {
                 error!(error:? = e; "Failed to release mouse button")
             };
         };
+    }
+
+    /// 处理触摸事件
+    pub async fn touch(&self, kind: Kind, num_slot: u64, x: f64, y: f64) {
+        use Kind::*;
+        if let Some(ctrl) = &self.multitouch {
+            let res = match kind {
+                Begin => ctrl.begin(num_slot, x, y).await,
+                Update => ctrl.update(num_slot, x, y).await,
+                End => ctrl.end(num_slot, x, y).await,
+                Cancel => ctrl.cancel(num_slot, x, y).await,
+            };
+            if let Err(e) = res {
+                error!(error:? = e; "Failed to send touch event")
+            }
+        }
     }
 }

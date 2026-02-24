@@ -40,14 +40,11 @@ impl SimpleComponent for AppModel {
 
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx) = create_mock_controllers();
 
+        let input_handler =
+            libmks_rs::display::input_handler::InputHandler::builder().mouse(mouse_ctrl).keyboard(kbd_ctrl).build();
+
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit {
-                rx,
-                console_ctrl,
-                mouse_ctrl,
-                keyboard_ctrl: kbd_ctrl,
-                grab_shortcut: GrabShortcut::default(),
-            })
+            .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
             .detach();
 
         let display_widget = _display.widget().clone();
@@ -124,7 +121,7 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
         for x in 0..cursor_w {
             let i = ((y * cursor_w + x) * 4) as usize;
             let is_center_line = x == 31 || y == 31;
-            let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
+            let is_border = (30..=32).contains(&x) || (30..=32).contains(&y);
 
             if is_center_line {
                 cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
@@ -262,7 +259,7 @@ async fn mock_qemu_source(tx: AsyncSender<Event>, mouse_cmd_rx: kanal::AsyncRece
 
                             // 3. 打印日志证明我们在使用相对移动
                             // 使用 debug 级别防止刷屏，或者使用 periodic log
-                            if frame_count % 30 == 0 { // 减少日志刷屏
+                            if frame_count.is_multiple_of(30) { // 减少日志刷屏
                                 info!("[Mock] Wayland RelMotion ({}, {}) -> Pos ({}, {})", dx, dy, mock_cursor_x, mock_cursor_y);
                             } else {
                                 debug!("[Mock] Wayland RelMotion ({}, {})", dx, dy);

@@ -3,19 +3,19 @@ use super::pixman_4cc::{FourCC, Pixman};
 use crate::{
     dbus::listener::Event,
     display::{
+        Error,
         direct_map::ImportedTexture,
         software_rasterizer::Swapchain,
-        udma::{build_dmabuf_texture_planar, DmabufPlane},
-        Error,
+        udma::{DmabufPlane, build_dmabuf_texture_planar},
     },
 };
+use RenderBackend::*;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
     prelude::*,
 };
 use std::os::fd::{AsRawFd, OwnedFd};
-use RenderBackend::*;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirtyFlags {
@@ -24,7 +24,8 @@ pub struct DirtyFlags {
 }
 
 impl DirtyFlags {
-    pub fn any(&self) -> bool { self.frame || self.cursor }
+    #[inline]
+    pub const fn any(&self) -> bool { self.frame || self.cursor }
 }
 
 #[derive(Debug, Clone)]
@@ -54,18 +55,20 @@ impl Default for CursorState {
 
 impl CursorState {
     #[inline]
-    pub fn looks_same(&self, width: u32, height: u32, hot_x: i32, hot_y: i32, new_data: &[u8]) -> bool {
+    pub fn looks_same(
+        &self, width: i32, height: i32, hot_x: i32, hot_y: i32, new_data: &[u8], bytes_per_pixel: usize,
+    ) -> bool {
         if self.hot_x != hot_x
             || self.hot_y != hot_y
-            || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width as i32
-            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height as i32
+            || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width
+            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height
             || self.last_data.len() != new_data.len()
         {
             return false;
         }
         let w = width as usize;
         let h = height as usize;
-        let stride = w * 4;
+        let stride = w * bytes_per_pixel;
         if w < 3 || h < 3 {
             return self.last_data == new_data;
         }
@@ -135,6 +138,7 @@ pub struct Screen {
 impl Screen {
     pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None } }
 
+    #[inline]
     pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
         use Event::*;
         let mut flags = DirtyFlags::default();
@@ -206,7 +210,7 @@ impl Screen {
                 flags.frame = true;
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
-                if !self.cursor.looks_same(width as u32, height as u32, hot_x, hot_y, &data) {
+                if !self.cursor.looks_same(width, height, hot_x, hot_y, &data, 4) {
                     let data = Bytes::from_owned(data.0);
                     let texture =
                         MemoryTexture::new(width, height, MemoryFormat::B8g8r8a8, &data, (width as u32 * 4) as usize);

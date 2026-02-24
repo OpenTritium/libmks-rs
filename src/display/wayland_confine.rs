@@ -1,6 +1,6 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
 use crate::dbus::mouse::MouseController;
-use gdk4_wayland::WaylandDisplay;
+use gdk4_wayland::{WaylandDisplay, gdk::Rectangle};
 use log::{debug, info, warn};
 use std::{
     cell::RefCell,
@@ -65,7 +65,7 @@ impl WaylandConfine {
     }
 
     /// 将指针约束在一个矩形内
-    pub fn confine_pointer(&self, surface: &WlSurface, (x, y, width, height): (i32, i32, i32, i32)) {
+    pub fn confine_pointer(&self, surface: &WlSurface, rect: &Rectangle) {
         let state = self.state.borrow();
         let Some(constraints) = state.pointer_constraints.as_ref() else {
             warn!("Pointer constraints not available");
@@ -84,7 +84,7 @@ impl WaylandConfine {
             return;
         }
         let region = compositor.create_region(&self.qh, ());
-        region.add(x, y, width, height);
+        region.add(rect.x(), rect.y(), rect.width(), rect.height());
         let confined = constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.qh, ());
         region.destroy();
         drop(state);

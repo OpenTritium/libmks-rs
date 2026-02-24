@@ -2,7 +2,7 @@
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.VM-section>
 use crate::generate_watcher;
 use kanal::AsyncReceiver;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 use zbus::{Connection, Result, proxy};
 
 #[proxy(
@@ -43,7 +43,7 @@ pub enum Event {
 /// VM event listener and its watch task.
 pub struct VmListener {
     pub rx: AsyncReceiver<Event>,
-    pub watch_task: JoinHandle<()>,
+    pub watch_task: AbortHandle,
 }
 
 impl Drop for VmListener {

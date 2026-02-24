@@ -1,10 +1,8 @@
 use crate::{
-    dbus::{
-        console::ConsoleController, keyboard::KeyboardController, listener::Event as QemuEvent, mouse::MouseController,
-    },
+    dbus::{console::ConsoleController, listener::Event as QemuEvent, mouse::MouseController},
     display::{
         capture_state::{Capture, CaptureState},
-        coord::CoordinateSystem,
+        coordinate::Coordinate,
         input_handler::InputHandler,
         screen::{DirtyFlags, Screen},
         wayland_confine::WaylandConfine,
@@ -12,7 +10,7 @@ use crate::{
 };
 use gdk4_wayland::{
     WaylandDisplay, WaylandSurface,
-    gdk::{Key, ModifierType, Texture},
+    gdk::{Key, ModifierType, Rectangle, Texture},
     glib::{ControlFlow, IOCondition, Propagation, SourceId, translate::IntoGlib, unix_fd_add_local},
     prelude::*,
 };
@@ -27,12 +25,12 @@ use relm4::{
         gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
     },
 };
-use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration, vec::Vec};
+use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
 use tokio::{task::AbortHandle, time::sleep};
 
-const INCH_TO_MM: f64 = 25.4;
-const DEFAULT_DPI: f64 = 96.0;
-const DEFAULT_PIXEL_PITCH_MM: f64 = INCH_TO_MM / DEFAULT_DPI;
+const INCH_TO_MM: f32 = 25.4;
+const DEFAULT_DPI: f32 = 96.;
+const DEFAULT_PIXEL_PITCH_MM: f32 = INCH_TO_MM / DEFAULT_DPI;
 
 /// 确保 css provider 只被初始化一次，因为它不是 sync 的所以我们没有使用 LazyCell
 #[inline]
@@ -146,7 +144,7 @@ pub enum CaptureEvent {
 
 impl CaptureEvent {
     #[inline]
-    fn should_capture(&self) -> bool {
+    const fn should_capture(&self) -> bool {
         match self {
             CaptureEvent::Capture { .. } => true,
             CaptureEvent::Release => false,
@@ -154,9 +152,9 @@ impl CaptureEvent {
     }
 
     #[inline]
-    fn click_pos(&self) -> Option<(f32, f32)> {
+    const fn click_pos(&self) -> Option<(f32, f32)> {
         match self {
-            &CaptureEvent::Capture { click_pos } => click_pos,
+            CaptureEvent::Capture { click_pos } => *click_pos,
             CaptureEvent::Release => None,
         }
     }
@@ -170,7 +168,7 @@ pub enum Message {
     MouseButton { button: u32, pressed: bool },
     Scroll { dy: f64 },
     Key { keyval: u32, keycode: u32, pressed: bool },
-    UpdateMonitorInfo { pixel_pitch_mm: f64 },
+    UpdateMonitorInfo { pixel_pitch_mm: f32 },
     SetScalingMode(ScalingMode),
     ToggleCapture(CaptureEvent),
     HideCaptureHint,
@@ -184,18 +182,15 @@ pub struct VmDisplayModel {
     pub screen: Screen,
     pub dirty_flags: DirtyFlags,
     console_ctrl: ConsoleController,
-    pixel_pitch_mm: f64,
-    scale_factor: f32,
+    pixel_pitch_mm: f32,
     resize_timer: Option<AbortHandle>,
     input_overlay: DrawingArea,
     pub confine_state: Option<ConfineState>,
     pub scaling_mode: ScalingMode,
     hint_visible: bool,
-    coord_system: CoordinateSystem,
-    input_handler: InputHandler,
-    capture_sm: CaptureState,
-    cursor_scale: f32,
-    cursor_offset: (f32, f32),
+    coord_system: Coordinate,
+    input: InputHandler,
+    capture_state: CaptureState,
 }
 
 pub struct VmDisplayWidgets {
@@ -211,14 +206,13 @@ pub struct VmDisplayWidgets {
 pub struct VmDisplayInit {
     pub rx: AsyncReceiver<QemuEvent>,
     pub console_ctrl: ConsoleController,
-    pub mouse_ctrl: MouseController,
-    pub keyboard_ctrl: KeyboardController,
+    pub input_handler: InputHandler,
     pub grab_shortcut: GrabShortcut,
 }
 
 impl VmDisplayModel {
     #[inline]
-    fn input_mode(&self) -> InputMode {
+    const fn input_mode(&self) -> InputMode {
         if self.confine_state.is_some() {
             InputMode::Confined
         } else {
@@ -238,8 +232,8 @@ impl VmDisplayModel {
         self.resize_timer = Some(
             relm4::spawn(async move {
                 sleep(Duration::from_millis(200)).await;
-                let w_mm = (w as f64 * pixel_pitch_mm) as u16;
-                let h_mm = (h as f64 * pixel_pitch_mm) as u16;
+                let w_mm = (w as f32 * pixel_pitch_mm) as u16;
+                let h_mm = (h as f32 * pixel_pitch_mm) as u16;
                 info!("Resize debounced: {w}x{h} ({w_mm}mm x {h_mm}mm)");
                 if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h).await {
                     error!(error:? = e; "Failed to send resize command");
@@ -266,32 +260,25 @@ impl Component for VmDisplayModel {
     fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         use Message::*;
         ensure_css_loaded();
-
         let input_plane =
             DrawingArea::builder().focusable(true).focus_on_click(true).hexpand(true).vexpand(true).build();
         input_plane.set_content_width(0);
         input_plane.set_content_height(0);
-
-        let input_handler = InputHandler::new(init.mouse_ctrl.clone(), init.keyboard_ctrl.clone());
         let model = VmDisplayModel {
             screen: Screen::new(),
             dirty_flags: DirtyFlags::default(),
             console_ctrl: init.console_ctrl,
             scaling_mode: ScalingMode::ResizeGuest,
             pixel_pitch_mm: DEFAULT_PIXEL_PITCH_MM,
-            scale_factor: 1.0,
             resize_timer: None,
             hint_visible: false,
             input_overlay: input_plane.clone(),
             confine_state: None,
-            coord_system: CoordinateSystem::new(0, 0, 0.0, 0.0),
-            input_handler,
-            capture_sm: CaptureState::new(),
-            cursor_scale: 1.0,
-            cursor_offset: (0.0, 0.0),
+            coord_system: Coordinate::new(0, 0, 0., 0., 1.),
+            input: init.input_handler,
+            capture_state: CaptureState::new(),
         };
         let view_stack = Overlay::builder().hexpand(true).vexpand(true).build();
-
         let vm_picture = Picture::builder()
             .can_shrink(true)
             .content_fit(ContentFit::Contain)
@@ -299,35 +286,55 @@ impl Component for VmDisplayModel {
             .valign(Align::Center)
             .can_target(false)
             .build();
-
         let offload = GraphicsOffload::builder()
             .enabled(GraphicsOffloadEnabled::Enabled)
             .child(&vm_picture)
             .hexpand(true)
             .vexpand(true)
             .build();
-
         let sender_clone = sender.clone();
         let update_monitor_info = move |widget: &DrawingArea| {
             let display = widget.display();
-            let Some(native) = widget.native() else { return };
-            let Some(surface) = native.surface() else { return };
-            let Some(monitor) = display.monitor_at_surface(&surface) else { return };
+            let Some(native) = widget.native() else {
+                error!("Failed to get native widget");
+                return;
+            };
+            let Some(surface) = native.surface() else {
+                error!("Failed to get surface from native");
+                return;
+            };
+            let Some(monitor) = display.monitor_at_surface(&surface) else {
+                error!("Failed to get monitor from surface");
+                return;
+            };
             let geometry = monitor.geometry();
-            let width_mm = monitor.width_mm();
-            let geometry_width = geometry.width();
-            if width_mm > 0 && geometry_width > 0 {
-                let pixel_pitch_mm = width_mm as f64 / geometry_width as f64;
+            let width_mm = monitor.width_mm() as f32;
+            let height_mm = monitor.height_mm() as f32;
+            let scale_factor = (widget.scale_factor() as f32).max(0.5).clamp(0.5, 8.);
+            let geometry_width_physical = geometry.width() as f32 * scale_factor;
+            let geometry_height_physical = geometry.height() as f32 * scale_factor;
+
+            if width_mm > 0. && height_mm > 0. && geometry_width_physical > 0. && geometry_height_physical > 0. {
+                let pixel_pitch_mm = width_mm / geometry_width_physical;
+                debug!(
+                    "Monitor {}: {}×{}mm, {}×{} logical px (scale={:.2}) → {}×{} physical px (pitch={:.4}mm/px)",
+                    monitor.model().as_deref().unwrap_or("unknown"),
+                    width_mm,
+                    height_mm,
+                    geometry.width(),
+                    geometry.height(),
+                    scale_factor,
+                    geometry_width_physical,
+                    geometry_height_physical,
+                    pixel_pitch_mm
+                );
                 sender_clone.input(UpdateMonitorInfo { pixel_pitch_mm });
             }
         };
-
         let updater = update_monitor_info.clone();
         input_plane.connect_realize(move |widget| updater(widget));
-        // root.connect_realize(move |_root| {});
 
         let mut controllers = Vec::new();
-
         let motion_ctrl = EventControllerMotion::new();
         let sender_clone = sender.clone();
         motion_ctrl.connect_motion(move |_, x, y| {
@@ -384,8 +391,6 @@ impl Component for VmDisplayModel {
         root.add_controller(key.clone());
         controllers.push(key.upcast());
 
-        let _cursor_picture = Picture::builder().can_target(false).halign(Align::Start).valign(Align::Start).build();
-
         let capture_hint = Label::builder()
             .label(format!("Press {grab_shortcut} to release mouse"))
             .halign(Align::Center)
@@ -404,7 +409,7 @@ impl Component for VmDisplayModel {
             .build();
 
         let cursor_fixed = Fixed::builder().can_target(false).hexpand(true).vexpand(true).build();
-        cursor_fixed.put(&cursor_picture, 0.0, 0.0);
+        cursor_fixed.put(&cursor_picture, 0., 0.);
 
         let resize_handler = {
             let updater = update_monitor_info.clone();
@@ -413,8 +418,10 @@ impl Component for VmDisplayModel {
                 updater(widget);
                 let w = widget.width() as f32;
                 let h = widget.height() as f32;
-                if w > 0.0 && h > 0.0 {
+                if w > 0. && h > 0. {
                     sender.input(Message::CanvasResize { logical_width: w, logical_height: h });
+                } else {
+                    warn!("Can not resize canvas: ({w}, {h})");
                 }
             }
         };
@@ -458,10 +465,15 @@ impl Component for VmDisplayModel {
                     warn!("Input mode already set to {mode:?}");
                     return;
                 }
+                self.capture_state.reset();
                 if self.confine_state.take().is_some() {
                     self.hint_visible = false;
                 } else {
-                    let Some(confine) = ConfineState::connect_to_wayland(self.input_handler.mouse_ctrl.clone()) else {
+                    let Some(mouse_ctrl) = &self.input.mouse else {
+                        warn!("No mouse controller available, fallback to seamless");
+                        return;
+                    };
+                    let Some(confine) = ConfineState::connect_to_wayland(mouse_ctrl.clone()) else {
                         warn!("Failed connect to wayland session, fallback to seamless");
                         return;
                     };
@@ -471,25 +483,22 @@ impl Component for VmDisplayModel {
             }
 
             MouseLeave => {
-                let mode = self.input_mode();
-                self.capture_sm.on_mouse_leave(mode);
-                if mode == Seamless {
-                    sender.input(UpdateCaptureView);
-                }
+                self.capture_state.on_mouse_leave();
+                sender.input(UpdateCaptureView);
             }
 
             MouseMove { x, y } => {
                 let mode = self.input_mode();
-                let was_hovering = self.capture_sm.current() == Capture::Hover;
-                if !was_hovering {
-                    self.capture_sm.on_mouse_enter(mode);
-                    if mode == InputMode::Seamless {
+                let was_capturing = self.capture_state.current() != Capture::Idle;
+                if !was_capturing {
+                    self.capture_state.on_mouse_enter(mode);
+                    if self.capture_state.current() == Capture::Seamless {
                         sender.input(UpdateCaptureView);
                     }
                 }
 
-                if self.capture_sm.should_forward(mode) {
-                    self.input_handler.move_mouse_to(x, y, &self.coord_system);
+                if self.capture_state.should_forward() {
+                    self.input.move_mouse_to(x, y, &self.coord_system);
                 }
             }
 
@@ -501,19 +510,17 @@ impl Component for VmDisplayModel {
                 let widget_rect = if let Some(native) = &native
                     && let Some(bounds) = self.input_overlay.compute_bounds(native)
                 {
-                    let x = bounds.x().floor() as i32;
-                    let y = bounds.y().floor() as i32;
-                    let right = (bounds.x() + bounds.width()).ceil() as i32;
-                    let bottom = (bounds.y() + bounds.height()).ceil() as i32;
-                    let width = 0.max(right - x);
-                    let height = 0.max(bottom - y);
-                    (x, y, width, height)
+                    Rectangle::new(
+                        bounds.x().floor() as i32,
+                        bounds.y().floor() as i32,
+                        bounds.width().ceil() as i32,
+                        bounds.height().ceil() as i32,
+                    )
                 } else {
-                    (0, 0, 0, 0)
+                    Rectangle::new(0, 0, 0, 0)
                 };
                 let click_pos = event.click_pos();
                 let vm_coords = click_pos.and_then(|(x, y)| self.coord_system.widget_to_guest(x, y));
-
                 let Some(proxy) = native
                     .and_then(|n| n.surface())
                     .and_then(|s| s.downcast::<WaylandSurface>().ok())
@@ -522,28 +529,28 @@ impl Component for VmDisplayModel {
                     warn!("Failed to get wl_surface proxy");
                     return;
                 };
-
                 let Some(confine) = &mut self.confine_state else {
                     sender.input(UpdateCaptureView);
                     return;
                 };
-
                 self.hint_visible = should_capture;
                 if should_capture {
                     if mode == Confined {
-                        self.capture_sm.on_click(mode);
+                        self.capture_state.on_click(mode);
                     }
                     confine.reset_hint_timer(sender.clone());
-                    confine.wayland_confine.borrow_mut().confine_pointer(&proxy, widget_rect);
-                    if let Some(pos) = vm_coords {
-                        if let Err(e) = self.input_handler.mouse_ctrl.try_set_abs_position(pos.0, pos.1) {
+                    confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect);
+                    if let Some(pos) = vm_coords
+                        && let Some(mouse_ctrl) = &self.input.mouse
+                    {
+                        if let Err(e) = mouse_ctrl.try_set_abs_position(pos.0, pos.1) {
                             error!(error:? = e; "Failed to set absolute position");
                         }
                         debug!("Mouse was confined, and latest position: {pos:?}");
                     }
                     info!("Pointer confined to region: {widget_rect:?}");
                 } else {
-                    self.capture_sm.on_release();
+                    self.capture_state.on_release();
                     confine.wayland_confine.borrow_mut().unconfine();
                     confine.try_cancel_hint_timer();
                     info!("Pointer unconfined");
@@ -556,10 +563,6 @@ impl Component for VmDisplayModel {
                 if let Ok(flags) = self.screen.handle_event(event) {
                     let (w, h) = self.screen.resolution();
                     self.coord_system.set_vm_resolution(w, h);
-                    if let Some(transform) = self.coord_system.get_cached_transform() {
-                        self.cursor_scale = transform.scale;
-                        self.cursor_offset = (transform.offset_x, transform.offset_y);
-                    }
                     self.dirty_flags.cursor |= flags.cursor;
                     self.dirty_flags.frame |= flags.frame;
                 }
@@ -567,43 +570,28 @@ impl Component for VmDisplayModel {
 
             SetScalingMode(mode) => {
                 self.scaling_mode = mode;
-                if mode == ScalingMode::ResizeGuest {
-                    let logical_w = self.input_overlay.width() as f32;
-                    let logical_h = self.input_overlay.height() as f32;
-                    if logical_w > 0.0 && logical_h > 0.0 {
-                        let scale = self.scale_factor;
-                        let phys_w = (logical_w * scale).max(1.0) as u32;
-                        let phys_h = (logical_h * scale).max(1.0) as u32;
-                        if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(phys_w), NonZeroU32::new(phys_h)) {
-                            self.reset_resize_timer(w_nz, h_nz);
-                        }
-                    }
+                if mode == ScalingMode::ResizeGuest
+                    && let Some((w_nz, h_nz)) = self.coord_system.target_guest_resolution()
+                {
+                    self.reset_resize_timer(w_nz, h_nz);
                 }
             }
 
             CanvasResize { logical_width, logical_height } => {
                 self.coord_system.set_widget_size(logical_width, logical_height);
                 if let Some(_native) = self.input_overlay.native() {
-                    self.scale_factor = self.input_overlay.scale_factor() as f32;
-                }
-                if let Some(transform) = self.coord_system.get_cached_transform() {
-                    self.cursor_scale = transform.scale;
-                    self.cursor_offset = (transform.offset_x, transform.offset_y);
+                    self.coord_system.set_monitor_scale(self.input_overlay.scale_factor() as f32);
                 }
                 self.dirty_flags.cursor = true;
-                if self.scaling_mode == ScalingMode::ResizeGuest {
-                    let scale = self.scale_factor;
-                    let phys_w = (logical_width * scale).max(1.0) as u32;
-                    let phys_h = (logical_height * scale).max(1.0) as u32;
-                    if let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(phys_w), NonZeroU32::new(phys_h)) {
-                        self.reset_resize_timer(w_nz, h_nz);
-                    }
+                if self.scaling_mode == ScalingMode::ResizeGuest
+                    && let Some((w_nz, h_nz)) = self.coord_system.target_guest_resolution()
+                {
+                    self.reset_resize_timer(w_nz, h_nz);
                 }
             }
 
             CheckCaptureState => {
-                let mode = self.input_mode();
-                if self.capture_sm.should_forward(mode) && mode == InputMode::Confined {
+                if self.capture_state.should_forward() && self.input_mode() == InputMode::Confined {
                     sender.input(UpdateCaptureView);
                 }
             }
@@ -621,33 +609,34 @@ impl Component for VmDisplayModel {
             }
 
             MouseButton { button, pressed } => {
-                let input_handler = self.input_handler.clone();
+                let Some(mouse_ctrl) = self.input.mouse.clone() else {
+                    warn!("No mouse controller available");
+                    return;
+                };
+                let input_handler = self.input.clone();
                 relm4::spawn(async move {
-                    input_handler.press_mouse_button(button, pressed, input_handler.mouse_ctrl.clone()).await;
+                    input_handler.press_mouse_button(button, pressed, mouse_ctrl).await;
                 });
             }
 
             Scroll { dy } => {
-                let mode = self.input_mode();
-                if !self.capture_sm.should_forward(mode) {
+                if !self.capture_state.should_forward() {
                     return;
                 }
-
-                let steps = self.input_handler.scroll_mouse(dy);
+                let steps = self.input.cache_mouse_scroll(dy);
                 if steps != 0 {
-                    let input_handler = self.input_handler.clone();
+                    let input_handler = self.input.clone();
                     relm4::spawn(async move {
-                        input_handler.send_scroll_events(steps).await;
+                        input_handler.scroll_mouse(steps).await;
                     });
                 }
             }
 
             Key { keyval: _, keycode, pressed } => {
-                let mode = self.input_mode();
-                if !self.capture_sm.should_forward(mode) {
+                if !self.capture_state.should_forward() {
                     return;
                 }
-                let input_handler = self.input_handler.clone();
+                let input_handler = self.input.clone();
                 relm4::spawn(async move {
                     input_handler.press_keyboard(keycode, pressed).await;
                 });
@@ -660,9 +649,6 @@ impl Component for VmDisplayModel {
     }
 
     fn update_view(&self, widgets: &mut Self::Widgets, _sender: ComponentSender<Self>) {
-        use relm4::gtk::prelude::*;
-
-        // 1. Toast 提示逻辑
         let (class_add, class_remove) = if self.hint_visible {
             ("toast-visible", "toast-hidden")
         } else {
@@ -670,46 +656,35 @@ impl Component for VmDisplayModel {
         };
         widgets.capture_hint.add_css_class(class_add);
         widgets.capture_hint.remove_css_class(class_remove);
-
-        // 捕获时隐藏系统鼠标
-        let mode = self.input_mode();
-        let is_interactive = self.capture_sm.should_forward(mode);
+        let is_interactive = self.capture_state.should_forward();
         widgets.input_overlay.set_cursor_from_name(is_interactive.then_some("none"));
-
         if !self.dirty_flags.any() {
             return;
         }
-
-        // 2. 更新背景 (GraphicsOffload 依然负责高性能背景渲染)
         if self.dirty_flags.frame {
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
         }
-
         if self.dirty_flags.cursor || self.dirty_flags.frame {
             let cursor = &self.screen.cursor;
-
-            widgets.cursor_picture.set_visible(cursor.visible && is_interactive);
-
-            if cursor.visible && is_interactive {
+            let visiable = cursor.visible && is_interactive;
+            widgets.cursor_picture.set_visible(visiable);
+            if visiable {
                 if let Some(texture) = &cursor.texture {
                     widgets.cursor_picture.set_paintable(Some(texture));
-
-                    let tex_w = texture.width() as i32;
-                    let tex_h = texture.height() as i32;
+                    let tex_w = texture.width();
+                    let tex_h = texture.height();
                     widgets.cursor_picture.set_size_request(tex_w, tex_h);
-
-                    let logical_scale = self.cursor_scale;
-                    let (logical_offset_x, logical_offset_y) = self.cursor_offset;
-
-                    let draw_x =
-                        logical_offset_x + (cursor.x as f32 * logical_scale) - (cursor.hot_x as f32 * logical_scale);
-                    let draw_y =
-                        logical_offset_y + (cursor.y as f32 * logical_scale) - (cursor.hot_y as f32 * logical_scale);
-
-                    let transform =
-                        Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
-
-                    widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform));
+                    if let Some(transform) = self.coord_system.get_cached_viewport() {
+                        let logical_scale = transform.scale;
+                        let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
+                        let draw_x = logical_offset_x + (cursor.x as f32 * logical_scale)
+                            - (cursor.hot_x as f32 * logical_scale);
+                        let draw_y = logical_offset_y + (cursor.y as f32 * logical_scale)
+                            - (cursor.hot_y as f32 * logical_scale);
+                        let transform_matrix =
+                            Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
+                        widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
+                    }
                 } else {
                     widgets.cursor_picture.set_paintable(None::<&Texture>);
                 }

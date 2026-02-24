@@ -68,14 +68,11 @@ impl SimpleComponent for AppModel {
 
         let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx, kbd_rx) = create_mock_controllers();
 
+        let input_handler =
+            libmks_rs::display::input_handler::InputHandler::builder().mouse(mouse_ctrl).keyboard(kbd_ctrl).build();
+
         let display = VmDisplayModel::builder()
-            .launch(VmDisplayInit {
-                rx,
-                console_ctrl,
-                mouse_ctrl,
-                keyboard_ctrl: kbd_ctrl,
-                grab_shortcut: GrabShortcut::default(),
-            })
+            .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
             .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
         let display_widget = display.widget().clone();
@@ -177,7 +174,7 @@ async fn mock_qemu_backend(
         for x in 0..cursor_w {
             let i = ((y * cursor_w + x) * 4) as usize;
             let is_center_line = x == 31 || y == 31;
-            let is_border = (x >= 30 && x <= 32) || (y >= 30 && y <= 32);
+            let is_border = (30..=32).contains(&x) || (30..=32).contains(&y);
 
             if is_center_line {
                 cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
@@ -265,8 +262,8 @@ async fn mock_qemu_backend(
 
             // C. 处理 Resize 指令
             Ok(cmd) = console_rx.recv() => {
-                if let console::Command::SetUiInfo { width, height, .. } = cmd {
-                    if width > 0 && height > 0 && (width != current_w || height != current_h) {
+                if let console::Command::SetUiInfo { width, height, .. } = cmd
+                    && width > 0 && height > 0 && (width != current_w || height != current_h) {
                         info!("📏 Resize: {}x{}", width, height);
                         current_w = width;
                         current_h = height;
@@ -274,7 +271,6 @@ async fn mock_qemu_backend(
                         v_cursor_x = (current_w / 2) as i32;
                         v_cursor_y = (current_h / 2) as i32;
                     }
-                }
             }
 
             // D. 处理键盘指令 (Drain Channel)

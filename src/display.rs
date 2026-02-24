@@ -1,5 +1,5 @@
 pub mod capture_state;
-pub mod coord;
+pub mod coordinate;
 pub mod direct_map;
 mod error;
 pub mod input_handler;
