@@ -120,6 +120,13 @@ generate_watcher!(
 
 async fn debounce_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
     use Command::*;
+
+    /// QEMU/Guest OS 单次鼠标相对位移的安全阈值。
+    /// 标准的 PS/2 或 USB HID 鼠标协议单次位移极限通常是 [-127, 127]（8位有符号整数）。
+    /// 如果一次性发送超过此范围的值，Guest OS 驱动会将其截断，从而导致快速移动时丢失精度。
+    /// 这里取 100 作为安全阈值进行分块发送。
+    const MAX_REL_MOTION_STEP: i32 = 100;
+
     let fut = async move {
         let mut pending_cmd: Option<Command> = None;
         loop {
@@ -141,14 +148,30 @@ async fn debounce_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiv
                     }
                 }
                 RelMotion { mut dx, mut dy } => {
-                    while let Ok(Some(RelMotion { dx: ndx, dy: ndy })) = cmd_rx.try_recv() {
-                        dx += ndx;
-                        dy += ndy;
+                    // 修复：使用更宽泛的模式匹配，避免意外吞掉其他类型的事件
+                    while let Ok(Some(next_cmd)) = cmd_rx.try_recv() {
+                        if let RelMotion { dx: ndx, dy: ndy } = next_cmd {
+                            dx += ndx;
+                            dy += ndy;
+                        } else {
+                            // 非 RelMotion 命令暂存，后续处理
+                            pending_cmd = Some(next_cmd);
+                            break;
+                        }
                     }
-                    if (dx != 0 || dy != 0)
-                        && let Err(e) = proxy.rel_motion(dx, dy).await
-                    {
-                        error!(error:? = e; "Mouse rel_motion failed");
+
+                    // 修复超大位移导致的 Guest OS 截断误差：
+                    // 如果累加的 dx/dy 超过单次协议允许的最大范围，必须切分成多个小块连续发送。
+                    while dx != 0 || dy != 0 {
+                        let step_dx = dx.clamp(-MAX_REL_MOTION_STEP, MAX_REL_MOTION_STEP);
+                        let step_dy = dy.clamp(-MAX_REL_MOTION_STEP, MAX_REL_MOTION_STEP);
+                        dx -= step_dx;
+                        dy -= step_dy;
+
+                        if let Err(e) = proxy.rel_motion(step_dx, step_dy).await {
+                            error!(error:? = e; "Mouse rel_motion failed");
+                            break; // 遇到 DBus 通信异常则跳出分块循环
+                        }
                     }
                 }
                 Press(btn) => {

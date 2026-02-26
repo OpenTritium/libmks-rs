@@ -65,7 +65,7 @@ qemu-system-x86_64 \
     -device virtio-keyboard-pci \
     -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
     -usb \
-    -device usb-tablet \
+    -device virtio-mouse-pci \
     -device usb-kbd \
     -net nic,model=virtio \
     -net user \

@@ -490,18 +490,15 @@ impl Component for VmDisplayModel {
             MouseMove { x, y } => {
                 let mode = self.input_mode();
                 let current_capture = self.capture_state.current();
-
-                // 将当前坐标转换为 Point，并判断是否在真实的虚拟机画面区域内（排除黑边）
                 let point = Point::new(x, y);
                 let is_in_viewport = self.coord_system.is_in_viewport(&point);
-
                 match (mode, current_capture, is_in_viewport) {
                     // 鼠标进入了有效画面区域
                     (InputMode::Seamless, Capture::Idle, true) => {
                         self.capture_state.on_mouse_enter(mode);
                         sender.input(UpdateCaptureView);
                     }
-                    // 鼠标从有效画面区域离开（比如移到了黑边区域）
+                    // 鼠标从有效画面区域离开
                     (InputMode::Seamless, Capture::Seamless, false) => {
                         self.capture_state.on_mouse_leave();
                         sender.input(UpdateCaptureView);
@@ -509,7 +506,6 @@ impl Component for VmDisplayModel {
                     // 鼠标在画面内持续移动，或在画面外持续移动，维持状态不变
                     _ => {}
                 }
-
                 if self.capture_state.should_forward() {
                     self.input.move_mouse_to(x, y, &self.coord_system);
                 }
