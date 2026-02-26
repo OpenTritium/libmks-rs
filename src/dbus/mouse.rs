@@ -105,7 +105,7 @@ impl_session_connect!(
     Event,
     watch_proxy_changes,
     debounce_mouse_commands,
-    2048
+    8192
 );
 
 generate_watcher!(
@@ -132,37 +132,22 @@ async fn debounce_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiv
             };
             match cmd {
                 SetAbsPosition { mut x, mut y } => {
-                    while let Ok(Some(next)) = cmd_rx.try_recv() {
-                        match next {
-                            SetAbsPosition { x: nx, y: ny } => {
-                                x = nx;
-                                y = ny;
-                            }
-                            barrier => {
-                                pending_cmd = Some(barrier);
-                                break;
-                            }
-                        }
+                    while let Ok(Some(SetAbsPosition { x: nx, y: ny })) = cmd_rx.try_recv() {
+                        x = nx;
+                        y = ny;
                     }
                     if let Err(e) = proxy.set_abs_position(x, y).await {
                         error!(error:? = e; "Mouse set_abs_position failed");
                     }
                 }
-
                 RelMotion { mut dx, mut dy } => {
-                    while let Ok(Some(next)) = cmd_rx.try_recv() {
-                        match next {
-                            RelMotion { dx: ndx, dy: ndy } => {
-                                dx += ndx;
-                                dy += ndy;
-                            }
-                            barrier => {
-                                pending_cmd = Some(barrier);
-                                break;
-                            }
-                        }
+                    while let Ok(Some(RelMotion { dx: ndx, dy: ndy })) = cmd_rx.try_recv() {
+                        dx += ndx;
+                        dy += ndy;
                     }
-                    if let Err(e) = proxy.rel_motion(dx, dy).await {
+                    if (dx != 0 || dy != 0)
+                        && let Err(e) = proxy.rel_motion(dx, dy).await
+                    {
                         error!(error:? = e; "Mouse rel_motion failed");
                     }
                 }

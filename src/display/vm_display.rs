@@ -490,20 +490,26 @@ impl Component for VmDisplayModel {
             MouseMove { x, y } => {
                 let mode = self.input_mode();
                 let current_capture = self.capture_state.current();
-                match (mode, current_capture) {
+
+                // 将当前坐标转换为 Point，并判断是否在真实的虚拟机画面区域内（排除黑边）
+                let point = Point::new(x, y);
+                let is_in_viewport = self.coord_system.is_in_viewport(&point);
+
+                match (mode, current_capture, is_in_viewport) {
                     // 鼠标进入了有效画面区域
-                    (InputMode::Seamless, Capture::Idle) => {
+                    (InputMode::Seamless, Capture::Idle, true) => {
                         self.capture_state.on_mouse_enter(mode);
                         sender.input(UpdateCaptureView);
                     }
-                    // 鼠标从有效画面区域离开
-                    (InputMode::Seamless, Capture::Seamless) => {
+                    // 鼠标从有效画面区域离开（比如移到了黑边区域）
+                    (InputMode::Seamless, Capture::Seamless, false) => {
                         self.capture_state.on_mouse_leave();
                         sender.input(UpdateCaptureView);
                     }
-                    // 其他情况（如 Confined 模式，或状态未改变）无需干预
+                    // 鼠标在画面内持续移动，或在画面外持续移动，维持状态不变
                     _ => {}
                 }
+
                 if self.capture_state.should_forward() {
                     self.input.move_mouse_to(x, y, &self.coord_system);
                 }
@@ -566,8 +572,6 @@ impl Component for VmDisplayModel {
             }
 
             Qemu(event) => {
-                // 注意：不要同步 QEMU 的 MouseSet 位置到 InputHandler！
-                // 相对鼠标模式必须只根据宿主机输入计算位移，否则会形成输入反馈循环导致疯狂跳跃
                 if let Ok(flags) = self.screen.handle_event(event) {
                     let (w, h) = self.screen.resolution();
                     self.coord_system.set_vm_resolution(w, h);
@@ -677,16 +681,19 @@ impl Component for VmDisplayModel {
                     widgets.cursor_picture.set_paintable(Some(texture));
                     let tex_w = texture.width();
                     let tex_h = texture.height();
-                    widgets.cursor_picture.set_size_request(tex_w, tex_h);
+                    // Only update size request when dimensions actually change to avoid GTK layout thrashing
+                    if widgets.cursor_picture.width_request() != tex_w
+                        || widgets.cursor_picture.height_request() != tex_h
+                    {
+                        widgets.cursor_picture.set_size_request(tex_w, tex_h);
+                    }
                     if let Some(transform) = self.coord_system.get_cached_viewport() {
                         let logical_scale = transform.scale;
                         let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
                         let anchor_x = logical_offset_x + cursor.x as f32 * logical_scale;
                         let anchor_y = logical_offset_y + cursor.y as f32 * logical_scale;
-                        let offset_x = cursor.hot_x as f32 * logical_scale;
-                        let offset_y = cursor.hot_y as f32 * logical_scale;
-                        let draw_x = (anchor_x - offset_x).round();
-                        let draw_y = (anchor_y - offset_y).round();
+                        let draw_x = anchor_x.round();
+                        let draw_y = anchor_y.round();
                         let transform_matrix =
                             Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
                         widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
