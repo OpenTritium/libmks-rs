@@ -22,7 +22,7 @@ use relm4::{
         Align, ContentFit, CssProvider, DrawingArea, EventController, EventControllerKey, EventControllerMotion,
         EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload,
         GraphicsOffloadEnabled, Label, Overlay, Picture, STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
-        gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
+        gdk::Display, graphene, gsk, prelude::*, style_context_add_provider_for_display,
     },
 };
 use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
@@ -176,6 +176,7 @@ pub enum Message {
     CheckCaptureState,
     MouseLeave,
     SetInputCaptureMode(InputMode),
+    MouseModeChanged { is_absolute: bool },
 }
 
 pub struct VmDisplayModel {
@@ -235,7 +236,7 @@ impl VmDisplayModel {
                 let w_mm = (w as f32 * pixel_pitch_mm) as u16;
                 let h_mm = (h as f32 * pixel_pitch_mm) as u16;
                 info!("Resize debounced: {w}x{h} ({w_mm}mm x {h_mm}mm)");
-                if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h).await {
+                if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h) {
                     error!(error:? = e; "Failed to send resize command");
                 }
             })
@@ -457,7 +458,6 @@ impl Component for VmDisplayModel {
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
-        use InputMode::*;
         use Message::*;
         match msg {
             SetInputCaptureMode(mode) => {
@@ -469,11 +469,11 @@ impl Component for VmDisplayModel {
                 if self.confine_state.take().is_some() {
                     self.hint_visible = false;
                 } else {
-                    let Some(mouse_ctrl) = &self.input.mouse else {
+                    let Some(ctrl) = self.input.mouse_ctrl() else {
                         warn!("No mouse controller available, fallback to seamless");
                         return;
                     };
-                    let Some(confine) = ConfineState::connect_to_wayland(mouse_ctrl.clone()) else {
+                    let Some(confine) = ConfineState::connect_to_wayland(ctrl.clone()) else {
                         warn!("Failed connect to wayland session, fallback to seamless");
                         return;
                     };
@@ -489,14 +489,21 @@ impl Component for VmDisplayModel {
 
             MouseMove { x, y } => {
                 let mode = self.input_mode();
-                let was_capturing = self.capture_state.current() != Capture::Idle;
-                if !was_capturing {
-                    self.capture_state.on_mouse_enter(mode);
-                    if self.capture_state.current() == Capture::Seamless {
+                let current_capture = self.capture_state.current();
+                match (mode, current_capture) {
+                    // 鼠标进入了有效画面区域
+                    (InputMode::Seamless, Capture::Idle) => {
+                        self.capture_state.on_mouse_enter(mode);
                         sender.input(UpdateCaptureView);
                     }
+                    // 鼠标从有效画面区域离开
+                    (InputMode::Seamless, Capture::Seamless) => {
+                        self.capture_state.on_mouse_leave();
+                        sender.input(UpdateCaptureView);
+                    }
+                    // 其他情况（如 Confined 模式，或状态未改变）无需干预
+                    _ => {}
                 }
-
                 if self.capture_state.should_forward() {
                     self.input.move_mouse_to(x, y, &self.coord_system);
                 }
@@ -535,18 +542,17 @@ impl Component for VmDisplayModel {
                 };
                 self.hint_visible = should_capture;
                 if should_capture {
-                    if mode == Confined {
-                        self.capture_state.on_click(mode);
-                    }
+                    self.capture_state.on_click(mode);
                     confine.reset_hint_timer(sender.clone());
                     confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect);
-                    if let Some(pos) = vm_coords
-                        && let Some(mouse_ctrl) = &self.input.mouse
-                    {
-                        if let Err(e) = mouse_ctrl.try_set_abs_position(pos.0, pos.1) {
+                    if let Some((x, y)) = vm_coords {
+                        let Some(ctrl) = self.input.mouse_ctrl() else {
+                            return;
+                        };
+                        debug!("Mouse was confined, and latest position: {x},{y}");
+                        if let Err(e) = ctrl.try_set_abs_position(x, y) {
                             error!(error:? = e; "Failed to set absolute position");
                         }
-                        debug!("Mouse was confined, and latest position: {pos:?}");
                     }
                     info!("Pointer confined to region: {widget_rect:?}");
                 } else {
@@ -560,6 +566,8 @@ impl Component for VmDisplayModel {
             }
 
             Qemu(event) => {
+                // 注意：不要同步 QEMU 的 MouseSet 位置到 InputHandler！
+                // 相对鼠标模式必须只根据宿主机输入计算位移，否则会形成输入反馈循环导致疯狂跳跃
                 if let Ok(flags) = self.screen.handle_event(event) {
                     let (w, h) = self.screen.resolution();
                     self.coord_system.set_vm_resolution(w, h);
@@ -580,7 +588,7 @@ impl Component for VmDisplayModel {
             CanvasResize { logical_width, logical_height } => {
                 self.coord_system.set_widget_size(logical_width, logical_height);
                 if let Some(_native) = self.input_overlay.native() {
-                    self.coord_system.set_monitor_scale(self.input_overlay.scale_factor() as f32);
+                    self.coord_system.monitor_scale = self.input_overlay.scale_factor() as f32;
                 }
                 self.dirty_flags.cursor = true;
                 if self.scaling_mode == ScalingMode::ResizeGuest
@@ -609,14 +617,8 @@ impl Component for VmDisplayModel {
             }
 
             MouseButton { button, pressed } => {
-                let Some(mouse_ctrl) = self.input.mouse.clone() else {
-                    warn!("No mouse controller available");
-                    return;
-                };
-                let input_handler = self.input.clone();
-                relm4::spawn(async move {
-                    input_handler.press_mouse_button(button, pressed, mouse_ctrl).await;
-                });
+                // Sync call - try_send is non-blocking
+                self.input.press_mouse_button(button, pressed);
             }
 
             Scroll { dy } => {
@@ -625,10 +627,8 @@ impl Component for VmDisplayModel {
                 }
                 let steps = self.input.cache_mouse_scroll(dy);
                 if steps != 0 {
-                    let input_handler = self.input.clone();
-                    relm4::spawn(async move {
-                        input_handler.scroll_mouse(steps).await;
-                    });
+                    // Sync call - try_send is non-blocking
+                    self.input.scroll_mouse(steps);
                 }
             }
 
@@ -636,14 +636,18 @@ impl Component for VmDisplayModel {
                 if !self.capture_state.should_forward() {
                     return;
                 }
-                let input_handler = self.input.clone();
-                relm4::spawn(async move {
-                    input_handler.press_keyboard(keycode, pressed).await;
-                });
+                // Sync call - try_send is non-blocking
+                self.input.press_keyboard(keycode, pressed);
             }
 
             UpdateMonitorInfo { pixel_pitch_mm } => {
                 self.pixel_pitch_mm = pixel_pitch_mm;
+            }
+
+            MouseModeChanged { is_absolute } => {
+                let mode_str = if is_absolute { "absolute" } else { "relative" };
+                info!("Guest mouse mode changed: {}", mode_str);
+                self.input.is_absolute = is_absolute;
             }
         }
     }
@@ -681,8 +685,9 @@ impl Component for VmDisplayModel {
                             - (cursor.hot_x as f32 * logical_scale);
                         let draw_y = logical_offset_y + (cursor.y as f32 * logical_scale)
                             - (cursor.hot_y as f32 * logical_scale);
-                        let transform_matrix =
-                            Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
+                        let transform_matrix = gsk::Transform::new()
+                            .translate(&graphene::Point::new(draw_x, draw_y))
+                            .scale(logical_scale, logical_scale);
                         widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
                     }
                 } else {

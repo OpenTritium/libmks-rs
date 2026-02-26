@@ -43,29 +43,29 @@ impl_controller!(
     MultiTouchController,
     Command,
     {
-        async fn send_event(kind: Kind, num_slot: u64, x: f64, y: f64) => SendEvent { kind, num_slot, x, y };
+        fn send_event(kind: Kind, num_slot: u64, x: f64, y: f64) => SendEvent { kind, num_slot, x, y };
     }
 );
 
 impl MultiTouchController {
     /// Convenience method for touch begin
-    pub async fn begin(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Begin, num_slot, x, y).await
+    pub fn begin(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
+        self.send_event(Kind::Begin, num_slot, x, y)
     }
 
     /// Convenience method for touch update
-    pub async fn update(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Update, num_slot, x, y).await
+    pub fn update(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
+        self.send_event(Kind::Update, num_slot, x, y)
     }
 
     /// Convenience method for touch end
-    pub async fn end(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::End, num_slot, x, y).await
+    pub fn end(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
+        self.send_event(Kind::End, num_slot, x, y)
     }
 
     /// Convenience method for touch cancel
-    pub async fn cancel(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Cancel, num_slot, x, y).await
+    pub fn cancel(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
+        self.send_event(Kind::Cancel, num_slot, x, y)
     }
 }
 
@@ -202,7 +202,7 @@ mod tests {
 
         // 测试 begin
         let notified = notify.notified();
-        session.tx.begin(0, 100.0, 200.0).await.expect("Failed to send begin");
+        session.tx.begin(0, 100.0, 200.0).expect("Failed to send begin");
         notified.await;
         {
             let s = state.lock().unwrap();
@@ -211,7 +211,7 @@ mod tests {
 
         // 测试 update
         let notified = notify.notified();
-        session.tx.update(0, 110.0, 210.0).await.expect("Failed to send update");
+        session.tx.update(0, 110.0, 210.0).expect("Failed to send update");
         notified.await;
         {
             let s = state.lock().unwrap();
@@ -220,7 +220,7 @@ mod tests {
 
         // 测试 end
         let notified = notify.notified();
-        session.tx.end(0, 110.0, 210.0).await.expect("Failed to send end");
+        session.tx.end(0, 110.0, 210.0).expect("Failed to send end");
         notified.await;
         {
             let s = state.lock().unwrap();
@@ -241,7 +241,7 @@ mod tests {
 
         // 测试 cancel
         let notified = notify.notified();
-        session.tx.cancel(1, 50.0, 75.0).await.expect("Failed to send cancel");
+        session.tx.cancel(1, 50.0, 75.0).expect("Failed to send cancel");
         notified.await;
         {
             let s = state.lock().unwrap();
@@ -262,11 +262,11 @@ mod tests {
 
         // 同时触摸两个点
         let notified = notify.notified();
-        session.tx.begin(0, 100.0, 100.0).await.expect("Failed to send slot 0 begin");
+        session.tx.begin(0, 100.0, 100.0).expect("Failed to send slot 0 begin");
         notified.await;
 
         let notified = notify.notified();
-        session.tx.begin(1, 300.0, 300.0).await.expect("Failed to send slot 1 begin");
+        session.tx.begin(1, 300.0, 300.0).expect("Failed to send slot 1 begin");
         notified.await;
 
         {
@@ -277,7 +277,7 @@ mod tests {
 
         // 更新 slot 0
         let notified = notify.notified();
-        session.tx.update(0, 110.0, 110.0).await.expect("Failed to send slot 0 update");
+        session.tx.update(0, 110.0, 110.0).expect("Failed to send slot 0 update");
         notified.await;
 
         {

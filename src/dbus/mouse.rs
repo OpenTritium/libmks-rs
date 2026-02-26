@@ -84,9 +84,9 @@ pub enum Event {
 pub struct MouseController(pub AsyncSender<Command>);
 
 impl_controller!(MouseController, Command, {
-    pub async fn press(button: Button) => Press(button);
-    pub async fn release(button: Button) => Release(button);
-    pub async fn rel_motion(dx: i32, dy: i32) => RelMotion { dx, dy };
+    pub fn press(button: Button) => Press(button);
+    pub fn release(button: Button) => Release(button);
+    pub fn rel_motion(dx: i32, dy: i32) => RelMotion { dx, dy };
 });
 
 impl MouseController {
@@ -325,19 +325,19 @@ mod tests {
 
         // 测试左键按下
         let notified = notify.notified();
-        session.tx.press(Button::Left).await.expect("Failed to send press");
+        session.tx.press(Button::Left).expect("Failed to send press");
         notified.await;
         assert_eq!(state.lock().unwrap().last_press, Some(0), "Button::Left should serialize to 0");
 
         // 测试左键释放
         let notified = notify.notified();
-        session.tx.release(Button::Left).await.expect("Failed to send release");
+        session.tx.release(Button::Left).expect("Failed to send release");
         notified.await;
         assert_eq!(state.lock().unwrap().last_release, Some(0));
 
         // 测试右键
         let notified = notify.notified();
-        session.tx.press(Button::Right).await.expect("Failed to send press");
+        session.tx.press(Button::Right).expect("Failed to send press");
         notified.await;
         assert_eq!(state.lock().unwrap().last_press, Some(2), "Button::Right should serialize to 2");
     }
@@ -369,7 +369,7 @@ mod tests {
         let _ = session.rx.recv().await;
 
         let notified = notify.notified();
-        session.tx.rel_motion(10, -5).await.expect("Failed to send motion");
+        session.tx.rel_motion(10, -5).expect("Failed to send motion");
         notified.await;
         assert_eq!(state.lock().unwrap().last_rel_motion, Some((10, -5)));
     }
@@ -383,19 +383,19 @@ mod tests {
 
         let _ = session.rx.recv().await;
 
-        session.tx.rel_motion(10, 0).await.unwrap();
-        session.tx.rel_motion(10, 0).await.unwrap();
-        session.tx.rel_motion(10, 0).await.unwrap();
+        session.tx.rel_motion(10, 0).unwrap();
+        session.tx.rel_motion(10, 0).unwrap();
+        session.tx.rel_motion(10, 0).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let notified = notify.notified();
-        session.tx.press(Button::Left).await.unwrap();
+        session.tx.press(Button::Left).unwrap();
         notified.await;
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let notified = notify.notified();
-        session.tx.rel_motion(0, 50).await.unwrap();
+        session.tx.rel_motion(0, 50).unwrap();
         notified.await;
 
         let s = state.lock().unwrap();

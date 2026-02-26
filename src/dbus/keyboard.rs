@@ -36,8 +36,8 @@ pub struct Event(pub LockState);
 pub struct KeyboardController(pub AsyncSender<Command>);
 
 impl_controller!(KeyboardController, Command, {
-    pub async fn press(keycode: Qnum) => Press(keycode);
-    pub async fn release(keycode: Qnum) => Release(keycode);
+    pub fn press(keycode: Qnum) => Press(keycode);
+    pub fn release(keycode: Qnum) => Release(keycode);
 });
 
 bitflags! {
@@ -201,13 +201,13 @@ mod tests {
 
         // 测试按键
         let notified = notify.notified();
-        session.tx.press(Qnum::from(0x1e)).await.unwrap();
+        session.tx.press(Qnum::from(0x1e)).unwrap();
         notified.await;
         assert_eq!(state.lock().unwrap().last_press, Some(0x1e));
 
         // 测试释放
         let notified = notify.notified();
-        session.tx.release(Qnum::from(0x1e)).await.unwrap();
+        session.tx.release(Qnum::from(0x1e)).unwrap();
         notified.await;
         assert_eq!(state.lock().unwrap().last_release, Some(0x1e));
     }

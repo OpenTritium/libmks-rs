@@ -28,10 +28,14 @@ where
 
 #[macro_use]
 pub mod macros {
-    /// Generates async methods for controller that send commands to channel.
+    /// Generates sync methods for controller that send commands to channel.
     ///
-    /// Generates `impl $controller { async fn $method(&self, ...) }` methods
-    /// that send `$cmd_type::$variant` to the internal channel.
+    /// Generates `impl $controller { fn $method(&self, ...) }` methods
+    /// that use non-blocking `try_send()` to send `$cmd_type::$variant` to the internal channel.
+    ///
+    /// This is designed for UI thread usage where blocking would cause freezes.
+    /// Uses try_send() - if the channel is full, the event is dropped (which is
+    /// acceptable for high-frequency input events like mouse moves).
     ///
     /// # Arguments
     /// * `$controller` - Controller struct name
@@ -42,14 +46,15 @@ pub mod macros {
         ($controller:ident, $cmd_type:ident, {
             $(
                 $(#[$meta:meta])*
-                $vis:vis async fn $method:ident($($arg:ident : $type:ty),* $(,)?) => $variant:ident $constructor:tt;
+                $vis:vis fn $method:ident($($arg:ident : $type:ty),* $(,)?) => $variant:ident $constructor:tt;
             )*
         }) => {
             impl $controller {
                 $(
                     $(#[$meta])*
-                    $vis async fn $method(&self, $($arg : $type),*) -> $crate::MksResult {
-                        self.0.send($cmd_type::$variant $constructor).await?;
+                    $vis fn $method(&self, $($arg : $type),*) -> $crate::MksResult {
+                        // Use try_send for non-blocking sync calls from UI thread
+                        self.0.try_send($cmd_type::$variant $constructor)?;
                         Ok(())
                     }
                 )*

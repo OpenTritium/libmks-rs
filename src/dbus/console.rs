@@ -84,9 +84,9 @@ pub enum Event {
 pub struct ConsoleController(pub AsyncSender<Command>);
 
 impl_controller!(ConsoleController, Command, {
-    pub async fn set_ui_info(width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32)
+    pub fn set_ui_info(width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32)
         => SetUiInfo { width_mm, height_mm, xoff, yoff, width, height };
-    pub async fn register_listener(fd: OwnedFd)
+    pub fn register_listener(fd: OwnedFd)
         => RegisterListener(fd);
 });
 

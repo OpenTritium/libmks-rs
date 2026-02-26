@@ -43,14 +43,18 @@ use libmks_rs::{
         vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
     },
 };
-use log::{error, info};
+use log::{error, info, warn};
 use relm4::{Controller, gtk::prelude::*, prelude::*};
 use std::path::PathBuf;
 
 /// Must hold these connections for the lifetime of the application
 struct AppResources {
-    conn: zbus::Connection,
-    listener_conn: zbus::Connection,
+    /// D-Bus connection to QEMU (kept alive to maintain the connection)
+    _conn: zbus::Connection,
+    /// Listener D-Bus connection (kept alive to receive display events)
+    _listener_conn: zbus::Connection,
+    /// Console session (kept alive to keep background tasks running)
+    _console_session: ConsoleSession,
 }
 
 struct AppModel {
@@ -64,8 +68,8 @@ enum AppMsg {
     Connected {
         resources: AppResources,
         console_ctrl: ConsoleController,
-        mouse_ctrl: MouseController,
-        kbd_ctrl: KeyboardController,
+        mouse: Option<(MouseController, libmks_rs::dbus::mouse::MouseSession)>,
+        keyboard: Option<(KeyboardController, libmks_rs::dbus::keyboard::KeyboardSession)>,
         event_rx: kanal::AsyncReceiver<QemuEvent>,
     },
     ConnectFailed(String),
@@ -99,12 +103,6 @@ impl SimpleComponent for AppModel {
     }
 
     fn init((socket_path, mode): (PathBuf, ListenerMode), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        // Create a multi-threaded runtime
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-
         // Create loading spinner widget
         let spinner = gtk::Spinner::builder()
             .spinning(true)
@@ -132,30 +130,30 @@ impl SimpleComponent for AppModel {
         let main_container = gtk::Overlay::new();
         main_container.set_child(Some(&loading_box));
 
-        // Spawn background connection task in a separate thread to keep runtime alive
+        // Spawn background connection task using the global Tokio runtime
+        // This works because #[tokio::main] creates a persistent multi-threaded runtime
         let sender_clone = sender.clone();
-        std::thread::spawn(move || {
-            rt.block_on(async move {
-                info!("[BACKGROUND] Starting connection task...");
-                match connect_to_qemu(socket_path, mode).await {
-                    Ok((resources, console_ctrl, mouse_ctrl, kbd_ctrl, event_rx)) => {
-                        info!("[BACKGROUND] Connection successful, sending message to UI...");
-                        sender_clone.input(AppMsg::Connected {
-                            resources,
-                            console_ctrl,
-                            mouse_ctrl,
-                            kbd_ctrl,
-                            event_rx,
-                        });
-                        // Keep the async runtime alive forever
-                        futures_util::future::pending::<()>().await;
-                    }
-                    Err(e) => {
-                        error!("[BACKGROUND] Connection failed: {}", e);
-                        sender_clone.input(AppMsg::ConnectFailed(e.to_string()));
-                    }
+        tokio::spawn(async move {
+            info!("[BACKGROUND] Starting connection task...");
+            match connect_to_qemu(socket_path, mode).await {
+                Ok((resources, console_ctrl, mouse, keyboard, event_rx)) => {
+                    info!("[BACKGROUND] Connection successful, sending message to UI...");
+                    // Note: resources now contains console_session to keep background tasks alive
+                    sender_clone.input(AppMsg::Connected {
+                        resources,
+                        console_ctrl,
+                        mouse,
+                        keyboard,
+                        event_rx,
+                    });
+                    // Keep the async runtime alive forever
+                    futures_util::future::pending::<()>().await;
                 }
-            });
+                Err(e) => {
+                    error!("[BACKGROUND] Connection failed: {}", e);
+                    sender_clone.input(AppMsg::ConnectFailed(e.to_string()));
+                }
+            }
         });
 
         // Initial model with loading state
@@ -172,19 +170,22 @@ impl SimpleComponent for AppModel {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::Ignore => {}
-            AppMsg::Connected { resources, console_ctrl, mouse_ctrl, kbd_ctrl, event_rx } => {
+            AppMsg::Connected { resources, console_ctrl, mut mouse, keyboard, event_rx } => {
                 info!("[UPDATE] Connected message received, setting up display...");
 
                 // 1. Store resources to keep D-Bus connections alive
                 self.resources = Some(resources);
 
-                // 2. Create input handler
+                // 2. Extract MouseSession's event receiver for listening to IsAbsolute events
+                let mouse_rx = mouse.as_mut().map(|(_, session)| session.rx.clone());
+
+                // 3. Create input handler (sessions are kept alive by the AppMsg tuple)
                 let input_handler = InputHandler::builder()
-                    .mouse(mouse_ctrl)
-                    .keyboard(kbd_ctrl)
+                    .mouse(mouse)
+                    .keyboard(keyboard)
                     .build();
 
-                // 3. Launch VmDisplayModel
+                // 4. Launch VmDisplayModel
                 let display_controller = VmDisplayModel::builder()
                     .launch(VmDisplayInit {
                         rx: event_rx,
@@ -194,11 +195,30 @@ impl SimpleComponent for AppModel {
                     })
                     .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
-                // 4. Get the widget and replace loading with VM display
+                // 5. Listen to D-Bus mouse events and forward to UI
+                if let Some(rx) = mouse_rx {
+                    use libmks_rs::dbus::mouse::Event;
+                    use libmks_rs::display::vm_display::Message as VmDisplayMsg;
+
+                    let display_sender = display_controller.sender().clone();
+                    tokio::spawn(async move {
+                        while let Ok(event) = rx.recv().await {
+                            match event {
+                                Event::IsAbsolute(is_abs) => {
+                                    if display_sender.send(VmDisplayMsg::MouseModeChanged { is_absolute: is_abs }).is_err() {
+                                        warn!("Failed to forward MouseModeChanged to VmDisplay");
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // 6. Get the widget and replace loading with VM display
                 let display_widget = display_controller.widget();
                 self.main_container.set_child(Some(display_widget));
 
-                // 5. Store controller to prevent it from being dropped
+                // 7. Store controller to prevent it from being dropped
                 self.display = Some(display_controller);
             }
             AppMsg::ConnectFailed(error_msg) => {
@@ -216,18 +236,15 @@ impl SimpleComponent for AppModel {
 /// - Scanout: Core interface only, QEMU sends framebuffer via D-Bus
 /// - ScanoutDMABUF: Core + single-plane DMA-BUF (always enabled in core)
 /// - ScanoutDMABUF2: Core + single-plane + multi-plane DMA-BUF
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListenerMode {
     /// Basic scanout mode - QEMU sends framebuffer via D-Bus (may still use single-plane DMABUF)
+    #[default]
     Scanout,
     /// Same as Scanout (single-plane DMABUF is always in core interface)
     ScanoutDMABUF,
     /// Full DMABUF support - multi-plane DMA-BUF enabled
     ScanoutDMABUF2,
-}
-
-impl Default for ListenerMode {
-    fn default() -> Self { Self::Scanout }
 }
 
 impl From<&str> for ListenerMode {
@@ -249,8 +266,8 @@ impl From<&str> for ListenerMode {
 /// - console_ctrl: Console controller for sending commands
 /// - resources: D-Bus connections that must be kept alive
 /// - console_ctrl: Console controller for sending commands
-/// - mouse_ctrl: Mouse controller
-/// - keyboard_ctrl: Keyboard controller
+/// - mouse: Option<(MouseController, MouseSession)>
+/// - keyboard: Option<(KeyboardController, KeyboardSession)>
 /// - event_rx: Receiver for display events (to pass to VmDisplayModel)
 async fn connect_to_qemu(
     socket_path: std::path::PathBuf,
@@ -258,8 +275,8 @@ async fn connect_to_qemu(
 ) -> anyhow::Result<(
     AppResources,
     ConsoleController,
-    MouseController,
-    KeyboardController,
+    Option<(MouseController, libmks_rs::dbus::mouse::MouseSession)>,
+    Option<(KeyboardController, libmks_rs::dbus::keyboard::KeyboardSession)>,
     kanal::AsyncReceiver<QemuEvent>,
 )> {
     info!("Connecting to QEMU at {:?}", socket_path);
@@ -307,13 +324,10 @@ async fn connect_to_qemu(
     // Get console IDs from VM
     let mut console_ids = None;
     while let Ok(event) = vm_listener.rx.recv().await {
-        match event {
-            vm::Event::ConsoleIds(ids) => {
-                info!("VM has {} consoles: {:?}", ids.len(), ids);
-                console_ids = Some(ids);
-                break;
-            }
-            _ => {}
+        if let vm::Event::ConsoleIds(ids) = event {
+            info!("VM has {} consoles: {:?}", ids.len(), ids);
+            console_ids = Some(ids);
+            break;
         }
     }
 
@@ -382,49 +396,47 @@ async fn connect_to_qemu(
 
     // Create keyboard session if available
     info!("Creating keyboard session, has_keyboard: {}", has_keyboard);
-    let kbd_ctrl = if has_keyboard {
+    let keyboard = if has_keyboard {
         let kbd_session = libmks_rs::dbus::keyboard::KeyboardSession::connect(&conn, &kbd_path).await?;
-        kbd_session.tx.clone()
+        Some((kbd_session.tx.clone(), kbd_session))
     } else {
-        let (tx, _rx) = kanal::unbounded_async();
-        KeyboardController::from(tx)
+        None
     };
     info!("Keyboard session created");
 
     // Create mouse session if available
     info!("Creating mouse session, has_mouse: {}", has_mouse);
-    let mouse_ctrl = if has_mouse {
+    let mouse = if has_mouse {
         let mouse_session = libmks_rs::dbus::mouse::MouseSession::connect(&conn, &mouse_path).await?;
-        mouse_session.tx.clone()
+        Some((mouse_session.tx.clone(), mouse_session))
     } else {
-        let (tx, _rx) = kanal::unbounded_async();
-        MouseController::from(tx)
+        None
     };
     info!("Mouse session created");
 
     // ================================================================
-    // FIX: 使用正确的时序 - 先传 FD 给 QEMU，再建立 D-Bus 连接
-    // 关键：.serve_at() 必须在 .build() 之前调用！
-    // 参考: https://gitlab.com/marcandre.lureau/qemu-display
+    // FIX: Use correct timing - send FD to QEMU first, then establish D-Bus connection
+    // Key: .serve_at() must be called before .build()!
+    // Reference: https://gitlab.com/marcandre.lureau/qemu-display
     // ================================================================
 
     info!("Creating socketpair for listener...");
     let (socket_server, socket_client) = std::os::unix::net::UnixStream::pair()?;
     info!("Socketpair created");
 
-    // 先把 client_fd 传给 QEMU！
-    // 这是关键：QEMU 需要先收到 fd 才能响应 D-Bus 握手
+    // Send client_fd to QEMU first!
+    // This is key: QEMU needs to receive the fd before it can respond to D-Bus handshake
     use std::os::fd::OwnedFd;
     let std_fd: OwnedFd = socket_client.into();
     let fd: zvariant::OwnedFd = std_fd.into();
-    console_ctrl.register_listener(fd).await?;
+    console_ctrl.register_listener(fd)?;
     info!("Listener registered with console (fd sent to QEMU)");
 
-    // 现在建立 D-Bus 连接
-    // 关键：.serve_at() 必须在 .build() 之前调用，这样对象在连接建立时就已经注册了
+    // Now establish D-Bus connection
+    // Key: .serve_at() must be called before .build() so the object is registered when connection is built
     info!("Creating listener D-Bus connection...");
 
-    // 创建 listener handler
+    // Create listener handler
     let enable_dmabuf2 = _mode == ListenerMode::ScanoutDMABUF2;
     let listener_opts = listener::Options::builder()
         .with_dmabuf2(enable_dmabuf2)
@@ -433,21 +445,16 @@ async fn connect_to_qemu(
     info!("Listener mode: {:?}, DMABUF2: {}", _mode, enable_dmabuf2);
 
     // Use kanal AsyncSender directly
-    // 使用 .serve_at() 在 .build() 之前注册对象
+    // Use .serve_at() to register object before .build()
     let builder = zbus::connection::Builder::unix_stream(socket_server)
         .p2p()
         .serve_at("/org/qemu/Display1/Listener", listener::Listener::from_opts(listener_opts.clone(), event_tx.clone()))?;
 
-    // 如果启用了 DMABUF2，也需要注册
-    if enable_dmabuf2 {
-        // 需要单独处理...
-    }
-
-    // 最后才 build
+    // Only build at the end
     let listener_conn = builder.build().await?;
     info!("Listener D-Bus connection established");
 
-    // 注册额外的接口
+    // Register additional interfaces
     if listener_opts.with_dmabuf2 {
         let dmabuf2_handler = listener::Dmabuf2Handler(event_tx.clone());
         listener_conn.object_server().at("/org/qemu/Display1/Listener", dmabuf2_handler).await?;
@@ -464,19 +471,22 @@ async fn connect_to_qemu(
         0, 0, 0, 0,  // width_mm, height_mm, xoff, yoff (use defaults)
         console_width,
         console_height,
-    ).await?;
+    )?;
     info!("Set UI info: {}x{}", console_width, console_height);
 
     // Create resources package to keep connections alive
+    // Note: console_session must be kept alive to maintain background tasks (watch_task, cmd_handler)
     let resources = AppResources {
-        conn,
-        listener_conn,
+        _conn: conn,
+        _listener_conn: listener_conn,
+        _console_session: console_session,
     };
 
-    Ok((resources, console_ctrl, mouse_ctrl, kbd_ctrl, event_rx))
+    Ok((resources, console_ctrl, mouse, keyboard, event_rx))
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
@@ -488,13 +498,13 @@ fn main() {
             (path, mode)
         }
         _ => {
-            eprintln!("用法: {} <qemu-dbus-socket-path> [mode]", args[0]);
-            eprintln!("");
-            eprintln!("参数:");
-            eprintln!("  qemu-dbus-socket-path  QEMU D-Bus socket 路径");
-            eprintln!("  mode                  监听模式: scanout | scanoutdmabuf | scanoutdmabuf2 (默认: scanout)");
-            eprintln!("");
-            eprintln!("示例:");
+            eprintln!("Usage: {} <qemu-dbus-socket-path> [mode]", args[0]);
+            eprintln!();
+            eprintln!("Arguments:");
+            eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
+            eprintln!("  mode                   Listener mode: scanout | scanoutdmabuf | scanoutdmabuf2 (default: scanout)");
+            eprintln!();
+            eprintln!("Examples:");
             eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", args[0]);
             eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", args[0]);
             std::process::exit(1);

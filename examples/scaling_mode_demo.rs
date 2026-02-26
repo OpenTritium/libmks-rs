@@ -11,7 +11,10 @@ use libmks_rs::{
         listener::Event,
         mouse::{self, MouseController},
     },
-    display::vm_display::{GrabShortcut, ScalingMode, VmDisplayInit, VmDisplayModel},
+    display::{
+        input_handler::InputHandler,
+        vm_display::{GrabShortcut, ScalingMode, VmDisplayInit, VmDisplayModel},
+    },
 };
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};
@@ -66,10 +69,10 @@ impl SimpleComponent for AppModel {
     fn init(_: (), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let (tx, rx) = kanal::unbounded_async::<Event>();
 
-        let (console_ctrl, mouse_ctrl, kbd_ctrl, mouse_rx, console_rx, kbd_rx) = create_mock_controllers();
+        let (console_ctrl, _mouse_ctrl, _kbd_ctrl, mouse_rx, console_rx, kbd_rx) = create_mock_controllers();
 
-        let input_handler =
-            libmks_rs::display::input_handler::InputHandler::builder().mouse(mouse_ctrl).keyboard(kbd_ctrl).build();
+        // Mock mode: no real sessions needed, pass None for mouse/keyboard
+        let input_handler = InputHandler::builder().build();
 
         let display = VmDisplayModel::builder()
             .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })

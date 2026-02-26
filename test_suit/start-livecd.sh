@@ -53,11 +53,12 @@ case $DISPLAY_MODE in
             -smp $CPU_CORES \
             -cdrom $ISO_PATH \
             -boot d \
+            -enable-kvm \
             -display gtk \
             -spice port=$SPICE_PORT,disable-ticketing \
             -device virtio-keyboard-pci \
             -device virtio-mouse-pci \
-            -device virtio-vga \
+            -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
             -chardev stdio,id=char0,mux=on \
             -mon chardev=char0,mode=readline \
             -serial chardev:char0 \
@@ -78,11 +79,12 @@ case $DISPLAY_MODE in
             -smp $CPU_CORES \
             -cdrom $ISO_PATH \
             -boot d \
-            -display dbus \
+            -enable-kvm \
+            -display dbus,p2p=on \
             -spice port=$SPICE_PORT,disable-ticketing \
             -device virtio-keyboard-pci \
             -device virtio-mouse-pci \
-            -device virtio-vga \
+            -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
             -chardev stdio,id=char0,mux=on \
             -mon chardev=char0,mode=readline \
             -serial chardev:char0 \
@@ -103,11 +105,12 @@ case $DISPLAY_MODE in
             -smp $CPU_CORES \
             -cdrom $ISO_PATH \
             -boot d \
-            -display dbus \
+            -enable-kvm \
+            -display dbus,p2p=on \
             -spice port=$SPICE_PORT,disable-ticketing \
             -device virtio-keyboard-pci \
             -device virtio-mouse-pci \
-            -device virtio-vga \
+            -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
             -chardev stdio,id=char0,mux=on \
             -mon chardev=char0,mode=readline \
             -serial chardev:char0 \
