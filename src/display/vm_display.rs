@@ -22,7 +22,7 @@ use relm4::{
         Align, ContentFit, CssProvider, DrawingArea, EventController, EventControllerKey, EventControllerMotion,
         EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload,
         GraphicsOffloadEnabled, Label, Overlay, Picture, STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
-        gdk::Display, graphene, gsk, prelude::*, style_context_add_provider_for_display,
+        gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
     },
 };
 use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
@@ -681,13 +681,14 @@ impl Component for VmDisplayModel {
                     if let Some(transform) = self.coord_system.get_cached_viewport() {
                         let logical_scale = transform.scale;
                         let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
-                        let draw_x = logical_offset_x + (cursor.x as f32 * logical_scale)
-                            - (cursor.hot_x as f32 * logical_scale);
-                        let draw_y = logical_offset_y + (cursor.y as f32 * logical_scale)
-                            - (cursor.hot_y as f32 * logical_scale);
-                        let transform_matrix = gsk::Transform::new()
-                            .translate(&graphene::Point::new(draw_x, draw_y))
-                            .scale(logical_scale, logical_scale);
+                        let anchor_x = logical_offset_x + cursor.x as f32 * logical_scale;
+                        let anchor_y = logical_offset_y + cursor.y as f32 * logical_scale;
+                        let offset_x = cursor.hot_x as f32 * logical_scale;
+                        let offset_y = cursor.hot_y as f32 * logical_scale;
+                        let draw_x = (anchor_x - offset_x).round();
+                        let draw_y = (anchor_y - offset_y).round();
+                        let transform_matrix =
+                            Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
                         widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
                     }
                 } else {
