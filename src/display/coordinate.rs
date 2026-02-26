@@ -12,7 +12,7 @@ pub struct Viewport {
 pub struct Coordinate {
     vm_resolution: (u32, u32),
     widget_size_logical: (f32, f32),
-    monitor_scale: f32,
+    pub monitor_scale: f32,
     cached_viewport: Cell<Option<Viewport>>,
     transform_dirty: Cell<bool>,
 }
@@ -35,13 +35,13 @@ impl Coordinate {
     }
 
     #[inline]
+    pub fn vm_resolution(&self) -> (u32, u32) { self.vm_resolution }
+
+    #[inline]
     pub fn set_widget_size(&mut self, w: f32, h: f32) {
         self.widget_size_logical = (w, h);
         self.transform_dirty.set(true);
     }
-
-    #[inline]
-    pub fn set_monitor_scale(&mut self, scale: f32) { self.monitor_scale = scale; }
 
     #[inline]
     pub fn target_guest_resolution(&self) -> Option<(NonZeroU32, NonZeroU32)> {
@@ -111,9 +111,9 @@ impl Coordinate {
         }
         let viewport = self.get_cached_viewport()?;
         let input = Point::new(logical_x, logical_y);
-        let guest_x = ((input.x() - viewport.offset_x) / viewport.scale).clamp(0., (vm_w - 1) as f32);
-        let guest_y = ((input.y() - viewport.offset_y) / viewport.scale).clamp(0., (vm_h - 1) as f32);
-        Some((guest_x.round() as u32, guest_y.round() as u32))
+        let guest_x = ((input.x() - viewport.offset_x) / viewport.scale).floor().clamp(0., (vm_w - 1) as f32);
+        let guest_y = ((input.y() - viewport.offset_y) / viewport.scale).floor().clamp(0., (vm_h - 1) as f32);
+        Some((guest_x as u32, guest_y as u32))
     }
 
     #[inline]
