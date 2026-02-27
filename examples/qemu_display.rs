@@ -24,10 +24,8 @@
 //!
 //! 1. Create P2P D-Bus connection to QEMU via Unix socket
 //! 2. Query VM interface at /org/qemu/Display1/VM for console IDs
-//! 3. For each console:
-//!    a. Create Listener server (org.qemu.Display1.Listener)
-//!    b. Register listener with console (sends file descriptor)
-//!    c. Set UI info (display dimensions)
+//! 3. For each console: a. Create Listener server (org.qemu.Display1.Listener) b. Register listener with console (sends
+//!    file descriptor) c. Set UI info (display dimensions)
 //! 4. Forward keyboard/mouse events from InputHandler to QEMU
 
 use libmks_rs::{
@@ -40,7 +38,7 @@ use libmks_rs::{
     },
     display::{
         input_handler::InputHandler,
-        vm_display::{GrabShortcut, VmDisplayInit, VmDisplayModel},
+        vm_display::{GrabShortcut, InputMode, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::{error, info, warn};
@@ -61,10 +59,18 @@ struct AppModel {
     display: Option<Controller<VmDisplayModel>>,
     resources: Option<AppResources>,
     main_container: gtk::Overlay,
+    scaling_mode: ScalingMode,
+    input_mode: InputMode,
+    guest_mouse_is_absolute: Option<bool>,
 }
 
 enum AppMsg {
     Ignore,
+    SetScalingMode(ScalingMode),
+    SetInputMode(InputMode),
+    GuestMouseModeChanged {
+        is_absolute: bool,
+    },
     Connected {
         resources: AppResources,
         console_ctrl: ConsoleController,
@@ -79,6 +85,11 @@ impl std::fmt::Debug for AppMsg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ignore => write!(f, "Ignore"),
+            Self::SetScalingMode(mode) => f.debug_tuple("SetScalingMode").field(mode).finish(),
+            Self::SetInputMode(mode) => f.debug_tuple("SetInputMode").field(mode).finish(),
+            Self::GuestMouseModeChanged { is_absolute } => {
+                f.debug_struct("GuestMouseModeChanged").field("is_absolute", is_absolute).finish()
+            }
             Self::Connected { .. } => write!(f, "Connected {{ ... }}"),
             Self::ConnectFailed(arg0) => f.debug_tuple("ConnectFailed").field(arg0).finish(),
         }
@@ -97,12 +108,77 @@ impl SimpleComponent for AppModel {
             set_default_width: 1024,
             set_default_height: 768,
 
-            #[local_ref]
-            main_container -> gtk::Overlay {}
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 10,
+                    set_margin_all: 10,
+
+                    gtk::Label {
+                        set_label: "Scaling:",
+                    },
+                    #[name = "scale_dropdown"]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&[
+                            "Resize Guest (Auto)",
+                            "Fixed Guest (Scaled)",
+                        ])),
+                        #[watch]
+                        set_selected: match model.scaling_mode {
+                            ScalingMode::ResizeGuest => 0,
+                            ScalingMode::FixedGuest => 1,
+                        },
+                    },
+
+                    gtk::Separator {
+                        set_orientation: gtk::Orientation::Vertical,
+                    },
+
+                    gtk::Label {
+                        set_label: "Input:",
+                    },
+                    #[name = "input_dropdown"]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&[
+                            "Seamless (Office/Tablet)",
+                            "Locked (Gaming/FPS)",
+                        ])),
+                        #[watch]
+                        set_selected: match model.input_mode {
+                            InputMode::Seamless => 0,
+                            InputMode::Confined => 1,
+                        },
+
+                        #[watch]
+                        set_sensitive: model.guest_mouse_is_absolute != Some(false),
+                    },
+
+                    gtk::Label {
+                        #[watch]
+                        set_label: if model.guest_mouse_is_absolute == Some(false) {
+                            "Hint: Guest is in relative mouse mode; input is forced to Locked."
+                        } else {
+                            "Hint: Locked mode requires click to capture, Ctrl+Alt+G to release."
+                        },
+                        set_opacity: 0.6,
+                        set_margin_start: 10,
+                    },
+                },
+
+                #[local_ref]
+                main_container -> gtk::Overlay {
+                    set_hexpand: true,
+                    set_vexpand: true,
+                }
+            }
         }
     }
 
-    fn init((socket_path, mode): (PathBuf, ListenerMode), root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+    fn init(
+        (socket_path, mode): (PathBuf, ListenerMode), root: Self::Root, sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
         // Create loading spinner widget
         let spinner = gtk::Spinner::builder()
             .spinning(true)
@@ -112,10 +188,7 @@ impl SimpleComponent for AppModel {
             .height_request(64)
             .build();
 
-        let label = gtk::Label::builder()
-            .label("Connecting to QEMU...")
-            .halign(gtk::Align::Center)
-            .build();
+        let label = gtk::Label::builder().label("Connecting to QEMU...").halign(gtk::Align::Center).build();
 
         let loading_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -139,13 +212,7 @@ impl SimpleComponent for AppModel {
                 Ok((resources, console_ctrl, mouse, keyboard, event_rx)) => {
                     info!("[BACKGROUND] Connection successful, sending message to UI...");
                     // Note: resources now contains console_session to keep background tasks alive
-                    sender_clone.input(AppMsg::Connected {
-                        resources,
-                        console_ctrl,
-                        mouse,
-                        keyboard,
-                        event_rx,
-                    });
+                    sender_clone.input(AppMsg::Connected { resources, console_ctrl, mouse, keyboard, event_rx });
                     // Keep the async runtime alive forever
                     futures_util::future::pending::<()>().await;
                 }
@@ -161,8 +228,31 @@ impl SimpleComponent for AppModel {
             display: None,
             resources: None,
             main_container: main_container.clone(),
+            scaling_mode: ScalingMode::ResizeGuest,
+            input_mode: InputMode::Seamless,
+            guest_mouse_is_absolute: None,
         };
         let widgets = view_output!();
+
+        let sender_clone = sender.clone();
+        widgets.scale_dropdown.connect_selected_item_notify(move |dropdown| {
+            let mode = match dropdown.selected() {
+                0 => ScalingMode::ResizeGuest,
+                1 => ScalingMode::FixedGuest,
+                _ => return,
+            };
+            sender_clone.input(AppMsg::SetScalingMode(mode));
+        });
+
+        let sender_clone = sender.clone();
+        widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
+            let mode = match dropdown.selected() {
+                0 => InputMode::Seamless,
+                1 => InputMode::Confined,
+                _ => return,
+            };
+            sender_clone.input(AppMsg::SetInputMode(mode));
+        });
 
         ComponentParts { model, widgets }
     }
@@ -170,6 +260,42 @@ impl SimpleComponent for AppModel {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::Ignore => {}
+            AppMsg::SetScalingMode(mode) => {
+                if self.scaling_mode == mode {
+                    return;
+                }
+                self.scaling_mode = mode;
+                if let Some(display) = &self.display {
+                    display.emit(VmDisplayMsg::SetScalingMode(mode));
+                }
+            }
+            AppMsg::SetInputMode(mode) => {
+                let effective_mode = if self.guest_mouse_is_absolute == Some(false) && mode == InputMode::Seamless {
+                    warn!("Guest mouse is relative; forcing InputMode::Confined");
+                    InputMode::Confined
+                } else {
+                    mode
+                };
+                if self.input_mode == effective_mode {
+                    return;
+                }
+                self.input_mode = effective_mode;
+                if let Some(display) = &self.display {
+                    display.emit(VmDisplayMsg::SetInputCaptureMode(effective_mode));
+                }
+            }
+            AppMsg::GuestMouseModeChanged { is_absolute } => {
+                self.guest_mouse_is_absolute = Some(is_absolute);
+                if !is_absolute && self.input_mode != InputMode::Confined {
+                    self.input_mode = InputMode::Confined;
+                    if let Some(display) = &self.display {
+                        display.emit(VmDisplayMsg::SetInputCaptureMode(InputMode::Confined));
+                    }
+                }
+                if let Some(display) = &self.display {
+                    display.emit(VmDisplayMsg::MouseModeChanged { is_absolute });
+                }
+            }
             AppMsg::Connected { resources, console_ctrl, mut mouse, keyboard, event_rx } => {
                 info!("[UPDATE] Connected message received, setting up display...");
 
@@ -180,10 +306,7 @@ impl SimpleComponent for AppModel {
                 let mouse_rx = mouse.as_mut().map(|(_, session)| session.rx.clone());
 
                 // 3. Create input handler (sessions are kept alive by the AppMsg tuple)
-                let input_handler = InputHandler::builder()
-                    .mouse(mouse)
-                    .keyboard(keyboard)
-                    .build();
+                let input_handler = InputHandler::builder().mouse(mouse).keyboard(keyboard).build();
 
                 // 4. Launch VmDisplayModel
                 let display_controller = VmDisplayModel::builder()
@@ -198,16 +321,13 @@ impl SimpleComponent for AppModel {
                 // 5. Listen to D-Bus mouse events and forward to UI
                 if let Some(rx) = mouse_rx {
                     use libmks_rs::dbus::mouse::Event;
-                    use libmks_rs::display::vm_display::Message as VmDisplayMsg;
 
-                    let display_sender = display_controller.sender().clone();
+                    let app_sender = sender.clone();
                     tokio::spawn(async move {
                         while let Ok(event) = rx.recv().await {
                             match event {
                                 Event::IsAbsolute(is_abs) => {
-                                    if display_sender.send(VmDisplayMsg::MouseModeChanged { is_absolute: is_abs }).is_err() {
-                                        warn!("Failed to forward MouseModeChanged to VmDisplay");
-                                    }
+                                    app_sender.input(AppMsg::GuestMouseModeChanged { is_absolute: is_abs });
                                 }
                             }
                         }
@@ -220,6 +340,13 @@ impl SimpleComponent for AppModel {
 
                 // 7. Store controller to prevent it from being dropped
                 self.display = Some(display_controller);
+                if let Some(display) = &self.display {
+                    display.emit(VmDisplayMsg::SetScalingMode(self.scaling_mode));
+                    display.emit(VmDisplayMsg::SetInputCaptureMode(self.input_mode));
+                    if let Some(is_absolute) = self.guest_mouse_is_absolute {
+                        display.emit(VmDisplayMsg::MouseModeChanged { is_absolute });
+                    }
+                }
             }
             AppMsg::ConnectFailed(error_msg) => {
                 error!("[UPDATE] Connection failed: {}", error_msg);
@@ -270,8 +397,7 @@ impl From<&str> for ListenerMode {
 /// - keyboard: Option<(KeyboardController, KeyboardSession)>
 /// - event_rx: Receiver for display events (to pass to VmDisplayModel)
 async fn connect_to_qemu(
-    socket_path: std::path::PathBuf,
-    _mode: ListenerMode,
+    socket_path: std::path::PathBuf, _mode: ListenerMode,
 ) -> anyhow::Result<(
     AppResources,
     ConsoleController,
@@ -307,10 +433,7 @@ async fn connect_to_qemu(
         } else {
             // Original behavior: treat as Unix socket path
             let socket = std::os::unix::net::UnixStream::connect(&socket_path)?;
-            zbus::connection::Builder::unix_stream(socket)
-                .p2p()
-                .build()
-                .await?
+            zbus::connection::Builder::unix_stream(socket).p2p().build().await?
         }
     };
 
@@ -331,7 +454,8 @@ async fn connect_to_qemu(
         }
     }
 
-    let console_id = *console_ids.ok_or_else(|| anyhow::anyhow!("No consoles available from QEMU"))?
+    let console_id = *console_ids
+        .ok_or_else(|| anyhow::anyhow!("No consoles available from QEMU"))?
         .first()
         .ok_or_else(|| anyhow::anyhow!("Empty console list from QEMU"))?;
     info!("Using console {}", console_id);
@@ -438,17 +562,15 @@ async fn connect_to_qemu(
 
     // Create listener handler
     let enable_dmabuf2 = _mode == ListenerMode::ScanoutDMABUF2;
-    let listener_opts = listener::Options::builder()
-        .with_dmabuf2(enable_dmabuf2)
-        .with_map(false)
-        .build();
+    let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(false).build();
     info!("Listener mode: {:?}, DMABUF2: {}", _mode, enable_dmabuf2);
 
     // Use kanal AsyncSender directly
     // Use .serve_at() to register object before .build()
-    let builder = zbus::connection::Builder::unix_stream(socket_server)
-        .p2p()
-        .serve_at("/org/qemu/Display1/Listener", listener::Listener::from_opts(listener_opts.clone(), event_tx.clone()))?;
+    let builder = zbus::connection::Builder::unix_stream(socket_server).p2p().serve_at(
+        "/org/qemu/Display1/Listener",
+        listener::Listener::from_opts(listener_opts.clone(), event_tx.clone()),
+    )?;
 
     // Only build at the end
     let listener_conn = builder.build().await?;
@@ -468,7 +590,10 @@ async fn connect_to_qemu(
 
     // Set UI info
     console_ctrl.set_ui_info(
-        0, 0, 0, 0,  // width_mm, height_mm, xoff, yoff (use defaults)
+        0,
+        0,
+        0,
+        0, // width_mm, height_mm, xoff, yoff (use defaults)
         console_width,
         console_height,
     )?;
@@ -476,11 +601,7 @@ async fn connect_to_qemu(
 
     // Create resources package to keep connections alive
     // Note: console_session must be kept alive to maintain background tasks (watch_task, cmd_handler)
-    let resources = AppResources {
-        _conn: conn,
-        _listener_conn: listener_conn,
-        _console_session: console_session,
-    };
+    let resources = AppResources { _conn: conn, _listener_conn: listener_conn, _console_session: console_session };
 
     Ok((resources, console_ctrl, mouse, keyboard, event_rx))
 }
@@ -502,7 +623,9 @@ async fn main() {
             eprintln!();
             eprintln!("Arguments:");
             eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
-            eprintln!("  mode                   Listener mode: scanout | scanoutdmabuf | scanoutdmabuf2 (default: scanout)");
+            eprintln!(
+                "  mode                   Listener mode: scanout | scanoutdmabuf | scanoutdmabuf2 (default: scanout)"
+            );
             eprintln!();
             eprintln!("Examples:");
             eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", args[0]);
@@ -512,9 +635,7 @@ async fn main() {
     };
 
     // Initialize logging
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::Builder::from_default_env().filter_level(log::LevelFilter::Info).init();
 
     info!("Starting QEMU D-Bus Display example, mode: {:?}", mode);
 

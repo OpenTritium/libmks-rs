@@ -25,12 +25,19 @@ use relm4::{
         gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
     },
 };
-use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
+use std::{borrow::Cow, cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
 use tokio::{task::AbortHandle, time::sleep};
 
 const INCH_TO_MM: f32 = 25.4;
 const DEFAULT_DPI: f32 = 96.;
 const DEFAULT_PIXEL_PITCH_MM: f32 = INCH_TO_MM / DEFAULT_DPI;
+const TOAST_DURATION_SECS: u64 = 3;
+const RELATIVE_SEAMLESS_UNSUPPORTED_TOAST: &str =
+    "Relative mouse mode does not support seamless capture. Switch to confined mode manually.";
+const CONFINED_CAPTURE_UNAVAILABLE_TOAST: &str =
+    "Confined capture is unavailable in the current environment. Falling back to seamless mode.";
+const RELATIVE_CONFINED_UNSUPPORTED_TOAST: &str =
+    "Relative capture requires Wayland relative-pointer protocol, which is unavailable in this environment.";
 
 /// 确保 css provider 只被初始化一次，因为它不是 sync 的所以我们没有使用 LazyCell
 #[inline]
@@ -67,7 +74,6 @@ pub struct ConfineState {
     pub wayland_confine: Rc<RefCell<WaylandConfine>>,
     pub poll_source: Option<SourceId>,
     pub is_captured: bool,
-    pub hint_timer: Option<AbortHandle>,
 }
 
 impl ConfineState {
@@ -84,28 +90,7 @@ impl ConfineState {
             ControlFlow::Continue
         });
         debug!("Wayland fd monitor attached to GLib main context");
-        Some(Self { wayland_confine: confine, poll_source: Some(poll_source), is_captured: false, hint_timer: None })
-    }
-
-    #[inline]
-    fn try_cancel_hint_timer(&mut self) -> bool {
-        if let Some(handle) = self.hint_timer.take() {
-            handle.abort();
-            return true;
-        }
-        false
-    }
-
-    #[inline]
-    fn reset_hint_timer(&mut self, sender: ComponentSender<VmDisplayModel>) {
-        self.try_cancel_hint_timer();
-        self.hint_timer = Some(
-            relm4::spawn(async move {
-                sleep(Duration::from_secs(3)).await;
-                sender.input(Message::HideCaptureHint);
-            })
-            .abort_handle(),
-        );
+        Some(Self { wayland_confine: confine, poll_source: Some(poll_source), is_captured: false })
     }
 }
 
@@ -115,7 +100,6 @@ impl Drop for ConfineState {
             source.remove();
         }
         self.wayland_confine.borrow_mut().unconfine();
-        self.try_cancel_hint_timer();
     }
 }
 
@@ -170,7 +154,7 @@ pub enum Message {
     Key { keyval: u32, keycode: u32, pressed: bool },
     UpdateMonitorInfo { pixel_pitch_mm: f32 },
     SetScalingMode(ScalingMode),
-    ToggleCapture(CaptureEvent),
+    SetCapture(CaptureEvent),
     HideCaptureHint,
     UpdateCaptureView, // 对于视图来说，它只知道收到这个事件以后隐藏宿主光标就行了
     CheckCaptureState,
@@ -188,10 +172,14 @@ pub struct VmDisplayModel {
     input_overlay: DrawingArea,
     pub confine_state: Option<ConfineState>,
     pub scaling_mode: ScalingMode,
+    grab_shortcut: GrabShortcut,
     hint_visible: bool,
+    hint_text: Cow<'static, str>,
+    hint_timer: Option<AbortHandle>,
     coord_system: Coordinate,
     input: InputHandler,
     capture_state: CaptureState,
+    requested_input_mode: InputMode,
 }
 
 pub struct VmDisplayWidgets {
@@ -243,6 +231,30 @@ impl VmDisplayModel {
             .abort_handle(),
         );
     }
+
+    #[inline]
+    fn cancel_hint_timer(&mut self) {
+        if let Some(handle) = self.hint_timer.take() {
+            handle.abort();
+        }
+    }
+
+    #[inline]
+    fn release_hint_text(shortcut: GrabShortcut) -> String { format!("Press {shortcut} to release mouse") }
+
+    fn show_toast(&mut self, text: impl Into<Cow<'static, str>>, sender: ComponentSender<Self>) {
+        self.hint_text = text.into();
+        self.hint_visible = true;
+        self.dirty_flags.cursor = true;
+        self.cancel_hint_timer();
+        self.hint_timer = Some(
+            relm4::spawn(async move {
+                sleep(Duration::from_secs(TOAST_DURATION_SECS)).await;
+                sender.input(Message::HideCaptureHint);
+            })
+            .abort_handle(),
+        );
+    }
 }
 
 impl Component for VmDisplayModel {
@@ -261,6 +273,8 @@ impl Component for VmDisplayModel {
     fn init(init: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         use Message::*;
         ensure_css_loaded();
+        let grab_shortcut = init.grab_shortcut;
+        let default_hint_text = Self::release_hint_text(grab_shortcut);
         let input_plane =
             DrawingArea::builder().focusable(true).focus_on_click(true).hexpand(true).vexpand(true).build();
         input_plane.set_content_width(0);
@@ -272,12 +286,16 @@ impl Component for VmDisplayModel {
             scaling_mode: ScalingMode::ResizeGuest,
             pixel_pitch_mm: DEFAULT_PIXEL_PITCH_MM,
             resize_timer: None,
+            grab_shortcut,
             hint_visible: false,
+            hint_text: Cow::Owned(default_hint_text.clone()),
+            hint_timer: None,
             input_overlay: input_plane.clone(),
             confine_state: None,
             coord_system: Coordinate::new(0, 0, 0., 0., 1.),
             input: init.input_handler,
             capture_state: CaptureState::new(),
+            requested_input_mode: InputMode::Seamless,
         };
         let view_stack = Overlay::builder().hexpand(true).vexpand(true).build();
         let vm_picture = Picture::builder()
@@ -352,7 +370,7 @@ impl Component for VmDisplayModel {
         let input_plane_click = input_plane.clone();
         click.connect_pressed(move |gesture, _, x, y| {
             input_plane_click.grab_focus();
-            sender_clone.input(Message::ToggleCapture(CaptureEvent::Capture { click_pos: Some((x as f32, y as f32)) }));
+            sender_clone.input(Message::SetCapture(CaptureEvent::Capture { click_pos: Some((x as f32, y as f32)) }));
             sender_clone.input(MouseButton { button: gesture.current_button(), pressed: true });
         });
         let sender_clone = sender.clone();
@@ -372,12 +390,11 @@ impl Component for VmDisplayModel {
         controllers.push(scroll.upcast());
 
         let key = EventControllerKey::new();
-        let grab_shortcut = init.grab_shortcut;
         let sender_for_release = sender.clone();
         let sender_for_key = sender.clone();
         key.connect_key_pressed(move |_, keyval, keycode, modifiers| {
             if modifiers.contains(grab_shortcut.mask) && keyval == grab_shortcut.key {
-                sender_for_release.input(Message::ToggleCapture(CaptureEvent::Release));
+                sender_for_release.input(Message::SetCapture(CaptureEvent::Release));
                 return Propagation::Stop;
             }
             let keyval_raw: u32 = keyval.into_glib();
@@ -393,7 +410,7 @@ impl Component for VmDisplayModel {
         controllers.push(key.upcast());
 
         let capture_hint = Label::builder()
-            .label(format!("Press {grab_shortcut} to release mouse"))
+            .label(&default_hint_text)
             .halign(Align::Center)
             .valign(Align::Start)
             .margin_top(20)
@@ -461,12 +478,24 @@ impl Component for VmDisplayModel {
         use Message::*;
         match msg {
             SetInputCaptureMode(mode) => {
+                self.requested_input_mode = mode;
+                if mode == InputMode::Seamless && !self.input.is_absolute {
+                    warn!("Ignoring seamless capture request: guest mouse is in relative mode");
+                    self.capture_state.reset();
+                    let _ = self.confine_state.take();
+                    self.cancel_hint_timer();
+                    self.hint_visible = false;
+                    self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());
+                    sender.input(UpdateCaptureView);
+                    return;
+                }
                 if self.input_mode() == mode {
                     warn!("Input mode already set to {mode:?}");
                     return;
                 }
                 self.capture_state.reset();
                 if self.confine_state.take().is_some() {
+                    self.cancel_hint_timer();
                     self.hint_visible = false;
                 } else {
                     let Some(ctrl) = self.input.mouse_ctrl() else {
@@ -475,6 +504,7 @@ impl Component for VmDisplayModel {
                     };
                     let Some(confine) = ConfineState::connect_to_wayland(ctrl.clone()) else {
                         warn!("Failed connect to wayland session, fallback to seamless");
+                        self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
                         return;
                     };
                     self.confine_state = Some(confine);
@@ -489,16 +519,27 @@ impl Component for VmDisplayModel {
 
             MouseMove { x, y } => {
                 let mode = self.input_mode();
+                if self.requested_input_mode == InputMode::Seamless
+                    && mode == InputMode::Seamless
+                    && !self.input.is_absolute
+                {
+                    let had_capture = self.capture_state.should_forward();
+                    self.capture_state.reset();
+                    if had_capture {
+                        sender.input(UpdateCaptureView);
+                    }
+                    return;
+                }
                 let current_capture = self.capture_state.current();
                 let point = Point::new(x, y);
                 let is_in_viewport = self.coord_system.is_in_viewport(&point);
                 match (mode, current_capture, is_in_viewport) {
-                    // 鼠标进入了有效画面区域
+                    // 鼠标刚刚进入虚拟机画面时
                     (InputMode::Seamless, Capture::Idle, true) => {
                         self.capture_state.on_mouse_enter(mode);
                         sender.input(UpdateCaptureView);
                     }
-                    // 鼠标从有效画面区域离开
+                    // 鼠标刚刚离开虚拟机画面时
                     (InputMode::Seamless, Capture::Seamless, false) => {
                         self.capture_state.on_mouse_leave();
                         sender.input(UpdateCaptureView);
@@ -507,13 +548,22 @@ impl Component for VmDisplayModel {
                     _ => {}
                 }
                 if self.capture_state.should_forward() {
+                    // Relative motion in confined mode is delivered only by native Wayland relative-pointer events.
+                    if mode == InputMode::Confined && !self.input.is_absolute {
+                        return;
+                    }
                     self.input.move_mouse_to(x, y, &self.coord_system);
                 }
             }
 
-            ToggleCapture(event) => {
+            SetCapture(event) => {
                 let mode = self.input_mode();
+                if mode != InputMode::Confined {
+                    warn!("Ignoring SetCapture event in non-confined mode: mode={mode:?}, event={event:?}");
+                    return;
+                }
                 let should_capture = event.should_capture();
+                let was_captured = self.capture_state.should_forward();
 
                 let native = self.input_overlay.native();
                 let widget_rect = if let Some(native) = &native
@@ -538,17 +588,45 @@ impl Component for VmDisplayModel {
                     warn!("Failed to get wl_surface proxy");
                     return;
                 };
-                let Some(confine) = &mut self.confine_state else {
+                if self.confine_state.is_none() {
                     sender.input(UpdateCaptureView);
                     return;
-                };
-                self.hint_visible = should_capture;
+                }
                 if should_capture {
+                    if was_captured {
+                        return;
+                    }
+                    let prefer_relative = !self.input.is_absolute;
+                    let confine_ok = self.confine_state.as_ref().is_some_and(|confine| {
+                        confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect, prefer_relative)
+                    });
+                    if !confine_ok {
+                        warn!("Failed to establish confined pointer capture");
+                        self.cancel_hint_timer();
+                        self.hint_visible = false;
+                        if prefer_relative {
+                            self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
+                        } else {
+                            self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
+                        }
+                        if let Some(confine) = &mut self.confine_state {
+                            confine.is_captured = false;
+                        }
+                        sender.input(UpdateCaptureView);
+                        return;
+                    }
+
+                    self.hint_visible = true;
                     self.capture_state.on_click(mode);
-                    confine.reset_hint_timer(sender.clone());
-                    confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect);
-                    if let Some((x, y)) = vm_coords {
+                    self.show_toast(Self::release_hint_text(self.grab_shortcut), sender.clone());
+                    if let Some(confine) = &mut self.confine_state {
+                        confine.is_captured = true;
+                    }
+                    if self.input.is_absolute
+                        && let Some((x, y)) = vm_coords
+                    {
                         let Some(ctrl) = self.input.mouse_ctrl() else {
+                            warn!("Mouse not avaliable");
                             return;
                         };
                         debug!("Mouse was confined, and latest position: {x},{y}");
@@ -559,11 +637,14 @@ impl Component for VmDisplayModel {
                     info!("Pointer confined to region: {widget_rect:?}");
                 } else {
                     self.capture_state.on_release();
-                    confine.wayland_confine.borrow_mut().unconfine();
-                    confine.try_cancel_hint_timer();
+                    if let Some(confine) = &mut self.confine_state {
+                        confine.wayland_confine.borrow_mut().unconfine();
+                        confine.is_captured = false;
+                    }
+                    self.cancel_hint_timer();
+                    self.hint_visible = false;
                     info!("Pointer unconfined");
                 }
-                confine.is_captured = should_capture;
                 sender.input(UpdateCaptureView);
             }
 
@@ -579,7 +660,7 @@ impl Component for VmDisplayModel {
             SetScalingMode(mode) => {
                 self.scaling_mode = mode;
                 if mode == ScalingMode::ResizeGuest
-                    && let Some((w_nz, h_nz)) = self.coord_system.target_guest_resolution()
+                    && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
                 {
                     self.reset_resize_timer(w_nz, h_nz);
                 }
@@ -588,11 +669,11 @@ impl Component for VmDisplayModel {
             CanvasResize { logical_width, logical_height } => {
                 self.coord_system.set_widget_size(logical_width, logical_height);
                 if let Some(_native) = self.input_overlay.native() {
-                    self.coord_system.monitor_scale = self.input_overlay.scale_factor() as f32;
+                    self.coord_system.ui_scale = self.input_overlay.scale_factor() as f32;
                 }
                 self.dirty_flags.cursor = true;
                 if self.scaling_mode == ScalingMode::ResizeGuest
-                    && let Some((w_nz, h_nz)) = self.coord_system.target_guest_resolution()
+                    && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
                 {
                     self.reset_resize_timer(w_nz, h_nz);
                 }
@@ -605,10 +686,8 @@ impl Component for VmDisplayModel {
             }
 
             HideCaptureHint => {
+                self.cancel_hint_timer();
                 self.hint_visible = false;
-                if let Some(confine) = &mut self.confine_state {
-                    confine.try_cancel_hint_timer();
-                }
                 self.dirty_flags.cursor = true;
             }
 
@@ -617,6 +696,29 @@ impl Component for VmDisplayModel {
             }
 
             MouseButton { button, pressed } => {
+                if self.requested_input_mode == InputMode::Seamless
+                    && self.input_mode() == InputMode::Seamless
+                    && !self.input.is_absolute
+                {
+                    if pressed {
+                        warn!(
+                            "Ignoring mouse click in seamless mode while guest mouse is relative: button={button}, \
+                             pressed={pressed}"
+                        );
+                        self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());
+                    }
+                    return;
+                }
+                if self.input_mode() == InputMode::Confined
+                    && !self.input.is_absolute
+                    && !self.capture_state.should_forward()
+                {
+                    if pressed {
+                        warn!("Ignoring mouse click before confined relative capture is established");
+                        self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
+                    }
+                    return;
+                }
                 // Sync call - try_send is non-blocking
                 self.input.press_mouse_button(button, pressed);
             }
@@ -647,7 +749,19 @@ impl Component for VmDisplayModel {
             MouseModeChanged { is_absolute } => {
                 let mode_str = if is_absolute { "absolute" } else { "relative" };
                 info!("Guest mouse mode changed: {}", mode_str);
-                self.input.is_absolute = is_absolute;
+                self.input.set_mouse_mode(is_absolute);
+                if !is_absolute
+                    && self.requested_input_mode == InputMode::Seamless
+                    && self.input_mode() == InputMode::Seamless
+                {
+                    let had_capture = self.capture_state.should_forward();
+                    self.capture_state.reset();
+                    warn!("Relative mouse mode is incompatible with seamless capture. Waiting for manual mode switch");
+                    self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());
+                    if had_capture {
+                        sender.input(UpdateCaptureView);
+                    }
+                }
             }
         }
     }
@@ -658,6 +772,7 @@ impl Component for VmDisplayModel {
         } else {
             ("toast-hidden", "toast-visible")
         };
+        widgets.capture_hint.set_label(self.hint_text.as_ref());
         widgets.capture_hint.add_css_class(class_add);
         widgets.capture_hint.remove_css_class(class_remove);
         let is_interactive = self.capture_state.should_forward();
@@ -686,8 +801,10 @@ impl Component for VmDisplayModel {
                     if let Some(transform) = self.coord_system.get_cached_viewport() {
                         let logical_scale = transform.scale;
                         let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
-                        let anchor_x = logical_offset_x + cursor.x as f32 * logical_scale;
-                        let anchor_y = logical_offset_y + cursor.y as f32 * logical_scale;
+                        let top_left_guest_x = cursor.x - cursor.hot_x;
+                        let top_left_guest_y = cursor.y - cursor.hot_y;
+                        let anchor_x = logical_offset_x + top_left_guest_x as f32 * logical_scale;
+                        let anchor_y = logical_offset_y + top_left_guest_y as f32 * logical_scale;
                         let draw_x = anchor_x.round();
                         let draw_y = anchor_y.round();
                         let transform_matrix =
@@ -702,6 +819,7 @@ impl Component for VmDisplayModel {
     }
 
     fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        self.cancel_hint_timer();
         self.confine_state = None;
         if let Some(handle) = self.resize_timer.take() {
             handle.abort();

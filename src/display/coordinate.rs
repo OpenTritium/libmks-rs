@@ -1,59 +1,89 @@
 use relm4::gtk::graphene::{Point, Rect};
 use std::{cell::Cell, num::NonZeroU32};
 
+/// Viewport describes how the VM display is positioned within the widget.
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
+    /// Scale factor for VM content (widget pixels per VM pixel).
     pub scale: f32,
+    /// X offset of VM display origin within widget.
     pub offset_x: f32,
+    /// Y offset of VM display origin within widget.
     pub offset_y: f32,
 }
 
+/// Coordinate system for transforming between widget and VM coordinates.
+///
+/// ## Coordinate Systems
+///
+/// This module operates in three coordinate systems:
+///
+/// - **VM coordinates**: Guest pixel positions inside the virtual machine (0 ~ vm_resolution)
+/// - **Widget coordinates within the GTK widget (**: Logical positionslogical pixels)
+/// - **Physical coordinates**: Actual screen pixels (logical pixels * ui_scale)
+///
+/// ## Transformation Chain
+///
+/// ```
+/// Physical coords ← ui_scale ← Widget coords
+///      ↑                         ↑
+///      │                   viewport.scale / offset
+///      ↓                         ↓
+///    VM coords ←─────────────────────┘
+/// ```
+///
+/// All public methods that take or return coordinates specify which system they use.
 #[derive(Debug, Clone)]
 pub struct Coordinate {
     vm_resolution: (u32, u32),
     widget_size_logical: (f32, f32),
-    pub monitor_scale: f32,
+    pub ui_scale: f32,
     cached_viewport: Cell<Option<Viewport>>,
     transform_dirty: Cell<bool>,
 }
 
 impl Coordinate {
-    pub fn new(vm_w: u32, vm_h: u32, widget_w: f32, widget_h: f32, monitor_scale: f32) -> Self {
+    /// Creates a new Coordinate system.
+    pub fn new(vm_w: u32, vm_h: u32, widget_w: f32, widget_h: f32, ui_scale: f32) -> Self {
         Self {
             vm_resolution: (vm_w, vm_h),
             widget_size_logical: (widget_w, widget_h),
-            monitor_scale,
+            ui_scale,
             cached_viewport: Cell::new(None),
             transform_dirty: Cell::new(true),
         }
     }
 
+    /// Sets the VM resolution (e.g., 1920x1080).
     #[inline]
     pub fn set_vm_resolution(&mut self, w: u32, h: u32) {
         self.vm_resolution = (w, h);
         self.transform_dirty.set(true);
     }
 
+    /// Returns the VM resolution.
     #[inline]
     pub fn vm_resolution(&self) -> (u32, u32) { self.vm_resolution }
 
+    /// Sets the widget logical size and marks viewport as dirty.
     #[inline]
     pub fn set_widget_size(&mut self, w: f32, h: f32) {
         self.widget_size_logical = (w, h);
         self.transform_dirty.set(true);
     }
 
+    /// Returns the physical canvas size for QEMU (logical size * ui_scale).
     #[inline]
-    pub fn target_guest_resolution(&self) -> Option<(NonZeroU32, NonZeroU32)> {
+    pub fn physical_canvas_size(&self) -> Option<(NonZeroU32, NonZeroU32)> {
         let (w, h) = self.widget_size_logical;
-        let scale = self.monitor_scale;
-        if !w.is_finite() || w <= 0. {
+        let scale = self.ui_scale;
+        if w <= 0. || !w.is_finite() {
             return None;
         }
-        if !h.is_finite() || h <= 0. {
+        if h <= 0. || !h.is_finite() {
             return None;
         }
-        if !scale.is_finite() || scale <= 0. {
+        if scale <= 0. || !scale.is_finite() {
             return None;
         }
         let phys_w = (w * scale).max(1.) as u32;
@@ -61,17 +91,18 @@ impl Coordinate {
         Some((NonZeroU32::new(phys_w)?, NonZeroU32::new(phys_h)?))
     }
 
+    /// Calculates how to fit VM display within widget (like CSS object-fit: contain).
     #[inline]
-    pub const fn calculate_contain_transform(&self) -> Option<(f32, f32, f32)> {
+    pub const fn calculate_contain_transform(&self) -> Option<Viewport> {
         let (vm_w, vm_h) = self.vm_resolution;
         let (widget_w, widget_h) = self.widget_size_logical;
         if vm_w == 0 || vm_h == 0 {
             return None;
         }
-        if !widget_h.is_finite() || widget_h <= 0. {
+        if widget_h <= 0. || !widget_h.is_finite() {
             return None;
         }
-        if !widget_w.is_finite() || widget_w <= 0. {
+        if widget_w <= 0. || !widget_w.is_finite() {
             return None;
         }
         let vm_w = vm_w as f32;
@@ -80,29 +111,26 @@ impl Coordinate {
             let scale = widget_w / vm_w;
             let offset_x = 0.;
             let offset_y = (widget_h - vm_h * scale) / 2.;
-            Some((scale, offset_x, offset_y))
+            Some(Viewport { scale, offset_x, offset_y })
         } else {
             let scale = widget_h / vm_h;
             let offset_x = (widget_w - vm_w * scale) / 2.;
             let offset_y = 0.;
-            Some((scale, offset_x, offset_y))
+            Some(Viewport { scale, offset_x, offset_y })
         }
     }
 
+    /// Returns cached viewport, recalculating if dirty.
     #[inline]
     pub fn get_cached_viewport(&self) -> Option<Viewport> {
         if self.transform_dirty.get() {
-            let new_viewport = self.calculate_contain_transform().map(|(scale, offset_x, offset_y)| Viewport {
-                scale,
-                offset_x,
-                offset_y,
-            });
-            self.cached_viewport.set(new_viewport);
+            self.cached_viewport.set(self.calculate_contain_transform());
             self.transform_dirty.set(false);
         }
         self.cached_viewport.get()
     }
 
+    /// Converts widget coordinates to VM guest coordinates.
     #[inline]
     pub fn widget_to_guest(&self, logical_x: f32, logical_y: f32) -> Option<(u32, u32)> {
         let (vm_w, vm_h) = self.vm_resolution;
@@ -110,21 +138,28 @@ impl Coordinate {
             return None;
         }
         let viewport = self.get_cached_viewport()?;
-        let input = Point::new(logical_x, logical_y);
-        let guest_x = ((input.x() - viewport.offset_x) / viewport.scale).floor().clamp(0., (vm_w - 1) as f32);
-        let guest_y = ((input.y() - viewport.offset_y) / viewport.scale).floor().clamp(0., (vm_h - 1) as f32);
+        let guest_x = ((logical_x - viewport.offset_x) / viewport.scale).floor().clamp(0., (vm_w - 1) as f32);
+        let guest_y = ((logical_y - viewport.offset_y) / viewport.scale).floor().clamp(0., (vm_h - 1) as f32);
         Some((guest_x as u32, guest_y as u32))
     }
 
+    /// Returns the VM display bounds in widget coordinates: (x, y, width, height).
     #[inline]
-    pub fn is_in_viewport(&self, point: &Point) -> bool {
-        let Some(viewport) = self.get_cached_viewport() else {
-            return false;
-        };
+    pub fn vm_display_bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        let viewport = self.get_cached_viewport()?;
         let (vm_w, vm_h) = self.vm_resolution;
         let vm_w = vm_w as f32;
         let vm_h = vm_h as f32;
-        let vm_rect = Rect::new(viewport.offset_x, viewport.offset_y, vm_w * viewport.scale, vm_h * viewport.scale);
+        Some((viewport.offset_x, viewport.offset_y, vm_w * viewport.scale, vm_h * viewport.scale))
+    }
+
+    /// Checks if a point (in widget coordinates) is within the VM display region.
+    #[inline]
+    pub fn is_in_viewport(&self, point: &Point) -> bool {
+        let Some((x, y, w, h)) = self.vm_display_bounds() else {
+            return false;
+        };
+        let vm_rect = Rect::new(x, y, w, h);
         vm_rect.contains_point(point)
     }
 }

@@ -8,9 +8,14 @@
 # - The qemu_display example connects via "session" D-Bus address
 #
 # Usage:
-#   ./run_qemu_display.sh           # Default scanout mode
-#   ./run_qemu_display.sh scanout   # Explicit scanout mode
-#   ./run_qemu_display.sh dmabuf2   # DMABUF2 mode
+#   ./run_qemu_display.sh                          # Default: scanout + relative mouse
+#   ./run_qemu_display.sh scanout                 # Explicit scanout mode
+#   ./run_qemu_display.sh dmabuf2 absolute        # DMABUF2 mode + absolute mouse
+#   ./run_qemu_display.sh scanout relative        # Scanout mode + relative mouse
+#
+# Mouse mode:
+#   relative -> virtio-mouse-pci
+#   absolute -> usb-tablet
 #
 # In another terminal, run:
 #   cargo run --example qemu_display -- session [mode]
@@ -22,6 +27,7 @@ CPU_CORES="8"
 
 # Parse command line arguments
 MODE="${1:-scanout}"
+MOUSE_MODE="${2:-relative}"
 
 # Colors
 RED='\033[0;31m'
@@ -31,6 +37,19 @@ NC='\033[0m'
 
 echo -e "${YELLOW}=== Starting QEMU with D-Bus Display ===${NC}"
 echo "Mode: $MODE"
+echo "Mouse mode: $MOUSE_MODE"
+
+if [[ "$MOUSE_MODE" != "relative" && "$MOUSE_MODE" != "absolute" ]]; then
+    echo -e "${RED}Error: invalid mouse mode '$MOUSE_MODE'${NC}"
+    echo "Usage: $0 [scanout|dmabuf2] [relative|absolute]"
+    exit 1
+fi
+
+if [[ "$MOUSE_MODE" == "absolute" ]]; then
+    MOUSE_DEVICE="usb-tablet"
+else
+    MOUSE_DEVICE="virtio-mouse-pci"
+fi
 
 # Check if ISO file exists
 if [ ! -f "$ISO_PATH" ]; then
@@ -65,7 +84,7 @@ qemu-system-x86_64 \
     -device virtio-keyboard-pci \
     -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
     -usb \
-    -device virtio-mouse-pci \
+    -device $MOUSE_DEVICE \
     -device usb-kbd \
     -net nic,model=virtio \
     -net user \
