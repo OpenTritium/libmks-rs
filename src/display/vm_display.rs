@@ -180,10 +180,13 @@ pub struct VmDisplayModel {
     input: InputHandler,
     capture_state: CaptureState,
     requested_input_mode: InputMode,
+    last_logged_presentation_y_flip: Option<bool>,
 }
 
 pub struct VmDisplayWidgets {
     pub view_stack: Overlay,
+    pub vm_fixed: Fixed,
+    pub offload: GraphicsOffload,
     pub vm_picture: Picture,
     pub input_overlay: DrawingArea,
     pub cursor_fixed: Fixed,
@@ -296,6 +299,7 @@ impl Component for VmDisplayModel {
             input: init.input_handler,
             capture_state: CaptureState::new(),
             requested_input_mode: InputMode::Seamless,
+            last_logged_presentation_y_flip: None,
         };
         let view_stack = Overlay::builder().hexpand(true).vexpand(true).css_classes(["vm-display-bg"]).build();
         let vm_picture = Picture::builder()
@@ -311,6 +315,8 @@ impl Component for VmDisplayModel {
             .hexpand(true)
             .vexpand(true)
             .build();
+        let vm_fixed = Fixed::builder().hexpand(true).vexpand(true).can_target(false).build();
+        vm_fixed.put(&offload, 0., 0.);
         let sender_clone = sender.clone();
         let update_monitor_info = move |widget: &DrawingArea| {
             let display = widget.display();
@@ -448,7 +454,7 @@ impl Component for VmDisplayModel {
         let handler_clone = resize_handler.clone();
         input_plane.connect_scale_factor_notify(move |widget| handler_clone(widget));
 
-        view_stack.set_child(Some(&offload));
+        view_stack.set_child(Some(&vm_fixed));
         view_stack.add_overlay(&input_plane);
         view_stack.add_overlay(&cursor_fixed);
         view_stack.add_overlay(&capture_hint);
@@ -464,6 +470,8 @@ impl Component for VmDisplayModel {
         let controllers = controllers.into_boxed_slice();
         let widgets = VmDisplayWidgets {
             view_stack,
+            vm_fixed,
+            offload,
             vm_picture,
             input_overlay: input_plane,
             cursor_fixed,
@@ -733,6 +741,12 @@ impl Component for VmDisplayModel {
                         self.coord_system.set_vm_resolution(w, h);
                         self.dirty_flags.cursor |= flags.cursor;
                         self.dirty_flags.frame |= flags.frame;
+                        let y_flip = self.screen.y0_top;
+                        if self.last_logged_presentation_y_flip != Some(y_flip) {
+                            let state = if y_flip { "enabled" } else { "disabled" };
+                            debug!(target: "mks.scanout", "Presentation Y-flip {state}");
+                            self.last_logged_presentation_y_flip = Some(y_flip);
+                        }
                     }
                     Err(e) => {
                         warn!(target: "mks.scanout", "Failed to handle display event: {e}");
@@ -754,6 +768,7 @@ impl Component for VmDisplayModel {
                 if let Some(_native) = self.input_overlay.native() {
                     self.coord_system.ui_scale = self.input_overlay.scale_factor() as f32;
                 }
+                self.dirty_flags.frame = true;
                 self.dirty_flags.cursor = true;
                 if self.scaling_mode == ScalingMode::ResizeGuest
                     && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
@@ -864,6 +879,20 @@ impl Component for VmDisplayModel {
             return;
         }
         if self.dirty_flags.frame {
+            let canvas_w = widgets.input_overlay.width();
+            let canvas_h = widgets.input_overlay.height();
+            if canvas_w > 0
+                && canvas_h > 0
+                && (widgets.offload.width_request() != canvas_w || widgets.offload.height_request() != canvas_h)
+            {
+                widgets.offload.set_size_request(canvas_w, canvas_h);
+            }
+            if self.screen.y0_top && canvas_h > 0 {
+                let matrix = Transform::new().translate(&Point::new(0., canvas_h as f32)).scale(1., -1.);
+                widgets.vm_fixed.set_child_transform(&widgets.offload, Some(&matrix));
+            } else {
+                widgets.vm_fixed.set_child_transform(&widgets.offload, None);
+            }
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
             // DMABUF Update events often mutate the same underlying texture object.
             // Explicit redraw is needed even when paintable identity does not change.

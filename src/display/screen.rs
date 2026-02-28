@@ -1,13 +1,8 @@
 //! 屏幕和鼠标的 model
-use super::pixman_4cc::{FourCC, Pixman};
+use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
 use crate::{
     dbus::listener::Event,
-    display::{
-        Error,
-        direct_map::ImportedTexture,
-        software_rasterizer::Swapchain,
-        udma::{DmabufPlane, build_dmabuf_texture_planar},
-    },
+    display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
 };
 use RenderBackend::*;
 use log::warn;
@@ -16,7 +11,7 @@ use relm4::gtk::{
     glib::Bytes,
     prelude::*,
 };
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirtyFlags {
@@ -99,13 +94,7 @@ pub enum RenderBackend {
     None,
     SoftwareRasterizer(Swapchain),
     DirectMapped(ImportedTexture),
-    GpuPassthrough {
-        texture: Texture,
-        // GDK requires DMA-BUF fds to stay alive for at least as long as the texture.
-        _dmabuf_fds: Box<[OwnedFd]>,
-        width: u32,
-        height: u32,
-    },
+    GpuPassthrough(GpuPassthrough),
 }
 
 impl RenderBackend {
@@ -136,11 +125,11 @@ impl RenderBackend {
 pub struct Screen {
     pub cursor: CursorState,
     pub backend: RenderBackend,
-    warned_unhandled_y0_top: bool,
+    pub y0_top: bool,
 }
 
 impl Screen {
-    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, warned_unhandled_y0_top: false } }
+    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, y0_top: false } }
 
     #[inline]
     pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
@@ -148,6 +137,7 @@ impl Screen {
         let mut flags = DirtyFlags::default();
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
+                self.y0_top = false;
                 let pixman = Pixman::from(pixman_format);
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
                 swapchain.full_update_texture(width, height, stride, pixman, &data)?;
@@ -173,43 +163,30 @@ impl Screen {
                 flags.frame = true;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
-                if y0_top && !self.warned_unhandled_y0_top {
-                    warn!(
-                        "QEMU reported y0_top=true for ScanoutDMABUF, but vertical origin conversion is not handled \
-                         yet; image may appear flipped"
-                    );
-                    self.warned_unhandled_y0_top = true;
-                }
+                self.y0_top = y0_top;
                 let fd: OwnedFd = dmabuf.into();
-                let plane = DmabufPlane { fd: fd.as_raw_fd(), stride, offset: 0 };
-                let texture = build_dmabuf_texture_planar(width, height, FourCC::from(fourcc), modifier, &[plane])?;
-                self.backend = GpuPassthrough { texture, _dmabuf_fds: vec![fd].into_boxed_slice(), width, height };
+                self.backend =
+                    GpuPassthrough(GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier)?);
                 flags.frame = true;
             }
             ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
-                if y0_top && !self.warned_unhandled_y0_top {
-                    warn!(
-                        "QEMU reported y0_top=true for ScanoutDMABUF2, but vertical origin conversion is not handled \
-                         yet; image may appear flipped"
-                    );
-                    self.warned_unhandled_y0_top = true;
-                }
+                self.y0_top = y0_top;
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
-                let planes: Box<_> = fds
-                    .iter()
-                    .zip(stride.iter())
-                    .zip(offset.iter())
-                    .map(|((fd, &stride), &offset)| DmabufPlane {
-                        fd: fd.as_raw_fd(),
-                        stride,
-                        offset: u32::try_from(offset).expect("offset exceeds u32::MAX"),
-                    })
-                    .collect();
-                let texture = build_dmabuf_texture_planar(width, height, FourCC::from(fourcc), modifier, &planes)?;
-                self.backend = GpuPassthrough { texture, _dmabuf_fds: fds.into_boxed_slice(), width, height };
+                let offsets_u32: Box<[u32]> =
+                    offset.iter().map(|&v| u32::try_from(v).expect("offset exceeds u32::MAX")).collect();
+                self.backend = GpuPassthrough(GpuPassthrough::from_multi_plane(
+                    fds,
+                    width,
+                    height,
+                    stride,
+                    &offsets_u32,
+                    fourcc,
+                    modifier,
+                )?);
                 flags.frame = true;
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
+                self.y0_top = false;
                 let (cache, _) = self.backend.ensure_direct_mapped();
                 let _texture = cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
                 flags.frame = true;
@@ -230,6 +207,9 @@ impl Screen {
                 flags.frame = true;
             }
             UpdateDmabuf { .. } => {
+                // DMABUF content is updated in-place by the producer.
+                // Rebuilding texture on every damage update can introduce extra overhead
+                // and visible trailing under high update rates.
                 flags.frame = true;
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
@@ -255,6 +235,7 @@ impl Screen {
                 }
             }
             Disable => {
+                self.y0_top = false;
                 self.backend = RenderBackend::None;
                 self.cursor.visible = false;
                 self.cursor.texture = Option::None;
@@ -268,7 +249,7 @@ impl Screen {
     pub fn get_background_texture(&self) -> Option<&Texture> {
         match &self.backend {
             SoftwareRasterizer(sw) => sw.active_texture().as_ref(),
-            GpuPassthrough { texture, .. } => Some(texture),
+            GpuPassthrough(gpu) => Some(gpu.texture()),
             DirectMapped(cache) => cache.texture(),
             None => Option::None,
         }
@@ -278,7 +259,7 @@ impl Screen {
     pub fn resolution(&self) -> (u32, u32) {
         match &self.backend {
             SoftwareRasterizer(sw) => sw.resolution().unwrap_or((0, 0)),
-            GpuPassthrough { width, height, .. } => (*width, *height),
+            GpuPassthrough(gpu) => gpu.resolution(),
             DirectMapped(cache) => cache.resolution().unwrap_or((0, 0)),
             None => (0, 0),
         }

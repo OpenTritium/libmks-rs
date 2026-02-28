@@ -49,24 +49,16 @@ impl_controller!(
 
 impl MultiTouchController {
     /// Convenience method for touch begin
-    pub fn begin(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Begin, num_slot, x, y)
-    }
+    pub fn begin(&self, num_slot: u64, x: f64, y: f64) -> MksResult { self.send_event(Kind::Begin, num_slot, x, y) }
 
     /// Convenience method for touch update
-    pub fn update(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Update, num_slot, x, y)
-    }
+    pub fn update(&self, num_slot: u64, x: f64, y: f64) -> MksResult { self.send_event(Kind::Update, num_slot, x, y) }
 
     /// Convenience method for touch end
-    pub fn end(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::End, num_slot, x, y)
-    }
+    pub fn end(&self, num_slot: u64, x: f64, y: f64) -> MksResult { self.send_event(Kind::End, num_slot, x, y) }
 
     /// Convenience method for touch cancel
-    pub fn cancel(&self, num_slot: u64, x: f64, y: f64) -> MksResult {
-        self.send_event(Kind::Cancel, num_slot, x, y)
-    }
+    pub fn cancel(&self, num_slot: u64, x: f64, y: f64) -> MksResult { self.send_event(Kind::Cancel, num_slot, x, y) }
 }
 
 impl_session_connect!(
