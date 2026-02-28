@@ -19,12 +19,12 @@ pub struct Viewport {
 /// This module operates in three coordinate systems:
 ///
 /// - **VM coordinates**: Guest pixel positions inside the virtual machine (0 ~ vm_resolution)
-/// - **Widget coordinates within the GTK widget (**: Logical positionslogical pixels)
+/// - **Widget coordinates**: Logical positions within the GTK widget (logical pixels)
 /// - **Physical coordinates**: Actual screen pixels (logical pixels * ui_scale)
 ///
 /// ## Transformation Chain
 ///
-/// ```
+/// ```text
 /// Physical coords ← ui_scale ← Widget coords
 ///      ↑                         ↑
 ///      │                   viewport.scale / offset
