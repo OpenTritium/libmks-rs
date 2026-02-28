@@ -801,8 +801,9 @@ impl Component for VmDisplayModel {
                     if let Some(transform) = self.coord_system.get_cached_viewport() {
                         let logical_scale = transform.scale;
                         let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
-                        let top_left_guest_x = cursor.x - cursor.hot_x;
-                        let top_left_guest_y = cursor.y - cursor.hot_y;
+                        // Intentionally align by cursor image top-left, not hotspot.
+                        let top_left_guest_x = cursor.x;
+                        let top_left_guest_y = cursor.y;
                         let anchor_x = logical_offset_x + top_left_guest_x as f32 * logical_scale;
                         let anchor_y = logical_offset_y + top_left_guest_y as f32 * logical_scale;
                         let draw_x = anchor_x.round();

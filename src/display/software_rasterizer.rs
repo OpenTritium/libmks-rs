@@ -13,7 +13,7 @@ use super::{
         utils::fetch_page_size,
     },
 };
-use log::error;
+use log::{debug, error, warn};
 use relm4::gtk::gdk::Texture;
 use rustix::{
     fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
@@ -152,8 +152,20 @@ impl UdmaSurface {
     /// Caller ensures `(x, y, width, height)` is within bounds and `buf` is valid.
     #[inline]
     fn update_rect(&mut self, x: u32, y: u32, width: u32, height: u32, stride: usize, buf: *const u8) {
-        debug_assert!((x + width) <= self.width);
-        debug_assert!((y + height) <= self.height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        if x >= self.width
+            || y >= self.height
+            || width > self.width.saturating_sub(x)
+            || height > self.height.saturating_sub(y)
+        {
+            warn!(
+                "Dropping out-of-bounds partial update: rect=({},{} {}x{}), surface={}x{}",
+                x, y, width, height, self.width, self.height
+            );
+            return;
+        }
         let bpp = self.pixman.bytes_per_pixel();
         // Sanity check to prevent OOB writes in debug builds
         #[cfg(debug_assertions)]
@@ -312,18 +324,53 @@ impl Swapchain {
     pub fn partial_update_texture(
         &mut self, x: u32, y: u32, width: u32, height: u32, stride: u32, pixman: Pixman, buf: &[u8],
     ) -> Result<Texture, Error> {
-        debug_assert!(height > 0 && stride > 0 && width > 0);
+        if height == 0 || stride == 0 || width == 0 {
+            return Err(Error::State("Partial update requires non-zero width/height/stride"));
+        }
         if self.active_buf().is_none() {
             return Err(Error::State("Swapchain uninitialized"));
         }
-        debug_assert_eq!(pixman, self.active_buf().as_ref().unwrap().pixman);
+        let active = self.active_buf().as_ref().unwrap();
+        if pixman != active.pixman {
+            return Err(Error::State("Partial update pixman format mismatch"));
+        }
+        if x >= active.width || y >= active.height {
+            // Expected during resize/mode transitions when stale Update events race with new Scanout.
+            debug!(
+                "Ignoring off-screen partial update: rect=({},{} {}x{}), surface={}x{}",
+                x, y, width, height, active.width, active.height
+            );
+            return self.active_texture().as_ref().cloned().ok_or(Error::State("Active texture missing"));
+        }
+        let clipped_width = width.min(active.width - x);
+        let clipped_height = height.min(active.height - y);
+        if clipped_width != width || clipped_height != height {
+            debug!(
+                "Clipping partial update: rect=({},{} {}x{}) -> {}x{} within surface={}x{}",
+                x, y, width, height, clipped_width, clipped_height, active.width, active.height
+            );
+        }
+        let src_stride = stride as usize;
+        let bpp = pixman.bytes_per_pixel();
+        let row_bytes = clipped_width as usize * bpp;
+        let required = (clipped_height as usize - 1).saturating_mul(src_stride) + row_bytes;
+        if buf.len() < required {
+            debug!(
+                "Ignoring partial update with short payload: need={required}, got={}, rect={}x{}, stride={}",
+                buf.len(),
+                clipped_width,
+                clipped_height,
+                stride
+            );
+            return self.active_texture().as_ref().cloned().ok_or(Error::State("Active texture missing"));
+        }
         // Bring shadow buffer up to date with the previous frame's state
         let texture_invalidated = self.sync_active_to_shadow()?;
         // Queue damage for the *next* frame
-        self.last_damage = Some(Damage { x, y, width, height });
+        self.last_damage = Some(Damage { x, y, width: clipped_width, height: clipped_height });
         // Apply current frame changes
         let shadow_buf = self.shadow_buf_mut().as_mut().unwrap();
-        shadow_buf.update_rect(x, y, width, height, stride as usize, buf.as_ptr());
+        shadow_buf.update_rect(x, y, clipped_width, clipped_height, src_stride, buf.as_ptr());
         if texture_invalidated {
             let fourcc: FourCC = pixman.try_into()?;
             let plane = DmabufPlane { fd: shadow_buf.dmabuf_fd(), stride: shadow_buf.stride as u32, offset: 0 };

@@ -374,15 +374,30 @@ pub enum ListenerMode {
     ScanoutDMABUF2,
 }
 
-impl From<&str> for ListenerMode {
-    fn from(s: &str) -> Self {
+impl ListenerMode {
+    const CLI_MODES: &'static str = "scanout | scanoutdmabuf | scanoutdmabuf2";
+
+    fn parse_cli(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "scanout" => Self::Scanout,
-            "scanoutdmabuf" | "dmabuf" => Self::ScanoutDMABUF,
-            "scanoutdmabuf2" | "dmabuf2" | "gl" => Self::ScanoutDMABUF2,
-            _ => Self::Scanout,
+            "scanout" => Some(Self::Scanout),
+            "scanoutdmabuf" | "dmabuf" => Some(Self::ScanoutDMABUF),
+            "scanoutdmabuf2" | "dmabuf2" | "gl" => Some(Self::ScanoutDMABUF2),
+            _ => None,
         }
     }
+}
+
+fn print_usage(bin: &str) {
+    eprintln!("Usage: {} <qemu-dbus-socket-path> [mode]", bin);
+    eprintln!();
+    eprintln!("Arguments:");
+    eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
+    eprintln!("  mode                   Listener mode: {} (default: scanout)", ListenerMode::CLI_MODES);
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", bin);
 }
 
 /// Connect to QEMU and return the event receiver for display updates.
@@ -610,26 +625,24 @@ async fn connect_to_qemu(
 async fn main() {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
+    let bin = args.first().map_or("qemu_display", String::as_str);
 
     let (socket_path, mode) = match args.len() {
         2 => (PathBuf::from(&args[1]), ListenerMode::Scanout),
         3 => {
             let path = PathBuf::from(&args[1]);
-            let mode = ListenerMode::from(args[2].as_str());
+            let mode = match ListenerMode::parse_cli(args[2].as_str()) {
+                Some(mode) => mode,
+                None => {
+                    eprintln!("Error: invalid mode '{}'", args[2]);
+                    print_usage(bin);
+                    std::process::exit(2);
+                }
+            };
             (path, mode)
         }
         _ => {
-            eprintln!("Usage: {} <qemu-dbus-socket-path> [mode]", args[0]);
-            eprintln!();
-            eprintln!("Arguments:");
-            eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
-            eprintln!(
-                "  mode                   Listener mode: scanout | scanoutdmabuf | scanoutdmabuf2 (default: scanout)"
-            );
-            eprintln!();
-            eprintln!("Examples:");
-            eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", args[0]);
-            eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", args[0]);
+            print_usage(bin);
             std::process::exit(1);
         }
     };

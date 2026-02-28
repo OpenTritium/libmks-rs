@@ -92,9 +92,11 @@ VGA_ARGS=()
 
 case "$GPU_MODE" in
     vga)
-        # Standard basic VGA, no OpenGL, no shared memory required
+        # VirtIO 2D mode: modern driver path without OpenGL/shared-memory requirements
+        MACHINE_ARGS=("-machine" "q35")
+        MEMORY_ARGS=("-m" "$RAM_SIZE")
         DISPLAY_ARGS=("-display" "dbus")
-        VGA_ARGS=("-vga" "std")
+        VGA_ARGS=("-device" "virtio-vga,max_outputs=1,xres=1920,yres=1080")
         ;;
     virtgpu)
         # VirtIO GPU with VirGL 3D (requires OpenGL on DBus and Shared Memory for DMABUF)
@@ -125,10 +127,9 @@ if [ ! -f "$ISO_PATH" ]; then
     exit 1
 fi
 
-# Clean up any existing QEMU and free port 5900
+# Clean up any existing QEMU process
 echo "Cleaning up existing processes..."
 pkill -9 qemu-system-x86_64 2>/dev/null || true
-fuser -k 5900/tcp 2>/dev/null || true
 sleep 1
 
 # -----------------------------------------------------------------------------
@@ -148,7 +149,6 @@ QEMU_CMD=(
     -boot d
     -enable-kvm
     "${DISPLAY_ARGS[@]}"
-    -spice port=5900,disable-ticketing=on
     -device virtio-keyboard-pci
     "${VGA_ARGS[@]}"
     -usb

@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use RenderBackend::*;
+use log::warn;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
@@ -150,6 +151,10 @@ impl Screen {
                 flags.frame = true;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
+                if x < 0 || y < 0 || width <= 0 || height <= 0 {
+                    warn!("Ignoring invalid Update rect from QEMU: x={x}, y={y}, width={width}, height={height}");
+                    return Ok(flags);
+                }
                 let pixman = Pixman::from(pixman_format);
                 let (swapchain, new_created) = self.backend.ensure_software_rasterizer();
                 if new_created {
@@ -157,15 +162,11 @@ impl Screen {
                         "Received partial 'Update' without preceding 'Scanout' (Software Backend uninitialized)",
                     ));
                 }
-                swapchain.partial_update_texture(
-                    x as u32,
-                    y as u32,
-                    width as u32,
-                    height as u32,
-                    stride,
-                    pixman,
-                    &data,
-                )?;
+                let x = x as u32;
+                let y = y as u32;
+                let width = width as u32;
+                let height = height as u32;
+                swapchain.partial_update_texture(x, y, width, height, stride, pixman, &data)?;
                 flags.frame = true;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top: _ } => {
@@ -196,6 +197,10 @@ impl Screen {
                 flags.frame = true;
             }
             UpdateMap { x, y, width, height } => {
+                if x < 0 || y < 0 || width <= 0 || height <= 0 {
+                    warn!("Ignoring invalid UpdateMap rect from QEMU: x={x}, y={y}, width={width}, height={height}");
+                    return Ok(flags);
+                }
                 let (cache, new_created) = self.backend.ensure_direct_mapped();
                 if new_created {
                     return Err(Error::State(
