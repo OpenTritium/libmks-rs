@@ -1,14 +1,15 @@
 //! `DBus` proxy for QEMU Mouse interface.
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Mouse-section>
-use crate::{MksResult, error::MksError, generate_watcher, impl_controller, impl_session_connect};
+use crate::{MksResult, error::MksError, generate_watcher, impl_controller, impl_session_connect, mks_error};
 use derive_more::{AsRef, Deref, From};
 use kanal::{AsyncReceiver, AsyncSender};
-use log::{error, info, warn};
 use serde_repr::Serialize_repr;
 use std::hint::spin_loop;
 use tokio::task::AbortHandle;
 use zbus::{Result, proxy};
 use zvariant::Type;
+
+const LOG_TARGET: &str = "mks.dbus.mouse";
 
 #[proxy(interface = "org.qemu.Display1.Mouse", default_service = "org.qemu", gen_blocking = false)]
 pub trait Mouse {
@@ -140,16 +141,6 @@ generate_watcher!(
     }
 );
 
-#[inline]
-fn promote_current_thread_mouse_priority() {
-    use rustix::{process::setpriority_process, thread::gettid};
-    let tid = gettid();
-    match setpriority_process(Some(tid), -20) {
-        Ok(()) => info!("Mouse worker priority raised to highest (nice=-20)"),
-        Err(e) => warn!(error:? = e; "Failed to raise mouse worker priority (needs CAP_SYS_NICE/root)"),
-    }
-}
-
 #[derive(Debug, Default)]
 enum PendingMove {
     #[default]
@@ -169,12 +160,12 @@ async fn flush_pending_move(proxy: &MouseProxy<'static>, pending_move: &mut Pend
         PendingMove::None => {}
         PendingMove::Abs { x, y } => {
             if let Err(e) = proxy.set_abs_position(x, y).await {
-                error!(error:? = e; "Mouse set_abs_position failed");
+                mks_error!(error:? = e; "Mouse set_abs_position failed");
             }
         }
         PendingMove::Rel { dx, dy } => {
             if let Err(e) = proxy.rel_motion(dx, dy).await {
-                error!(error:? = e; "Mouse rel_motion failed");
+                mks_error!(error:? = e; "Mouse rel_motion failed");
             }
         }
     }
@@ -182,9 +173,7 @@ async fn flush_pending_move(proxy: &MouseProxy<'static>, pending_move: &mut Pend
 
 async fn handle_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
     use Command::*;
-
     let fut = async move {
-        promote_current_thread_mouse_priority();
         while let Ok(mut cmd) = cmd_rx.recv().await {
             let mut pending_move = PendingMove::None;
             let mut rx_open = true;
@@ -220,13 +209,13 @@ async fn handle_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver
                     Press(btn) => {
                         flush_pending_move(&proxy, &mut pending_move).await;
                         if let Err(e) = proxy.press(btn).await {
-                            error!(error:? = e; "Mouse press failed");
+                            mks_error!(error:? = e; "Mouse press failed");
                         }
                     }
                     Release(btn) => {
                         flush_pending_move(&proxy, &mut pending_move).await;
                         if let Err(e) = proxy.release(btn).await {
-                            error!(error:? = e; "Mouse release failed");
+                            mks_error!(error:? = e; "Mouse release failed");
                         }
                     }
                 }

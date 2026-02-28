@@ -1,14 +1,16 @@
+use super::coordinate::Coordinate;
 use crate::{
     dbus::{
         keyboard::{KeyboardController, KeyboardSession},
         mouse::{Button, MouseController, MouseSession},
         multitouch::{Kind, MultiTouchController, MultiTouchSession},
     },
-    display::coordinate::Coordinate,
     keymaps::Qnum,
+    mks_debug, mks_error, mks_warn,
 };
-use log::{debug, error, warn};
 use typed_builder::TypedBuilder;
+
+const LOG_TARGET: &str = "mks.display.input";
 
 #[derive(TypedBuilder)]
 pub struct InputHandler {
@@ -40,21 +42,21 @@ impl InputHandler {
     #[inline]
     pub fn move_mouse_to(&mut self, widget_x: f32, widget_y: f32, coord: &Coordinate) {
         let Some(ctrl) = self.mouse_ctrl() else {
-            warn!("No mouse controller available");
+            mks_warn!("No mouse controller available");
             return;
         };
-        debug!("move_mouse_to: widget=({:.1}, {:.1}), is_absolute={}", widget_x, widget_y, self.is_absolute);
+        mks_debug!("move_mouse_to: widget=({:.1}, {:.1}), is_absolute={}", widget_x, widget_y, self.is_absolute);
         if self.is_absolute {
             let Some((guest_x, guest_y)) = coord.widget_to_guest(widget_x, widget_y) else {
-                warn!("failed map widget pos to guest pos: {widget_x},{widget_y}");
+                mks_warn!("failed map widget pos to guest pos: {widget_x},{widget_y}");
                 return;
             };
             if let Err(e) = ctrl.try_set_abs_position(guest_x, guest_y) {
-                warn!(error:? = e; "Lost mouse absolute move event")
+                mks_warn!(error:? = e; "Lost mouse absolute move event")
             }
             return;
         }
-        debug!("Ignoring widget motion in relative mode; expecting native Wayland relative events");
+        mks_debug!("Ignoring widget motion in relative mode; expecting native Wayland relative events");
     }
 
     pub const fn cache_mouse_scroll(&mut self, dy: f64) -> i64 {
@@ -67,7 +69,7 @@ impl InputHandler {
 
     pub fn scroll_mouse(&self, steps: i64) {
         let Some(ctrl) = self.mouse_ctrl() else {
-            warn!("No mouse controller available");
+            mks_warn!("No mouse controller available");
             return;
         };
         for _ in 0..steps.abs() {
@@ -78,46 +80,46 @@ impl InputHandler {
             };
             let Err(e) = ctrl.press(btn) else {
                 let Err(e) = ctrl.release(btn) else { continue };
-                error!(error:? = e; "Failed to release mouse button");
+                mks_error!(error:? = e; "Failed to release mouse button");
                 continue;
             };
-            error!(error:? = e; "Failed to press mouse button");
+            mks_error!(error:? = e; "Failed to press mouse button");
         }
     }
 
     /// 处理键盘事件
     pub fn press_keyboard(&self, keycode: u32, pressed: bool) {
         let Some(ctrl) = self.keyboard_ctrl() else {
-            warn!("No keyboard controller available");
+            mks_warn!("No keyboard controller available");
             return;
         };
         let qnum = Qnum::from_xorg_keycode(keycode);
         let Err(e) = (if pressed { ctrl.press(qnum) } else { ctrl.release(qnum) }) else {
             return;
         };
-        error!(error:? = e; "Failed to {} keyboard key", if pressed { "press" } else { "release" });
+        mks_error!(error:? = e; "Failed to {} keyboard key", if pressed { "press" } else { "release" });
     }
 
     pub fn press_mouse_button(&self, button: u32, pressed: bool) {
         let Some(ctrl) = self.mouse_ctrl() else {
-            warn!("No mouse controller available");
+            mks_warn!("No mouse controller available");
             return;
         };
         let Some(btn) = Button::from_xorg(button) else {
-            warn!("Unmapped mouse button {button}, ignore");
+            mks_warn!("Unmapped mouse button {button}, ignore");
             return;
         };
         let Err(e) = (if pressed { ctrl.press(btn) } else { ctrl.release(btn) }) else {
             return;
         };
-        error!(error:? = e; "Failed to {} mouse button", if pressed { "press" } else { "release" });
+        mks_error!(error:? = e; "Failed to {} mouse button", if pressed { "press" } else { "release" });
     }
 
     /// 处理触摸事件
     pub fn touch(&self, kind: Kind, num_slot: u64, x: f64, y: f64) {
         use Kind::*;
         let Some(ctrl) = self.multitouch_ctrl() else {
-            warn!("No multitouch controller available");
+            mks_warn!("No multitouch controller available");
             return;
         };
         let res = match kind {
@@ -127,6 +129,6 @@ impl InputHandler {
             Cancel => ctrl.cancel(num_slot, x, y),
         };
         let Err(e) = res else { return };
-        error!(error:? = e; "Failed to send touch event");
+        mks_error!(error:? = e; "Failed to send touch event");
     }
 }

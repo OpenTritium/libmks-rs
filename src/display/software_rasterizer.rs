@@ -13,7 +13,7 @@ use super::{
         utils::fetch_page_size,
     },
 };
-use log::{debug, error, warn};
+use crate::{mks_debug, mks_error, mks_warn};
 use relm4::gtk::gdk::Texture;
 use rustix::{
     fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
@@ -24,6 +24,8 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
     ptr::{self, NonNull},
 };
+
+const LOG_TARGET: &str = "mks.display.raster";
 
 /// A shared memory buffer backed by `memfd` and exported as a DMABUF.
 ///
@@ -160,9 +162,14 @@ impl UdmaSurface {
             || width > self.width.saturating_sub(x)
             || height > self.height.saturating_sub(y)
         {
-            warn!(
+            mks_warn!(
                 "Dropping out-of-bounds partial update: rect=({},{} {}x{}), surface={}x{}",
-                x, y, width, height, self.width, self.height
+                x,
+                y,
+                width,
+                height,
+                self.width,
+                self.height
             );
             return;
         }
@@ -204,7 +211,7 @@ impl Drop for UdmaSurface {
         // SAFETY: We must use the original aligned allocation size.
         unsafe {
             if let Err(e) = munmap(self.ptr.as_ptr() as *mut _, self.capacity) {
-                error!(error:?=e; "Failed to unmap memory")
+                mks_error!(error:?=e; "Failed to unmap memory")
             }
         }
     }
@@ -336,18 +343,30 @@ impl Swapchain {
         }
         if x >= active.width || y >= active.height {
             // Expected during resize/mode transitions when stale Update events race with new Scanout.
-            debug!(
+            mks_debug!(
                 "Ignoring off-screen partial update: rect=({},{} {}x{}), surface={}x{}",
-                x, y, width, height, active.width, active.height
+                x,
+                y,
+                width,
+                height,
+                active.width,
+                active.height
             );
             return self.active_texture().as_ref().cloned().ok_or(Error::State("Active texture missing"));
         }
         let clipped_width = width.min(active.width - x);
         let clipped_height = height.min(active.height - y);
         if clipped_width != width || clipped_height != height {
-            debug!(
+            mks_debug!(
                 "Clipping partial update: rect=({},{} {}x{}) -> {}x{} within surface={}x{}",
-                x, y, width, height, clipped_width, clipped_height, active.width, active.height
+                x,
+                y,
+                width,
+                height,
+                clipped_width,
+                clipped_height,
+                active.width,
+                active.height
             );
         }
         let src_stride = stride as usize;
@@ -355,7 +374,7 @@ impl Swapchain {
         let row_bytes = clipped_width as usize * bpp;
         let required = (clipped_height as usize - 1).saturating_mul(src_stride) + row_bytes;
         if buf.len() < required {
-            debug!(
+            mks_debug!(
                 "Ignoring partial update with short payload: need={required}, got={}, rect={}x{}, stride={}",
                 buf.len(),
                 clipped_width,

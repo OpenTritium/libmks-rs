@@ -98,7 +98,7 @@ pub mod macros {
                     let mut streams = ::std::vec::Vec::new();
                     $(
                         let p = proxy.clone();
-                        streams.push($crate::fetch_then_update(
+                        streams.push($crate::dbus::utils::fetch_then_update(
                             async move { p.$getter().await },
                             $signal,
                             $map_fn,
@@ -106,7 +106,11 @@ pub mod macros {
                     )*
 
                     if streams.is_empty() {
-                        ::log::warn!("No properties to watch for {}", $log_context);
+                        ::log::warn!(
+                            target: concat!("mks.dbus.", $log_context),
+                            "No properties to watch for {}",
+                            $log_context
+                        );
                         return;
                     }
 
@@ -121,7 +125,12 @@ pub mod macros {
                                 }
                             }
                             Err(e) => {
-                                ::log::error!(error:? = e; "Error reading {} property", $log_context);
+                                ::log::error!(
+                                    target: concat!("mks.dbus.", $log_context),
+                                    error:? = e;
+                                    "Error reading {} property",
+                                    $log_context
+                                );
                             }
                         }
                     }
@@ -167,7 +176,12 @@ pub mod macros {
                             )*
                         };
                         if let Err(e) = res {
-                            ::log::error!(error:? = e; "{} failed to call method", $log_context);
+                            ::log::error!(
+                                target: concat!("mks.dbus.", $log_context),
+                                error:? = e;
+                                "{} failed to call method",
+                                $log_context
+                            );
                         }
                     }
                 };

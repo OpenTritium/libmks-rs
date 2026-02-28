@@ -3,15 +3,17 @@ use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
 use crate::{
     dbus::listener::Event,
     display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
+    mks_trace, mks_warn,
 };
 use RenderBackend::*;
-use log::warn;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
     prelude::*,
 };
-use std::os::fd::OwnedFd;
+use std::{hint::unreachable_unchecked, os::fd::OwnedFd};
+
+const LOG_TARGET: &str = "mks.display.event";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirtyFlags {
@@ -105,7 +107,7 @@ impl RenderBackend {
             *self = SoftwareRasterizer(Swapchain::new());
             created = true;
         }
-        let SoftwareRasterizer(swapchain) = self else { unsafe { std::hint::unreachable_unchecked() } };
+        let SoftwareRasterizer(swapchain) = self else { unsafe { unreachable_unchecked() } };
         (swapchain, created)
     }
 
@@ -116,7 +118,7 @@ impl RenderBackend {
             *self = DirectMapped(ImportedTexture::new());
             created = true;
         }
-        let DirectMapped(cache) = self else { unsafe { std::hint::unreachable_unchecked() } };
+        let DirectMapped(cache) = self else { unsafe { unreachable_unchecked() } };
         (cache, created)
     }
 }
@@ -137,6 +139,8 @@ impl Screen {
         let mut flags = DirtyFlags::default();
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
+                let bytes = data.len();
+                mks_trace!("Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={bytes}");
                 self.y0_top = false;
                 let pixman = Pixman::from(pixman_format);
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
@@ -144,8 +148,13 @@ impl Screen {
                 flags.frame = true;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
+                let bytes = data.len();
+                mks_trace!(
+                    "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, \
+                     bytes={bytes}"
+                );
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    warn!("Ignoring invalid Update rect from QEMU: x={x}, y={y}, width={width}, height={height}");
+                    mks_warn!("Ignoring invalid Update rect from QEMU: x={x}, y={y}, width={width}, height={height}");
                     return Ok(flags);
                 }
                 let pixman = Pixman::from(pixman_format);
@@ -163,6 +172,10 @@ impl Screen {
                 flags.frame = true;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
+                mks_trace!(
+                    "ScanoutDMABUF: {width}x{height}, stride={stride}, fourcc=0x{fourcc:08x}, \
+                     modifier=0x{modifier:016x}, y0_top={y0_top}"
+                );
                 self.y0_top = y0_top;
                 let fd: OwnedFd = dmabuf.into();
                 self.backend =
@@ -170,6 +183,11 @@ impl Screen {
                 flags.frame = true;
             }
             ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
+                let planes = dmabuf.len();
+                mks_trace!(
+                    "ScanoutDMABUF2: {width}x{height}, planes={planes}, fourcc=0x{fourcc:08x}, \
+                     modifier=0x{modifier:016x}, y0_top={y0_top}"
+                );
                 self.y0_top = y0_top;
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
                 let offsets_u32: Box<[u32]> =
@@ -186,14 +204,20 @@ impl Screen {
                 flags.frame = true;
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
+                mks_trace!(
+                    "ScanoutMap: {width}x{height}, stride={stride}, offset={offset}, pixman=0x{pixman_format:08x}"
+                );
                 self.y0_top = false;
                 let (cache, _) = self.backend.ensure_direct_mapped();
                 let _texture = cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
                 flags.frame = true;
             }
             UpdateMap { x, y, width, height } => {
+                mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    warn!("Ignoring invalid UpdateMap rect from QEMU: x={x}, y={y}, width={width}, height={height}");
+                    mks_warn!(
+                        "Ignoring invalid UpdateMap rect from QEMU: x={x}, y={y}, width={width}, height={height}"
+                    );
                     return Ok(flags);
                 }
                 let (cache, new_created) = self.backend.ensure_direct_mapped();
@@ -206,7 +230,8 @@ impl Screen {
                 cache.record_damage(x as u32, y as u32, width as u32, height as u32);
                 flags.frame = true;
             }
-            UpdateDmabuf { .. } => {
+            UpdateDmabuf { x, y, width, height } => {
+                mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
                 // DMABUF content is updated in-place by the producer.
                 // Rebuilding texture on every damage update can introduce extra overhead
                 // and visible trailing under high update rates.
