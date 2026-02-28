@@ -1,3 +1,5 @@
 /target
 /libmks
 /qemu-display
+
+/test_suit/livecd.iso
