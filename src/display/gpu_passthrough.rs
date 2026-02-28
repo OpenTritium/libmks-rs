@@ -1,13 +1,10 @@
 use super::{
     Error,
-    pixman_4cc::{FourCC, sanitize_opaque_fourcc},
+    pixman_4cc::FourCC,
     udma::{DmabufPlane, build_dmabuf_texture_planar},
 };
-use crate::mks_warn;
 use relm4::gtk::gdk::Texture;
 use std::os::fd::{AsRawFd, OwnedFd};
-
-const LOG_TARGET: &str = "mks.display.gpu_passthrough";
 
 #[derive(Debug)]
 struct PlaneDesc {
@@ -32,37 +29,15 @@ pub struct GpuPassthrough {
 }
 
 impl GpuPassthrough {
-    fn build_texture_with_fallback(
-        width: u32, height: u32, raw_fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],
-    ) -> Result<(Texture, FourCC), Error> {
-        let sanitized_fourcc = sanitize_opaque_fourcc(raw_fourcc);
-        if sanitized_fourcc != raw_fourcc {
-            match build_dmabuf_texture_planar(width, height, sanitized_fourcc, modifier, planes) {
-                Ok(texture) => return Ok((texture, sanitized_fourcc)),
-                Err(e) => {
-                    let raw = u32::from(raw_fourcc);
-                    let sanitized = u32::from(sanitized_fourcc);
-                    mks_warn!(
-                        error:? = e;
-                        "Sanitized DMABUF import failed (raw=0x{raw:08x}, sanitized=0x{sanitized:08x}, \
-                         modifier=0x{modifier:016x}); retrying with raw fourcc"
-                    );
-                }
-            }
-        }
-        let texture = build_dmabuf_texture_planar(width, height, raw_fourcc, modifier, planes)?;
-        Ok((texture, raw_fourcc))
-    }
-
     #[inline]
     pub fn from_single_plane(
         dmabuf_fd: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64,
     ) -> Result<Self, Error> {
         let planes = vec![PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into_boxed_slice();
-        let raw_fourcc = FourCC::from(fourcc);
+        let fourcc = FourCC::from(fourcc);
         let gdk_planes =
             [DmabufPlane { fd: planes[0].fd.as_raw_fd(), stride: planes[0].stride, offset: planes[0].offset }];
-        let (texture, fourcc) = Self::build_texture_with_fallback(width, height, raw_fourcc, modifier, &gdk_planes)?;
+        let texture = build_dmabuf_texture_planar(width, height, fourcc, modifier, &gdk_planes)?;
         Ok(Self { texture, planes, fourcc, modifier, width, height })
     }
 
@@ -77,12 +52,12 @@ impl GpuPassthrough {
             .zip(plane_offsets.iter().copied())
             .map(|((fd, stride), offset)| PlaneDesc { fd, stride, offset })
             .collect();
-        let raw_fourcc = FourCC::from(fourcc);
+        let fourcc = FourCC::from(fourcc);
         let gdk_planes: Box<[_]> = planes
             .iter()
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
-        let (texture, fourcc) = Self::build_texture_with_fallback(width, height, raw_fourcc, modifier, &gdk_planes)?;
+        let texture = build_dmabuf_texture_planar(width, height, fourcc, modifier, &gdk_planes)?;
         Ok(Self { texture, planes, fourcc, modifier, width, height })
     }
 

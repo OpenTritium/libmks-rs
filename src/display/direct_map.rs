@@ -1,6 +1,6 @@
 use super::{
     Error,
-    pixman_4cc::{FourCC, Pixman, sanitize_opaque_fourcc},
+    pixman_4cc::{FourCC, Pixman},
     udma::{DRM_FORMAT_MOD_LINEAR, Damage, DmabufPlane, build_dmabuf_texture_planar, create_udmabuf_fd},
 };
 use relm4::gtk::gdk::Texture;
@@ -98,7 +98,7 @@ impl ImportedTexture {
         }
 
         // Cache miss: Create new mapping and texture
-        let fourcc: FourCC = sanitize_opaque_fourcc(pixman.try_into()?);
+        let fourcc: FourCC = pixman.try_into()?;
         let buffer = DmabufImport::new(memfd, offset, width, height, stride, pixman)?;
         let plane = DmabufPlane { fd: buffer.as_raw_dmabuf_fd(), stride, offset: 0 };
         let texture = build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane])?;
