@@ -2,4 +2,5 @@
 /libmks
 /qemu-display
 
-/test_suit/livecd.iso
+/test_suit/*.iso
+/test_suit/**/*.iso
