@@ -232,9 +232,17 @@ impl Screen {
             }
             UpdateDmabuf { x, y, width, height } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
-                // DMABUF content is updated in-place by the producer.
-                // Rebuilding texture on every damage update can introduce extra overhead
-                // and visible trailing under high update rates.
+                // DMABUF content may be updated in-place. gdk::Texture is immutable,
+                // so recreate a lightweight wrapper to force GTK/GSK cache invalidation.
+                let GpuPassthrough(gpu) = &mut self.backend else {
+                    return Err(Error::State(
+                        "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf' (GpuPassthrough Backend \
+                         uninitialized)",
+                    ));
+                };
+                if let Err(e) = gpu.rebuild_texture() {
+                    mks_warn!(error:? = e; "Failed to rebuild DMABUF texture on update");
+                }
                 flags.frame = true;
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
