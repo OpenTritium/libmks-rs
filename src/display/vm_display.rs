@@ -783,7 +783,7 @@ impl Component for VmDisplayModel {
             HideCaptureHint => {
                 self.cancel_hint_timer();
                 self.hint_visible = false;
-                self.mark_cursor_dirty();
+                self.mark_frame_and_cursor_dirty();
             }
 
             UpdateCaptureView => {
@@ -814,7 +814,6 @@ impl Component for VmDisplayModel {
                     }
                     return;
                 }
-                // Sync call - try_send is non-blocking
                 self.input.press_mouse_button(button, pressed);
             }
 
@@ -824,7 +823,6 @@ impl Component for VmDisplayModel {
                 }
                 let steps = self.input.cache_mouse_scroll(dy);
                 if steps != 0 {
-                    // Sync call - try_send is non-blocking
                     self.input.scroll_mouse(steps);
                 }
             }
@@ -833,7 +831,6 @@ impl Component for VmDisplayModel {
                 if !self.capture_state.should_forward() {
                     return;
                 }
-                // Sync call - try_send is non-blocking
                 self.input.press_keyboard(keycode, pressed);
             }
 
