@@ -150,34 +150,98 @@ fn promote_current_thread_mouse_priority() {
     }
 }
 
+#[derive(Debug, Default)]
+enum PendingMove {
+    #[default]
+    None,
+    Abs {
+        x: u32,
+        y: u32,
+    },
+    Rel {
+        dx: i32,
+        dy: i32,
+    },
+}
+
+async fn flush_pending_move(proxy: &MouseProxy<'static>, pending_move: &mut PendingMove) {
+    match std::mem::take(pending_move) {
+        PendingMove::None => {}
+        PendingMove::Abs { x, y } => {
+            if let Err(e) = proxy.set_abs_position(x, y).await {
+                error!(error:? = e; "Mouse set_abs_position failed");
+            }
+        }
+        PendingMove::Rel { dx, dy } => {
+            if let Err(e) = proxy.rel_motion(dx, dy).await {
+                error!(error:? = e; "Mouse rel_motion failed");
+            }
+        }
+    }
+}
+
 async fn handle_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
     use Command::*;
 
     let fut = async move {
         promote_current_thread_mouse_priority();
-        while let Ok(cmd) = cmd_rx.recv().await {
-            match cmd {
-                SetAbsPosition { x, y } => {
-                    if let Err(e) = proxy.set_abs_position(x, y).await {
-                        error!(error:? = e; "Mouse set_abs_position failed");
+        while let Ok(mut cmd) = cmd_rx.recv().await {
+            let mut pending_move = PendingMove::None;
+            let mut rx_open = true;
+            loop {
+                match cmd {
+                    SetAbsPosition { x, y } => {
+                        if matches!(pending_move, PendingMove::Rel { .. }) {
+                            flush_pending_move(&proxy, &mut pending_move).await;
+                        }
+                        match &mut pending_move {
+                            PendingMove::None => pending_move = PendingMove::Abs { x, y },
+                            PendingMove::Abs { x: pending_x, y: pending_y } => {
+                                *pending_x = x;
+                                *pending_y = y;
+                            }
+                            PendingMove::Rel { .. } => unreachable!("Relative move must be flushed before abs"),
+                        }
+                    }
+                    RelMotion { dx, dy } => {
+                        if matches!(pending_move, PendingMove::Abs { .. }) {
+                            flush_pending_move(&proxy, &mut pending_move).await;
+                        }
+                        match &mut pending_move {
+                            PendingMove::None => pending_move = PendingMove::Rel { dx, dy },
+                            PendingMove::Rel { dx: pending_dx, dy: pending_dy } => {
+                                // Saturate at i32 bounds to avoid overflow under extreme backlog.
+                                *pending_dx = pending_dx.saturating_add(dx);
+                                *pending_dy = pending_dy.saturating_add(dy);
+                            }
+                            PendingMove::Abs { .. } => unreachable!("Absolute move must be flushed before relative"),
+                        }
+                    }
+                    Press(btn) => {
+                        flush_pending_move(&proxy, &mut pending_move).await;
+                        if let Err(e) = proxy.press(btn).await {
+                            error!(error:? = e; "Mouse press failed");
+                        }
+                    }
+                    Release(btn) => {
+                        flush_pending_move(&proxy, &mut pending_move).await;
+                        if let Err(e) = proxy.release(btn).await {
+                            error!(error:? = e; "Mouse release failed");
+                        }
                     }
                 }
-                RelMotion { dx, dy } => {
-                    // Virtio/modern HID path: forward the full relative delta directly.
-                    if let Err(e) = proxy.rel_motion(dx, dy).await {
-                        error!(error:? = e; "Mouse rel_motion failed");
+                match cmd_rx.try_recv_realtime() {
+                    Ok(Some(next_cmd)) => cmd = next_cmd,
+                    Ok(None) => break,
+                    Err(_) => {
+                        rx_open = false;
+                        break;
                     }
                 }
-                Press(btn) => {
-                    if let Err(e) = proxy.press(btn).await {
-                        error!(error:? = e; "Mouse press failed");
-                    }
-                }
-                Release(btn) => {
-                    if let Err(e) = proxy.release(btn).await {
-                        error!(error:? = e; "Mouse release failed");
-                    }
-                }
+            }
+            flush_pending_move(&proxy, &mut pending_move).await;
+            if !rx_open {
+                break;
             }
         }
     };
@@ -187,10 +251,18 @@ async fn handle_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{sync::Mutex, time::Duration};
     use zbus::interface;
 
-    /// Mock QEMU Mouse 状态
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedEvent {
+        Press(u32),
+        Release(u32),
+        Abs(u32, u32),
+        Rel(i32, i32),
+    }
+
+    /// Mock QEMU Mouse state
     struct MockState {
         is_absolute: bool,
         last_press: Option<u32>,
@@ -201,9 +273,10 @@ mod tests {
         release_count: u32,
         set_abs_count: u32,
         rel_motion_count: u32,
+        events: Vec<RecordedEvent>,
     }
 
-    /// Mock QEMU Mouse 服务
+    /// Mock QEMU Mouse service
     struct MockQemuMouse {
         state: std::sync::Arc<Mutex<MockState>>,
         notify: std::sync::Arc<tokio::sync::Notify>,
@@ -220,6 +293,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.last_press = Some(button);
             state.press_count += 1;
+            state.events.push(RecordedEvent::Press(button));
             self.notify.notify_waiters();
             Ok(())
         }
@@ -228,6 +302,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.last_release = Some(button);
             state.release_count += 1;
+            state.events.push(RecordedEvent::Release(button));
             self.notify.notify_waiters();
             Ok(())
         }
@@ -236,6 +311,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.last_abs_position = Some((x, y));
             state.set_abs_count += 1;
+            state.events.push(RecordedEvent::Abs(x, y));
             self.notify.notify_waiters();
             Ok(())
         }
@@ -244,6 +320,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.last_rel_motion = Some((dx, dy));
             state.rel_motion_count += 1;
+            state.events.push(RecordedEvent::Rel(dx, dy));
             self.notify.notify_waiters();
             Ok(())
         }
@@ -255,7 +332,7 @@ mod tests {
         }
     }
 
-    /// 搭建测试环境
+    /// Set up test environment.
     async fn setup_env() -> (zbus::Connection, std::sync::Arc<Mutex<MockState>>, std::sync::Arc<tokio::sync::Notify>) {
         use zbus::Guid;
 
@@ -269,6 +346,7 @@ mod tests {
             release_count: 0,
             set_abs_count: 0,
             rel_motion_count: 0,
+            events: vec![],
         }));
 
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -297,6 +375,19 @@ mod tests {
             .expect("Failed to build client connection");
 
         (client_conn, state, notify)
+    }
+
+    async fn wait_for_event_count(state: &std::sync::Arc<Mutex<MockState>>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.lock().unwrap().events.len() >= expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Timed out waiting for mouse events");
     }
 
     /// 连接与初始状态同步测试
@@ -376,10 +467,10 @@ mod tests {
         assert_eq!(state.lock().unwrap().last_rel_motion, Some((10, -5)));
     }
 
-    /// 实时路径测试
+    /// Realtime command path test.
     #[tokio::test]
     async fn test_mouse_realtime_path() {
-        let (conn, state, notify) = setup_env().await;
+        let (conn, state, _notify) = setup_env().await;
         let session =
             MouseSession::connect(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to create session");
 
@@ -388,28 +479,122 @@ mod tests {
         session.tx.rel_motion(10, 0).unwrap();
         session.tx.rel_motion(10, 0).unwrap();
         session.tx.rel_motion(10, 0).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let notified = notify.notified();
         session.tx.press(Button::Left).unwrap();
-        notified.await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let notified = notify.notified();
         session.tx.rel_motion(0, 50).unwrap();
-        notified.await;
+
+        wait_for_event_count(&state, 3).await;
 
         let s = state.lock().unwrap();
 
         assert_eq!(s.press_count, 1, "Press should be executed exactly once");
         assert_eq!(s.last_press, Some(0), "Press event should not be lost (Button::Left = 0)");
         assert_eq!(s.last_rel_motion, Some((0, 50)));
+        let press_idx =
+            s.events.iter().position(|event| *event == RecordedEvent::Press(0)).expect("Press event should exist");
         assert!(
-            s.rel_motion_count >= 3,
-            "Realtime path should avoid aggressive debouncing: got {}",
-            s.rel_motion_count
+            s.events[..press_idx].iter().any(|event| matches!(event, RecordedEvent::Rel(_, _))),
+            "Relative motion should be flushed before press barrier"
         );
+        assert!(
+            s.events[press_idx + 1..].contains(&RecordedEvent::Rel(0, 50)),
+            "Relative motion after press should be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abs_backlog_coalesces_to_last() {
+        let (conn, state, _notify) = setup_env().await;
+        let (cmd_tx, cmd_rx) = kanal::bounded_async::<Command>(8192);
+
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 10, y: 20 }).unwrap());
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 30, y: 40 }).unwrap());
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 50, y: 60 }).unwrap());
+        drop(cmd_tx);
+
+        let proxy = MouseProxy::new(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to build mouse proxy");
+        let handler = handle_mouse_commands(proxy, cmd_rx).await.expect("Failed to spawn mouse command handler");
+
+        wait_for_event_count(&state, 1).await;
+        handler.abort();
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.set_abs_count, 1, "Absolute backlog should coalesce to one update");
+        assert_eq!(s.last_abs_position, Some((50, 60)));
+        assert_eq!(s.events, vec![RecordedEvent::Abs(50, 60)]);
+    }
+
+    #[tokio::test]
+    async fn test_rel_backlog_coalesces_by_sum() {
+        let (conn, state, _notify) = setup_env().await;
+        let (cmd_tx, cmd_rx) = kanal::bounded_async::<Command>(8192);
+
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 10, dy: 5 }).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: -3, dy: 7 }).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 8, dy: -9 }).unwrap());
+        drop(cmd_tx);
+
+        let proxy = MouseProxy::new(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to build mouse proxy");
+        let handler = handle_mouse_commands(proxy, cmd_rx).await.expect("Failed to spawn mouse command handler");
+
+        wait_for_event_count(&state, 1).await;
+        handler.abort();
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.rel_motion_count, 1, "Relative backlog should coalesce to one update");
+        assert_eq!(s.last_rel_motion, Some((15, 3)));
+        assert_eq!(s.events, vec![RecordedEvent::Rel(15, 3)]);
+    }
+
+    #[tokio::test]
+    async fn test_button_is_barrier_for_move_flush() {
+        let (conn, state, _notify) = setup_env().await;
+        let (cmd_tx, cmd_rx) = kanal::bounded_async::<Command>(8192);
+
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 10, dy: 0 }).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 5, dy: 0 }).unwrap());
+        assert!(cmd_tx.try_send(Command::Press(Button::Left)).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 2, dy: 3 }).unwrap());
+        assert!(cmd_tx.try_send(Command::Release(Button::Left)).unwrap());
+        drop(cmd_tx);
+
+        let proxy = MouseProxy::new(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to build mouse proxy");
+        let handler = handle_mouse_commands(proxy, cmd_rx).await.expect("Failed to spawn mouse command handler");
+
+        wait_for_event_count(&state, 4).await;
+        handler.abort();
+
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.events,
+            vec![
+                RecordedEvent::Rel(15, 0),
+                RecordedEvent::Press(0),
+                RecordedEvent::Rel(2, 3),
+                RecordedEvent::Release(0)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_abs_rel_switch_flushes() {
+        let (conn, state, _notify) = setup_env().await;
+        let (cmd_tx, cmd_rx) = kanal::bounded_async::<Command>(8192);
+
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 1, y: 1 }).unwrap());
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 2, y: 2 }).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 3, dy: 4 }).unwrap());
+        assert!(cmd_tx.try_send(Command::RelMotion { dx: 1, dy: -2 }).unwrap());
+        assert!(cmd_tx.try_send(Command::SetAbsPosition { x: 50, y: 60 }).unwrap());
+        drop(cmd_tx);
+
+        let proxy = MouseProxy::new(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to build mouse proxy");
+        let handler = handle_mouse_commands(proxy, cmd_rx).await.expect("Failed to spawn mouse command handler");
+
+        wait_for_event_count(&state, 3).await;
+        handler.abort();
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.events, vec![RecordedEvent::Abs(2, 2), RecordedEvent::Rel(4, 2), RecordedEvent::Abs(50, 60)]);
     }
 
     /// Button 枚举测试
