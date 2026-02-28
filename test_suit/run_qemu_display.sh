@@ -1,94 +1,168 @@
 #!/bin/bash
 
-# Run QEMU with D-Bus display for the qemu_display example
-#
-# IMPORTANT: This script starts QEMU in a way that works with qemu_display example.
-# - Uses -display dbus (WITHOUT p2p=on) so QEMU registers on session D-Bus as "org.qemu"
-# - Does NOT use -nographic as it interferes with D-Bus display initialization
-# - The qemu_display example connects via "session" D-Bus address
-#
-# Usage:
-#   ./run_qemu_display.sh                          # Default: scanout + relative mouse
-#   ./run_qemu_display.sh scanout                 # Explicit scanout mode
-#   ./run_qemu_display.sh dmabuf2 absolute        # DMABUF2 mode + absolute mouse
-#   ./run_qemu_display.sh scanout relative        # Scanout mode + relative mouse
-#
-# Mouse mode:
-#   relative -> virtio-mouse-pci
-#   absolute -> usb-tablet
-#
-# In another terminal, run:
-#   cargo run --example qemu_display -- session [mode]
-
 # Configuration
 ISO_PATH="livecd.iso"
 RAM_SIZE="8G"
 CPU_CORES="8"
 
-# Parse command line arguments
-MODE="${1:-scanout}"
-MOUSE_MODE="${2:-relative}"
+# Default settings
+GPU_MODE="virtgpu"
+MOUSE_MODE="relative"
 
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-echo -e "${YELLOW}=== Starting QEMU with D-Bus Display ===${NC}"
-echo "Mode: $MODE"
-echo "Mouse mode: $MOUSE_MODE"
+# Print Help
+print_help() {
+    echo -e "${CYAN}Usage: $0 [OPTIONS]${NC}"
+    echo ""
+    echo "Options:"
+    echo "  -g, --gpu <mode>     Set GPU mode: ${YELLOW}vga, virtgpu, virtgpu-vulkan${NC} (default: $GPU_MODE)"
+    echo "  -m, --mouse <mode>   Set Mouse mode: ${YELLOW}relative, absolute${NC} (default: $MOUSE_MODE)"
+    echo "  -h, --help           Show this help message"
+    echo ""
+    echo "Mouse Drivers (Using Latest VirtIO):"
+    echo "  relative -> virtio-mouse-pci   (Best for gaming/FPS, sends raw dx/dy)"
+    echo "  absolute -> virtio-tablet-pci  (Best for UI/Desktop, perfectly syncs cursor)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 -g virtgpu -m relative"
+    echo "  $0 --gpu virtgpu-vulkan --mouse absolute"
+    exit 0
+}
 
-if [[ "$MOUSE_MODE" != "relative" && "$MOUSE_MODE" != "absolute" ]]; then
-    echo -e "${RED}Error: invalid mouse mode '$MOUSE_MODE'${NC}"
-    echo "Usage: $0 [scanout|dmabuf2] [relative|absolute]"
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -g|--gpu)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo -e "${RED}Error: Missing value for $1${NC}"
+                print_help
+            fi
+            GPU_MODE="$2"
+            shift 2
+            ;;
+        -m|--mouse)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo -e "${RED}Error: Missing value for $1${NC}"
+                print_help
+            fi
+            MOUSE_MODE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            print_help
+            ;;
+    esac
+done
+
+echo -e "${YELLOW}=== Starting QEMU with D-Bus Display ===${NC}"
+echo "GPU Mode:   $GPU_MODE"
+echo "Mouse Mode: $MOUSE_MODE"
+
+# -----------------------------------------------------------------------------
+# 1. Configure Mouse Arguments
+# -----------------------------------------------------------------------------
+if [[ "$MOUSE_MODE" == "absolute" ]]; then
+    # Modern virtio-tablet instead of legacy usb-tablet
+    MOUSE_ARGS=("-device" "virtio-tablet-pci")
+elif [[ "$MOUSE_MODE" == "relative" ]]; then
+    MOUSE_ARGS=("-device" "virtio-mouse-pci")
+else
+    echo -e "${RED}Error: Invalid mouse mode '$MOUSE_MODE'. Use 'relative' or 'absolute'.${NC}"
     exit 1
 fi
 
-if [[ "$MOUSE_MODE" == "absolute" ]]; then
-    MOUSE_DEVICE="usb-tablet"
-else
-    MOUSE_DEVICE="virtio-mouse-pci"
-fi
+# -----------------------------------------------------------------------------
+# 2. Configure GPU, Display, and Machine/Memory Arguments
+# -----------------------------------------------------------------------------
+# Base machine args (will be appended with shared memory if needed)
+MACHINE_ARGS=("-machine" "q35")
+MEMORY_ARGS=("-m" "$RAM_SIZE")
+DISPLAY_ARGS=()
+VGA_ARGS=()
 
-# Check if ISO file exists
+case "$GPU_MODE" in
+    vga)
+        # Standard basic VGA, no OpenGL, no shared memory required
+        DISPLAY_ARGS=("-display" "dbus")
+        VGA_ARGS=("-vga" "std")
+        ;;
+    virtgpu)
+        # VirtIO GPU with VirGL 3D (requires OpenGL on DBus and Shared Memory for DMABUF)
+        MACHINE_ARGS=("-machine" "q35,memory-backend=mem")
+        MEMORY_ARGS=("-object" "memory-backend-memfd,id=mem,size=$RAM_SIZE,share=on" "-m" "$RAM_SIZE")
+        DISPLAY_ARGS=("-display" "dbus,gl=on")
+        VGA_ARGS=("-device" "virtio-vga-gl,max_outputs=1,xres=1920,yres=1080")
+        ;;
+    virtgpu-vulkan)
+        # VirtIO GPU with Venus Vulkan support (Requires hostmem, blob, and Venus enabled)
+        MACHINE_ARGS=("-machine" "q35,memory-backend=mem")
+        MEMORY_ARGS=("-object" "memory-backend-memfd,id=mem,size=$RAM_SIZE,share=on" "-m" "$RAM_SIZE")
+        DISPLAY_ARGS=("-display" "dbus,gl=on")
+        # hostmem requires a size; blob=true and venus=on are required for Vulkan support.
+        VGA_ARGS=("-device" "virtio-vga-gl,max_outputs=1,xres=1920,yres=1080,blob=true,hostmem=4G,venus=on")
+        ;;
+    *)
+        echo -e "${RED}Error: Invalid GPU mode '$GPU_MODE'. Use 'vga', 'virtgpu', or 'virtgpu-vulkan'.${NC}"
+        exit 1
+        ;;
+esac
+
+# -----------------------------------------------------------------------------
+# 3. Pre-flight Checks & Cleanup
+# -----------------------------------------------------------------------------
 if [ ! -f "$ISO_PATH" ]; then
     echo -e "${RED}Error: ISO file $ISO_PATH not found${NC}"
     exit 1
 fi
 
 # Clean up any existing QEMU and free port 5900
-echo "Cleaning up..."
+echo "Cleaning up existing processes..."
 pkill -9 qemu-system-x86_64 2>/dev/null || true
-# Kill any process using port 5900
 fuser -k 5900/tcp 2>/dev/null || true
 sleep 1
 
-# Run QEMU with D-Bus display
-# Key: Without p2p=on, QEMU registers on D-Bus session bus as "org.qemu"
-# This allows qemu_display example to connect via "session" address
+# -----------------------------------------------------------------------------
+# 4. Build and Execute QEMU Command
+# -----------------------------------------------------------------------------
 echo -e "${GREEN}Starting QEMU...${NC}"
 echo "QEMU will register on D-Bus session bus as 'org.qemu'"
 echo ""
-echo "In another terminal, run:"
-echo "  cargo run --example qemu_display -- session $MODE"
+echo "In another terminal, run your rust client based on the mode you chose."
 
-qemu-system-x86_64 \
-    -m $RAM_SIZE \
-    -smp $CPU_CORES \
-    -cdrom $ISO_PATH \
-    -boot d \
-    -enable-kvm \
-    -display dbus \
-    -spice port=5900,disable-ticketing=on \
-    -device virtio-keyboard-pci \
-    -device virtio-vga,max_outputs=1,xres=1920,yres=1080 \
-    -usb \
-    -device $MOUSE_DEVICE \
-    -device usb-kbd \
-    -net nic,model=virtio \
-    -net user \
-    -k en-us \
+QEMU_CMD=(
+    qemu-system-x86_64
+    "${MACHINE_ARGS[@]}"
+    "${MEMORY_ARGS[@]}"
+    -smp "$CPU_CORES"
+    -cdrom "$ISO_PATH"
+    -boot d
+    -enable-kvm
+    "${DISPLAY_ARGS[@]}"
+    -spice port=5900,disable-ticketing=on
+    -device virtio-keyboard-pci
+    "${VGA_ARGS[@]}"
+    -usb
+    "${MOUSE_ARGS[@]}"
+    -device usb-kbd
+    -net nic,model=virtio
+    -net user
+    -k en-us
     -no-reboot
+)
+
+echo -e "${CYAN}Executing: ${QEMU_CMD[*]}${NC}"
+echo "------------------------------------------------------------------"
+
+"${QEMU_CMD[@]}"
 
 echo -e "${YELLOW}QEMU exited${NC}"

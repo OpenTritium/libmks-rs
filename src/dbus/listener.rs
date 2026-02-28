@@ -576,7 +576,7 @@ mod tests {
         let (tx, _rx) = kanal::bounded_async::<Event>(1);
         drop(_rx); // 立即关闭接收端
 
-        let listener = Listener { tx, ifaces: vec![IFACE_DISPLAY_LISTENER].into_boxed_slice() };
+        let listener = Listener::from_opts(Options::builder().with_dmabuf2(false).with_map(false).build(), tx);
 
         let result = listener.emit(Event::Disable).await;
 

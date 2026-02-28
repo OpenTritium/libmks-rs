@@ -40,8 +40,6 @@ pub struct WaylandState {
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     pointer_capture: PointerCapture,
-    rel_remainder_x: f64,
-    rel_remainder_y: f64,
     mouse_ctrl: Option<MouseController>,
 }
 
@@ -115,8 +113,6 @@ impl WaylandConfine {
             let relative = relative_manager.get_relative_pointer(pointer, &self.qh, ());
             let locked = constraints.lock_pointer(surface, pointer, None, Lifetime::Persistent, &self.qh, ());
             state.pointer_capture = PointerCapture::LockedRelative { locked, relative };
-            state.rel_remainder_x = 0.;
-            state.rel_remainder_y = 0.;
             info!("Pointer locked with native relative motion");
         } else {
             // Absolute guest mode path.
@@ -130,8 +126,6 @@ impl WaylandConfine {
                 constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.qh, ());
             region.destroy();
             state.pointer_capture = PointerCapture::Confined(confined);
-            state.rel_remainder_x = 0.;
-            state.rel_remainder_y = 0.;
             info!("Pointer confined with region mode (absolute guest mouse)");
         }
         drop(state);
@@ -158,8 +152,6 @@ impl WaylandConfine {
             }
             PointerCapture::None => {}
         }
-        state.rel_remainder_x = 0.;
-        state.rel_remainder_y = 0.;
 
         if released {
             if let Err(e) = self.conn.flush() {
@@ -269,12 +261,21 @@ impl Dispatch<ZwpRelativePointerV1, ()> for WaylandState {
             dy_unaccel: _,
         } = event
         {
-            let sum_x = state.rel_remainder_x + dx;
-            let sum_y = state.rel_remainder_y + dy;
-            let step_x = sum_x.trunc() as i32;
-            let step_y = sum_y.trunc() as i32;
-            state.rel_remainder_x = sum_x - f64::from(step_x);
-            state.rel_remainder_y = sum_y - f64::from(step_y);
+            #[inline]
+            fn quantize_realtime_delta(delta: f64) -> i32 {
+                if !delta.is_finite() || delta == 0.0 {
+                    return 0;
+                }
+                let rounded = delta.round();
+                if rounded == 0.0 {
+                    // Preserve tiny non-zero deltas instead of accumulating/skipping them.
+                    delta.signum() as i32
+                } else {
+                    rounded as i32
+                }
+            }
+            let step_x = quantize_realtime_delta(dx);
+            let step_y = quantize_realtime_delta(dy);
 
             if (step_x != 0 || step_y != 0)
                 && let Some(ctrl) = state.mouse_ctrl.as_ref()

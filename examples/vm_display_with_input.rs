@@ -44,7 +44,12 @@ impl SimpleComponent for AppModel {
         let input_handler = libmks_rs::display::input_handler::InputHandler::builder().build();
 
         let _display = VmDisplayModel::builder()
-            .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
+            .launch(VmDisplayInit {
+                rx,
+                console_ctrl,
+                input_handler,
+                grab_shortcut: GrabShortcut::default(),
+            })
             .detach();
 
         let display_widget = _display.widget().clone();

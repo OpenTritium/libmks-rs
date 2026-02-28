@@ -75,7 +75,12 @@ impl SimpleComponent for AppModel {
         let input_handler = InputHandler::builder().build();
 
         let display = VmDisplayModel::builder()
-            .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
+            .launch(VmDisplayInit {
+                rx,
+                console_ctrl,
+                input_handler,
+                grab_shortcut: GrabShortcut::default(),
+            })
             .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
         let display_widget = display.widget().clone();

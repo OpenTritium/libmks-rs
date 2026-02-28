@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -6,10 +7,10 @@ pub enum MksError {
     Dbus(#[from] zbus::Error),
 
     #[error("D-Bus method call failed: {0}")]
-    DbusMethod(String),
+    DbusMethod(Cow<'static, str>),
 
     #[error("D-Bus connection error: {0}")]
-    DbusConnection(String),
+    DbusConnection(Cow<'static, str>),
 
     #[error("Serialization error: {0}")]
     Zvariant(#[from] zvariant::Error),
@@ -18,19 +19,19 @@ pub enum MksError {
     Io(#[from] std::io::Error),
 
     #[error("Display error: {0}")]
-    Display(String),
+    Display(Cow<'static, str>),
 
     #[error("Input error: {0}")]
-    Input(String),
+    Input(Cow<'static, str>),
 
     #[error("Keyboard error: {0}")]
-    KeyboardError(String),
+    KeyboardError(Cow<'static, str>),
 
     #[error("Mouse error: {0}")]
-    MouseError(String),
+    MouseError(Cow<'static, str>),
 
     #[error("Screen error: {0}")]
-    ScreenError(String),
+    ScreenError(Cow<'static, str>),
 
     #[error("Not connected")]
     NotConnected,
@@ -39,10 +40,10 @@ pub enum MksError {
     NotAttached,
 
     #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(Cow<'static, str>),
 
     #[error("Protocol error: {0}")]
-    Protocol(String),
+    Protocol(Cow<'static, str>),
 
     #[error("Device not found")]
     DeviceNotFound,
@@ -52,18 +53,4 @@ pub enum MksError {
 
     #[error("Channel communication error: {0}")]
     KanalSend(#[from] kanal::SendError),
-}
-
-impl MksError {
-    pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            MksError::Io(_)
-                | MksError::Display(_)
-                | MksError::Input(_)
-                | MksError::ScreenError(_)
-                | MksError::KeyboardError(_)
-                | MksError::MouseError(_)
-        )
-    }
 }

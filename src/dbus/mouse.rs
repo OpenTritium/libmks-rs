@@ -1,10 +1,11 @@
 //! `DBus` proxy for QEMU Mouse interface.
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Mouse-section>
-use crate::{MksResult, generate_watcher, impl_controller, impl_session_connect};
+use crate::{MksResult, error::MksError, generate_watcher, impl_controller, impl_session_connect};
 use derive_more::{AsRef, Deref, From};
 use kanal::{AsyncReceiver, AsyncSender};
-use log::error;
+use log::{error, info, warn};
 use serde_repr::Serialize_repr;
+use std::hint::spin_loop;
 use tokio::task::AbortHandle;
 use zbus::{Result, proxy};
 use zvariant::Type;
@@ -86,15 +87,36 @@ pub struct MouseController(pub AsyncSender<Command>);
 impl_controller!(MouseController, Command, {
     pub fn press(button: Button) => Press(button);
     pub fn release(button: Button) => Release(button);
-    pub fn rel_motion(dx: i32, dy: i32) => RelMotion { dx, dy };
 });
 
 impl MouseController {
+    /// Spin tries for lock-free realtime send before falling back to regular try_send path.
+    const REALTIME_SEND_SPIN: usize = 8;
+
+    #[inline]
+    fn try_send_spin(&self, cmd: Command) -> MksResult<()> {
+        let mut pending = Some(cmd);
+        for _ in 0..Self::REALTIME_SEND_SPIN {
+            if self.0.try_send_option_realtime(&mut pending)? {
+                return Ok(());
+            }
+            spin_loop();
+        }
+        // Fallback to normal try_send path without blocking UI thread.
+        if self.0.try_send_option(&mut pending)? {
+            Ok(())
+        } else {
+            Err(MksError::MouseError("Mouse command queue contention: dropped realtime event".into()))
+        }
+    }
+
     #[inline]
     pub fn try_set_abs_position(&self, x: u32, y: u32) -> MksResult<()> {
-        self.0.try_send_realtime(Command::SetAbsPosition { x, y })?;
-        Ok(())
+        self.try_send_spin(Command::SetAbsPosition { x, y })
     }
+
+    #[inline]
+    pub fn rel_motion(&self, dx: i32, dy: i32) -> MksResult<()> { self.try_send_spin(Command::RelMotion { dx, dy }) }
 }
 
 impl_session_connect!(
@@ -104,7 +126,7 @@ impl_session_connect!(
     Command,
     Event,
     watch_proxy_changes,
-    debounce_mouse_commands,
+    handle_mouse_commands,
     8192
 );
 
@@ -118,60 +140,32 @@ generate_watcher!(
     }
 );
 
-async fn debounce_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
+#[inline]
+fn promote_current_thread_mouse_priority() {
+    use rustix::{process::setpriority_process, thread::gettid};
+    let tid = gettid();
+    match setpriority_process(Some(tid), -20) {
+        Ok(()) => info!("Mouse worker priority raised to highest (nice=-20)"),
+        Err(e) => warn!(error:? = e; "Failed to raise mouse worker priority (needs CAP_SYS_NICE/root)"),
+    }
+}
+
+async fn handle_mouse_commands(proxy: MouseProxy<'static>, cmd_rx: AsyncReceiver<Command>) -> MksResult<AbortHandle> {
     use Command::*;
 
-    /// QEMU/Guest OS 单次鼠标相对位移的安全阈值。
-    /// 标准的 PS/2 或 USB HID 鼠标协议单次位移极限通常是 [-127, 127]（8位有符号整数）。
-    /// 如果一次性发送超过此范围的值，Guest OS 驱动会将其截断，从而导致快速移动时丢失精度。
-    /// 这里取 100 作为安全阈值进行分块发送。
-    const MAX_REL_MOTION_STEP: i32 = 100;
-
     let fut = async move {
-        let mut pending_cmd: Option<Command> = None;
-        loop {
-            let cmd = if let Some(c) = pending_cmd.take() {
-                c
-            } else if let Ok(c) = cmd_rx.recv().await {
-                c
-            } else {
-                break;
-            };
+        promote_current_thread_mouse_priority();
+        while let Ok(cmd) = cmd_rx.recv().await {
             match cmd {
-                SetAbsPosition { mut x, mut y } => {
-                    while let Ok(Some(SetAbsPosition { x: nx, y: ny })) = cmd_rx.try_recv() {
-                        x = nx;
-                        y = ny;
-                    }
+                SetAbsPosition { x, y } => {
                     if let Err(e) = proxy.set_abs_position(x, y).await {
                         error!(error:? = e; "Mouse set_abs_position failed");
                     }
                 }
-                RelMotion { mut dx, mut dy } => {
-                    // 修复：使用更宽泛的模式匹配，避免意外吞掉其他类型的事件
-                    while let Ok(Some(next_cmd)) = cmd_rx.try_recv() {
-                        if let RelMotion { dx: ndx, dy: ndy } = next_cmd {
-                            dx += ndx;
-                            dy += ndy;
-                        } else {
-                            // 非 RelMotion 命令暂存，后续处理
-                            pending_cmd = Some(next_cmd);
-                            break;
-                        }
-                    }
-
-                    // 修复超大位移导致的 Guest OS 截断误差：
-                    // 如果累加的 dx/dy 超过单次协议允许的最大范围，必须切分成多个小块连续发送。
-                    while dx != 0 || dy != 0 {
-                        let step_dx = dx.clamp(-MAX_REL_MOTION_STEP, MAX_REL_MOTION_STEP);
-                        let step_dy = dy.clamp(-MAX_REL_MOTION_STEP, MAX_REL_MOTION_STEP);
-                        dx -= step_dx;
-                        dy -= step_dy;
-
-                        if let Err(e) = proxy.rel_motion(step_dx, step_dy).await {
-                            error!(error:? = e; "Mouse rel_motion failed");
-                            break; // 遇到 DBus 通信异常则跳出分块循环
-                        }
+                RelMotion { dx, dy } => {
+                    // Virtio/modern HID path: forward the full relative delta directly.
+                    if let Err(e) = proxy.rel_motion(dx, dy).await {
+                        error!(error:? = e; "Mouse rel_motion failed");
                     }
                 }
                 Press(btn) => {
@@ -382,9 +376,9 @@ mod tests {
         assert_eq!(state.lock().unwrap().last_rel_motion, Some((10, -5)));
     }
 
-    /// 防抖/合并逻辑测试
+    /// 实时路径测试
     #[tokio::test]
-    async fn test_mouse_debouncing() {
+    async fn test_mouse_realtime_path() {
         let (conn, state, notify) = setup_env().await;
         let session =
             MouseSession::connect(&conn, "/org/qemu/Display1/Mouse_0").await.expect("Failed to create session");
@@ -411,7 +405,11 @@ mod tests {
         assert_eq!(s.press_count, 1, "Press should be executed exactly once");
         assert_eq!(s.last_press, Some(0), "Press event should not be lost (Button::Left = 0)");
         assert_eq!(s.last_rel_motion, Some((0, 50)));
-        assert!(s.rel_motion_count < 3, "Debouncing should reduce calls: got {}", s.rel_motion_count);
+        assert!(
+            s.rel_motion_count >= 3,
+            "Realtime path should avoid aggressive debouncing: got {}",
+            s.rel_motion_count
+        );
     }
 
     /// Button 枚举测试
