@@ -101,6 +101,8 @@ pub enum RenderBackend {
     DirectMapped(ImportedTexture),
     GpuPassthrough {
         texture: Texture,
+        // GDK requires DMA-BUF fds to stay alive for at least as long as the texture.
+        _dmabuf_fds: Box<[OwnedFd]>,
         width: u32,
         height: u32,
     },
@@ -134,10 +136,11 @@ impl RenderBackend {
 pub struct Screen {
     pub cursor: CursorState,
     pub backend: RenderBackend,
+    warned_unhandled_y0_top: bool,
 }
 
 impl Screen {
-    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None } }
+    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, warned_unhandled_y0_top: false } }
 
     #[inline]
     pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
@@ -169,16 +172,31 @@ impl Screen {
                 swapchain.partial_update_texture(x, y, width, height, stride, pixman, &data)?;
                 flags.frame = true;
             }
-            ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top: _ } => {
+            ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
+                if y0_top && !self.warned_unhandled_y0_top {
+                    warn!(
+                        "QEMU reported y0_top=true for ScanoutDMABUF, but vertical origin conversion is not handled \
+                         yet; image may appear flipped"
+                    );
+                    self.warned_unhandled_y0_top = true;
+                }
                 let fd: OwnedFd = dmabuf.into();
                 let plane = DmabufPlane { fd: fd.as_raw_fd(), stride, offset: 0 };
                 let texture = build_dmabuf_texture_planar(width, height, FourCC::from(fourcc), modifier, &[plane])?;
-                self.backend = GpuPassthrough { texture, width, height };
+                self.backend = GpuPassthrough { texture, _dmabuf_fds: vec![fd].into_boxed_slice(), width, height };
                 flags.frame = true;
             }
-            ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, .. } => {
-                let fds = dmabuf.into_iter().map(OwnedFd::from);
+            ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
+                if y0_top && !self.warned_unhandled_y0_top {
+                    warn!(
+                        "QEMU reported y0_top=true for ScanoutDMABUF2, but vertical origin conversion is not handled \
+                         yet; image may appear flipped"
+                    );
+                    self.warned_unhandled_y0_top = true;
+                }
+                let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
                 let planes: Box<_> = fds
+                    .iter()
                     .zip(stride.iter())
                     .zip(offset.iter())
                     .map(|((fd, &stride), &offset)| DmabufPlane {
@@ -188,7 +206,7 @@ impl Screen {
                     })
                     .collect();
                 let texture = build_dmabuf_texture_planar(width, height, FourCC::from(fourcc), modifier, &planes)?;
-                self.backend = GpuPassthrough { texture, width, height };
+                self.backend = GpuPassthrough { texture, _dmabuf_fds: fds.into_boxed_slice(), width, height };
                 flags.frame = true;
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {

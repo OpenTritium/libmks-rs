@@ -15,7 +15,7 @@ use gdk4_wayland::{
     prelude::*,
 };
 use kanal::AsyncReceiver;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use relm4::{
     Component, ComponentParts, ComponentSender,
     gtk::{
@@ -297,7 +297,7 @@ impl Component for VmDisplayModel {
             capture_state: CaptureState::new(),
             requested_input_mode: InputMode::Seamless,
         };
-        let view_stack = Overlay::builder().hexpand(true).vexpand(true).build();
+        let view_stack = Overlay::builder().hexpand(true).vexpand(true).css_classes(["vm-display-bg"]).build();
         let vm_picture = Picture::builder()
             .can_shrink(true)
             .content_fit(ContentFit::Contain)
@@ -649,11 +649,94 @@ impl Component for VmDisplayModel {
             }
 
             Qemu(event) => {
-                if let Ok(flags) = self.screen.handle_event(event) {
-                    let (w, h) = self.screen.resolution();
-                    self.coord_system.set_vm_resolution(w, h);
-                    self.dirty_flags.cursor |= flags.cursor;
-                    self.dirty_flags.frame |= flags.frame;
+                match &event {
+                    QemuEvent::Scanout { width, height, stride, pixman_format, data } => {
+                        debug!(
+                            target: "mks.scanout",
+                            "Scanout: {}x{}, stride={}, pixman=0x{pixman_format:08x}, bytes={}",
+                            width,
+                            height,
+                            stride,
+                            data.len()
+                        );
+                    }
+                    QemuEvent::Update { x, y, width, height, stride, pixman_format, data } => {
+                        trace!(
+                            target: "mks.scanout",
+                            "Update: rect=({},{} {}x{}), stride={}, pixman=0x{pixman_format:08x}, bytes={}",
+                            x,
+                            y,
+                            width,
+                            height,
+                            stride,
+                            data.len()
+                        );
+                    }
+                    QemuEvent::ScanoutDmabuf { width, height, stride, fourcc, modifier, y0_top, .. } => {
+                        debug!(
+                            target: "mks.scanout",
+                            "ScanoutDMABUF: {}x{}, stride={}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, \
+                             y0_top={}",
+                            width,
+                            height,
+                            stride,
+                            y0_top
+                        );
+                    }
+                    QemuEvent::UpdateDmabuf { x, y, width, height } => {
+                        trace!(target: "mks.scanout", "UpdateDMABUF: rect=({},{} {}x{})", x, y, width, height);
+                    }
+                    QemuEvent::ScanoutDmabuf2 {
+                        x,
+                        y,
+                        width,
+                        height,
+                        num_planes,
+                        fourcc,
+                        modifier,
+                        backing_width,
+                        backing_height,
+                        ..
+                    } => {
+                        debug!(
+                            target: "mks.scanout",
+                            "ScanoutDMABUF2: rect=({},{} {}x{}), planes={}, fourcc=0x{fourcc:08x}, \
+                             modifier=0x{modifier:016x}, backing={}x{}",
+                            x,
+                            y,
+                            width,
+                            height,
+                            num_planes,
+                            backing_width,
+                            backing_height
+                        );
+                    }
+                    QemuEvent::ScanoutMap { offset, width, height, stride, pixman_format, .. } => {
+                        debug!(
+                            target: "mks.scanout",
+                            "ScanoutMap: {}x{}, stride={}, offset={}, pixman=0x{pixman_format:08x}",
+                            width,
+                            height,
+                            stride,
+                            offset
+                        );
+                    }
+                    QemuEvent::UpdateMap { x, y, width, height } => {
+                        trace!(target: "mks.scanout", "UpdateMap: rect=({},{} {}x{})", x, y, width, height);
+                    }
+                    _ => {}
+                }
+
+                match self.screen.handle_event(event) {
+                    Ok(flags) => {
+                        let (w, h) = self.screen.resolution();
+                        self.coord_system.set_vm_resolution(w, h);
+                        self.dirty_flags.cursor |= flags.cursor;
+                        self.dirty_flags.frame |= flags.frame;
+                    }
+                    Err(e) => {
+                        warn!(target: "mks.scanout", "Failed to handle display event: {e}");
+                    }
                 }
             }
 
@@ -782,6 +865,9 @@ impl Component for VmDisplayModel {
         }
         if self.dirty_flags.frame {
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
+            // DMABUF Update events often mutate the same underlying texture object.
+            // Explicit redraw is needed even when paintable identity does not change.
+            widgets.vm_picture.queue_draw();
         }
         if self.dirty_flags.cursor || self.dirty_flags.frame {
             let cursor = &self.screen.cursor;

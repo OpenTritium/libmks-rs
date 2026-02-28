@@ -15,3 +15,8 @@
 .toast-hidden {
     opacity: 0;
 }
+
+.vm-display-bg {
+    background-color: #101214;
+    color: #f2f2f2;
+}

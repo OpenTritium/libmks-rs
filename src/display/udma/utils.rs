@@ -83,7 +83,8 @@ pub fn create_udmabuf_fd(memfd: &impl AsFd, offset: u64, size: u64) -> io::Resul
 ///
 /// # Safety
 /// * Caller guarantees all `planes` contain valid FDs.
-/// * GDK duplicates (dups) these FDs internally; **caller retains ownership** of the originals.
+/// * FDs must remain open for at least as long as the returned texture.
+///   If you need callback-based release, use GDK's `build_with_release_func`.
 #[inline]
 pub fn build_dmabuf_texture_planar(
     width: u32, height: u32, fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],

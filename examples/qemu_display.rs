@@ -359,10 +359,11 @@ impl SimpleComponent for AppModel {
 
 /// Listener mode - determines what capabilities we advertise to QEMU
 ///
-/// Three levels of D-Bus Display capabilities:
+/// Four levels of D-Bus Display capabilities:
 /// - Scanout: Core interface only, QEMU sends framebuffer via D-Bus
 /// - ScanoutDMABUF: Core + single-plane DMA-BUF (always enabled in core)
 /// - ScanoutDMABUF2: Core + single-plane + multi-plane DMA-BUF
+/// - ScanoutMap: Core + Unix.Map shared-memory scanout
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListenerMode {
     /// Basic scanout mode - QEMU sends framebuffer via D-Bus (may still use single-plane DMABUF)
@@ -372,16 +373,19 @@ pub enum ListenerMode {
     ScanoutDMABUF,
     /// Full DMABUF support - multi-plane DMA-BUF enabled
     ScanoutDMABUF2,
+    /// Shared-memory map support via org.qemu.Display1.Listener.Unix.Map
+    ScanoutMap,
 }
 
 impl ListenerMode {
-    const CLI_MODES: &'static str = "scanout | scanoutdmabuf | scanoutdmabuf2";
+    const CLI_MODES: &'static str = "scanout | scanoutdmabuf | scanoutdmabuf2 | scanoutmap";
 
     fn parse_cli(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "scanout" => Some(Self::Scanout),
             "scanoutdmabuf" | "dmabuf" => Some(Self::ScanoutDMABUF),
             "scanoutdmabuf2" | "dmabuf2" | "gl" => Some(Self::ScanoutDMABUF2),
+            "scanoutmap" | "scnoutmap" | "map" => Some(Self::ScanoutMap),
             _ => None,
         }
     }
@@ -398,6 +402,7 @@ fn print_usage(bin: &str) {
     eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", bin);
     eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf", bin);
     eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutmap", bin);
 }
 
 /// Connect to QEMU and return the event receiver for display updates.
@@ -412,7 +417,7 @@ fn print_usage(bin: &str) {
 /// - keyboard: Option<(KeyboardController, KeyboardSession)>
 /// - event_rx: Receiver for display events (to pass to VmDisplayModel)
 async fn connect_to_qemu(
-    socket_path: std::path::PathBuf, _mode: ListenerMode,
+    socket_path: std::path::PathBuf, mode: ListenerMode,
 ) -> anyhow::Result<(
     AppResources,
     ConsoleController,
@@ -576,9 +581,10 @@ async fn connect_to_qemu(
     info!("Creating listener D-Bus connection...");
 
     // Create listener handler
-    let enable_dmabuf2 = _mode == ListenerMode::ScanoutDMABUF2;
-    let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(false).build();
-    info!("Listener mode: {:?}, DMABUF2: {}", _mode, enable_dmabuf2);
+    let enable_dmabuf2 = mode == ListenerMode::ScanoutDMABUF2;
+    let enable_map = mode == ListenerMode::ScanoutMap;
+    let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(enable_map).build();
+    info!("Listener mode: {:?}, DMABUF2: {}, MAP: {}", mode, enable_dmabuf2, enable_map);
 
     // Use kanal AsyncSender directly
     // Use .serve_at() to register object before .build()
