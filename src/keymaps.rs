@@ -11,7 +11,7 @@ pub const fn xorg_keycode_to_qnum(keycode: u32) -> u32 {
     XORG_EVDEV_TO_QNUM[idx] as u32
 }
 
-#[derive(Debug, From, Into, Type, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into, Type, Serialize)]
 pub struct Qnum(u32);
 
 impl Qnum {

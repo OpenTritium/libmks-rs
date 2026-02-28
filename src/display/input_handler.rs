@@ -1,13 +1,14 @@
 use super::coordinate::Coordinate;
 use crate::{
     dbus::{
-        keyboard::{KeyboardController, KeyboardSession},
+        keyboard::{KeyboardController, KeyboardSession, PressAction},
         mouse::{Button, MouseController, MouseSession},
         multitouch::{Kind, MultiTouchController, MultiTouchSession},
     },
     keymaps::Qnum,
     mks_debug, mks_error, mks_warn,
 };
+use std::collections::HashSet;
 use typed_builder::TypedBuilder;
 
 const LOG_TARGET: &str = "mks.display.input";
@@ -24,6 +25,8 @@ pub struct InputHandler {
     pub multitouch: Option<(MultiTouchController, MultiTouchSession)>,
     #[builder(default = true)]
     pub is_absolute: bool,
+    #[builder(default)]
+    held_keys: HashSet<Qnum>,
 }
 
 impl InputHandler {
@@ -88,19 +91,47 @@ impl InputHandler {
     }
 
     /// 处理键盘事件
-    pub fn press_keyboard(&self, keycode: u32, pressed: bool) {
-        let Some(ctrl) = self.keyboard_ctrl() else {
+    pub fn press_keyboard(&mut self, keycode: u32, transition: PressAction) {
+        let Some(ctrl) = self.keyboard_ctrl().cloned() else {
             mks_warn!("No keyboard controller available");
             return;
         };
         let qnum = Qnum::from_xorg_keycode(keycode);
-        let Err(e) = (if pressed { ctrl.press(qnum) } else { ctrl.release(qnum) }) else {
+        if u32::from(qnum) == 0 {
+            mks_warn!("Unmapped keyboard keycode {keycode}, ignore");
             return;
+        }
+        let result = match transition {
+            PressAction::Press => ctrl.press(qnum),
+            PressAction::Release => ctrl.release(qnum),
         };
-        mks_error!(error:? = e; "Failed to {} keyboard key", if pressed { "press" } else { "release" });
+        match result {
+            Ok(()) => match transition {
+                PressAction::Press => {
+                    self.held_keys.insert(qnum);
+                }
+                PressAction::Release => {
+                    self.held_keys.remove(&qnum);
+                }
+            },
+            Err(e) => {
+                mks_error!(error:? = e; "Failed to {transition} keyboard key");
+            }
+        }
     }
 
-    pub fn press_mouse_button(&self, button: u32, pressed: bool) {
+    /// Releases all tracked keyboard keys to prevent stuck modifiers when capture is dropped.
+    pub fn release_all_keys(&mut self) {
+        let ctrl = self.keyboard_ctrl().cloned();
+        for qnum in self.held_keys.drain() {
+            let Some(ctrl) = &ctrl else { continue };
+            if let Err(e) = ctrl.release(qnum) {
+                mks_error!(error:? = e; "Failed to release keyboard key during capture reset");
+            }
+        }
+    }
+
+    pub fn press_mouse_button(&self, button: u32, transition: PressAction) {
         let Some(ctrl) = self.mouse_ctrl() else {
             mks_warn!("No mouse controller available");
             return;
@@ -109,10 +140,13 @@ impl InputHandler {
             mks_warn!("Unmapped mouse button {button}, ignore");
             return;
         };
-        let Err(e) = (if pressed { ctrl.press(btn) } else { ctrl.release(btn) }) else {
-            return;
+        let result = match transition {
+            PressAction::Press => ctrl.press(btn),
+            PressAction::Release => ctrl.release(btn),
         };
-        mks_error!(error:? = e; "Failed to {} mouse button", if pressed { "press" } else { "release" });
+        if let Err(e) = result {
+            mks_error!(error:? = e; "Failed to {transition} mouse button");
+        }
     }
 
     /// 处理触摸事件

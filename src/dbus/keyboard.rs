@@ -4,6 +4,7 @@ use crate::{generate_handler, generate_watcher, impl_controller, impl_session_co
 use bitflags::bitflags;
 use derive_more::{AsRef, Deref, From};
 use kanal::AsyncSender;
+use std::fmt;
 use zbus::{Result, proxy};
 
 #[proxy(interface = "org.qemu.Display1.Keyboard", default_service = "org.qemu", gen_blocking = false)]
@@ -27,6 +28,22 @@ pub trait Keyboard {
 pub enum Command {
     Press(Qnum),
     Release(Qnum),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressAction {
+    Press,
+    Release,
+}
+
+impl fmt::Display for PressAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let action = match self {
+            Self::Press => "press",
+            Self::Release => "release",
+        };
+        f.write_str(action)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deref, AsRef)]

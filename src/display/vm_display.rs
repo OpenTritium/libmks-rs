@@ -6,7 +6,7 @@ use super::{
     wayland_confine::WaylandConfine,
 };
 use crate::{
-    dbus::{console::ConsoleController, listener::Event as QemuEvent, mouse::MouseController},
+    dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent, mouse::MouseController},
     mks_debug, mks_error, mks_info, mks_warn,
 };
 use gdk4_wayland::{
@@ -33,8 +33,6 @@ const INCH_TO_MM: f32 = 25.4;
 const DEFAULT_DPI: f32 = 96.;
 const DEFAULT_PIXEL_PITCH_MM: f32 = INCH_TO_MM / DEFAULT_DPI;
 const TOAST_DURATION_SECS: u64 = 3;
-// GTK uses -1 as a sentinel meaning "unset size request" / use natural size.
-const UNSET_SIZE_REQUEST: i32 = -1;
 const RELATIVE_SEAMLESS_UNSUPPORTED_TOAST: &str =
     "Relative mouse mode does not support seamless capture. Switch to confined mode manually.";
 const CONFINED_CAPTURE_UNAVAILABLE_TOAST: &str =
@@ -152,9 +150,9 @@ pub enum Message {
     Qemu(QemuEvent),
     CanvasResize { logical_width: f32, logical_height: f32 },
     MouseMove { x: f32, y: f32 },
-    MouseButton { button: u32, pressed: bool },
+    MouseButton { button: u32, transition: PressAction },
     Scroll { dy: f64 },
-    Key { keyval: u32, keycode: u32, pressed: bool },
+    Key { keyval: u32, keycode: u32, transition: PressAction },
     UpdateMonitorInfo { pixel_pitch_mm: f32 },
     SetScalingMode(ScalingMode),
     SetConfined(CaptureEvent),
@@ -290,11 +288,6 @@ impl VmDisplayModel {
                 };
                 widgets.vm_fixed.set_child_transform(&widgets.offload, Some(&matrix));
             } else {
-                if widgets.offload.width_request() != UNSET_SIZE_REQUEST
-                    || widgets.offload.height_request() != UNSET_SIZE_REQUEST
-                {
-                    widgets.offload.set_size_request(UNSET_SIZE_REQUEST, UNSET_SIZE_REQUEST);
-                }
                 widgets.vm_fixed.set_child_transform(&widgets.offload, None);
             }
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
@@ -469,11 +462,11 @@ impl Component for VmDisplayModel {
         click.connect_pressed(move |gesture, _, x, y| {
             input_plane_click.grab_focus();
             sender_clone.input(Message::SetConfined(CaptureEvent::Capture { click_pos: Some((x as f32, y as f32)) }));
-            sender_clone.input(MouseButton { button: gesture.current_button(), pressed: true });
+            sender_clone.input(MouseButton { button: gesture.current_button(), transition: PressAction::Press });
         });
         let sender_clone = sender.clone();
         click.connect_released(move |gesture, _, _, _| {
-            sender_clone.input(MouseButton { button: gesture.current_button(), pressed: false });
+            sender_clone.input(MouseButton { button: gesture.current_button(), transition: PressAction::Release });
         });
         input_plane.add_controller(click.clone());
         controllers.push(click.upcast());
@@ -496,13 +489,13 @@ impl Component for VmDisplayModel {
                 return Propagation::Stop;
             }
             let keyval_raw: u32 = keyval.into_glib();
-            sender_for_key.input(Key { keyval: keyval_raw, keycode, pressed: true });
+            sender_for_key.input(Key { keyval: keyval_raw, keycode, transition: PressAction::Press });
             Propagation::Stop
         });
         let sender_clone = sender.clone();
         key.connect_key_released(move |_, keyval, keycode, _| {
             let keyval_raw: u32 = keyval.into_glib();
-            sender_clone.input(Key { keyval: keyval_raw, keycode, pressed: false });
+            sender_clone.input(Key { keyval: keyval_raw, keycode, transition: PressAction::Release });
         });
         root.add_controller(key.clone());
         controllers.push(key.upcast());
@@ -797,15 +790,15 @@ impl Component for VmDisplayModel {
                 self.mark_cursor_dirty();
             }
 
-            MouseButton { button, pressed } => {
+            MouseButton { button, transition } => {
                 if self.requested_input_mode == InputMode::Seamless
                     && self.input_mode() == InputMode::Seamless
                     && !self.input.is_absolute
                 {
-                    if pressed {
+                    if transition == PressAction::Press {
                         mks_warn!(
                             "Ignoring mouse click in seamless mode while guest mouse is relative: button={button}, \
-                             pressed={pressed}"
+                             transition={transition}"
                         );
                         self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());
                     }
@@ -815,13 +808,13 @@ impl Component for VmDisplayModel {
                     && !self.input.is_absolute
                     && !self.capture_state.should_forward()
                 {
-                    if pressed {
+                    if transition == PressAction::Press {
                         mks_warn!("Ignoring mouse click before confined relative capture is established");
                         self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
                     }
                     return;
                 }
-                self.input.press_mouse_button(button, pressed);
+                self.input.press_mouse_button(button, transition);
             }
 
             Scroll { dy } => {
@@ -834,11 +827,11 @@ impl Component for VmDisplayModel {
                 }
             }
 
-            Key { keyval: _, keycode, pressed } => {
+            Key { keyval: _, keycode, transition } => {
                 if !self.capture_state.should_forward() {
                     return;
                 }
-                self.input.press_keyboard(keycode, pressed);
+                self.input.press_keyboard(keycode, transition);
             }
 
             UpdateMonitorInfo { pixel_pitch_mm } => {
@@ -849,6 +842,54 @@ impl Component for VmDisplayModel {
                 let mode_str = if is_absolute { "absolute" } else { "relative" };
                 mks_info!("Guest mouse mode changed: {}", mode_str);
                 self.input.set_mouse_mode(is_absolute);
+                if self.input_mode() == InputMode::Confined && self.capture_state.should_forward() {
+                    let native = self.input_overlay.native();
+                    let widget_rect = if let Some(native) = &native
+                        && let Some(bounds) = self.input_overlay.compute_bounds(native)
+                    {
+                        Rectangle::new(
+                            bounds.x().floor() as i32,
+                            bounds.y().floor() as i32,
+                            bounds.width().ceil() as i32,
+                            bounds.height().ceil() as i32,
+                        )
+                    } else {
+                        Rectangle::new(0, 0, 0, 0)
+                    };
+                    let Some(proxy) = native
+                        .and_then(|n| n.surface())
+                        .and_then(|s| s.downcast::<WaylandSurface>().ok())
+                        .and_then(|ws| ws.wl_surface())
+                    else {
+                        mks_warn!("Failed to get wl_surface proxy while switching mouse mode");
+                        return;
+                    };
+                    let prefer_relative = !is_absolute;
+                    let recapture_ok = self.confine_state.as_mut().is_some_and(|confine| {
+                        confine.wayland_confine.borrow_mut().unconfine();
+                        let ok =
+                            confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect, prefer_relative);
+                        confine.is_captured = ok;
+                        ok
+                    });
+                    if recapture_ok {
+                        mks_info!(
+                            "Reconfigured confined pointer capture for {} guest mouse mode",
+                            if prefer_relative { "relative" } else { "absolute" }
+                        );
+                    } else {
+                        mks_warn!("Failed to reconfigure confined pointer after mouse mode switch");
+                        self.capture_state.on_release();
+                        self.cancel_hint_timer();
+                        self.hint_visible = false;
+                        if prefer_relative {
+                            self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
+                        } else {
+                            self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
+                        }
+                        sender.input(UpdateCaptureView);
+                    }
+                }
                 if !is_absolute
                     && self.requested_input_mode == InputMode::Seamless
                     && self.input_mode() == InputMode::Seamless
@@ -870,7 +911,11 @@ impl Component for VmDisplayModel {
     fn update_with_view(
         &mut self, widgets: &mut Self::Widgets, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root,
     ) {
+        let was_forwarding_input = self.capture_state.should_forward();
         self.update(message, sender, root);
+        if was_forwarding_input && !self.capture_state.should_forward() {
+            self.input.release_all_keys();
+        }
         let dirty_flags = mem::take(&mut self.dirty_flags);
         self.render_view(widgets, dirty_flags);
     }
