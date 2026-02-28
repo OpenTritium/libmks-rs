@@ -254,6 +254,37 @@ pub use pixman::Pixman;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Display)]
 pub struct UnknownPixmanFormat;
 
+/// Maps alpha-bearing RGB formats to their opaque "X" counterparts when compatible.
+///
+/// This helps avoid unintended composition with transparent guest content on DMABUF paths.
+#[inline]
+pub const fn sanitize_opaque_fourcc(fourcc: drm_4cc::FourCC) -> drm_4cc::FourCC {
+    match fourcc {
+        drm_4cc::ARGB4444 => drm_4cc::XRGB4444,
+        drm_4cc::ABGR4444 => drm_4cc::XBGR4444,
+        drm_4cc::RGBA4444 => drm_4cc::RGBX4444,
+        drm_4cc::BGRA4444 => drm_4cc::BGRX4444,
+        drm_4cc::ARGB1555 => drm_4cc::XRGB1555,
+        drm_4cc::ABGR1555 => drm_4cc::XBGR1555,
+        drm_4cc::RGBA5551 => drm_4cc::RGBX5551,
+        drm_4cc::BGRA5551 => drm_4cc::BGRX5551,
+        drm_4cc::ARGB8888 => drm_4cc::XRGB8888,
+        drm_4cc::ABGR8888 => drm_4cc::XBGR8888,
+        drm_4cc::RGBA8888 => drm_4cc::RGBX8888,
+        drm_4cc::BGRA8888 => drm_4cc::BGRX8888,
+        drm_4cc::ARGB2101010 => drm_4cc::XRGB2101010,
+        drm_4cc::ABGR2101010 => drm_4cc::XBGR2101010,
+        drm_4cc::RGBA1010102 => drm_4cc::RGBX1010102,
+        drm_4cc::BGRA1010102 => drm_4cc::BGRX1010102,
+        drm_4cc::ARGB16161616 => drm_4cc::XRGB16161616,
+        drm_4cc::ABGR16161616 => drm_4cc::XBGR16161616,
+        drm_4cc::ARGB16161616F => drm_4cc::XRGB16161616F,
+        drm_4cc::ABGR16161616F => drm_4cc::XBGR16161616F,
+        drm_4cc::AVUY8888 => drm_4cc::XVUY8888,
+        _ => fourcc,
+    }
+}
+
 impl TryFrom<Pixman> for drm_4cc::FourCC {
     type Error = UnknownPixmanFormat;
 
@@ -373,5 +404,23 @@ mod tests {
         assert_ne!(alpha, no_alpha);
         assert_eq!(alpha, drm_4cc::ARGB8888);
         assert_eq!(no_alpha, drm_4cc::XRGB8888);
+    }
+
+    #[test]
+    fn test_sanitize_opaque_fourcc_converts_alpha_formats() {
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB8888), drm_4cc::XRGB8888);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ABGR8888), drm_4cc::XBGR8888);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGBA8888), drm_4cc::RGBX8888);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::BGRA8888), drm_4cc::BGRX8888);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB2101010), drm_4cc::XRGB2101010);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB16161616F), drm_4cc::XRGB16161616F);
+    }
+
+    #[test]
+    fn test_sanitize_opaque_fourcc_keeps_opaque_formats() {
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XRGB8888), drm_4cc::XRGB8888);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XBGR2101010), drm_4cc::XBGR2101010);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::YUYV), drm_4cc::YUYV);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGB565), drm_4cc::RGB565);
     }
 }

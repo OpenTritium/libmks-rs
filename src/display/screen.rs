@@ -1,5 +1,8 @@
 //! 屏幕和鼠标的 model
-use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
+use super::{
+    gpu_passthrough::GpuPassthrough,
+    pixman_4cc::{FourCC, Pixman, sanitize_opaque_fourcc},
+};
 use crate::{
     dbus::listener::Event,
     display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
@@ -176,11 +179,33 @@ impl Screen {
                     "ScanoutDMABUF: {width}x{height}, stride={stride}, fourcc=0x{fourcc:08x}, \
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
-                self.y0_top = y0_top;
+                let raw_fourcc = FourCC::from(fourcc);
+                let sanitized_fourcc = sanitize_opaque_fourcc(raw_fourcc);
+                if sanitized_fourcc != raw_fourcc {
+                    let raw = u32::from(raw_fourcc);
+                    let sanitized = u32::from(sanitized_fourcc);
+                    mks_trace!(
+                        "ScanoutDMABUF fourcc sanitize candidate: raw=0x{raw:08x} -> opaque=0x{sanitized:08x}, \
+                         modifier=0x{modifier:016x}"
+                    );
+                }
                 let fd: OwnedFd = dmabuf.into();
-                self.backend =
-                    GpuPassthrough(GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier)?);
-                flags.frame = true;
+                match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
+                    Ok(gpu) => {
+                        self.y0_top = y0_top;
+                        self.backend = GpuPassthrough(gpu);
+                        flags.frame = true;
+                    }
+                    Err(e) => {
+                        let raw = u32::from(raw_fourcc);
+                        let sanitized = u32::from(sanitized_fourcc);
+                        mks_warn!(
+                            error:? = e;
+                            "Failed to import ScanoutDMABUF (raw_fourcc=0x{raw:08x}, \
+                             sanitized_fourcc=0x{sanitized:08x}, modifier=0x{modifier:016x}); keeping previous frame"
+                        );
+                    }
+                }
             }
             ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
                 let planes = dmabuf.len();
@@ -188,20 +213,35 @@ impl Screen {
                     "ScanoutDMABUF2: {width}x{height}, planes={planes}, fourcc=0x{fourcc:08x}, \
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
-                self.y0_top = y0_top;
+                let raw_fourcc = FourCC::from(fourcc);
+                let sanitized_fourcc = sanitize_opaque_fourcc(raw_fourcc);
+                if sanitized_fourcc != raw_fourcc {
+                    let raw = u32::from(raw_fourcc);
+                    let sanitized = u32::from(sanitized_fourcc);
+                    mks_trace!(
+                        "ScanoutDMABUF2 fourcc sanitize candidate: raw=0x{raw:08x} -> opaque=0x{sanitized:08x}, \
+                         modifier=0x{modifier:016x}"
+                    );
+                }
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
                 let offsets_u32: Box<[u32]> =
                     offset.iter().map(|&v| u32::try_from(v).expect("offset exceeds u32::MAX")).collect();
-                self.backend = GpuPassthrough(GpuPassthrough::from_multi_plane(
-                    fds,
-                    width,
-                    height,
-                    stride,
-                    &offsets_u32,
-                    fourcc,
-                    modifier,
-                )?);
-                flags.frame = true;
+                match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offsets_u32, fourcc, modifier) {
+                    Ok(gpu) => {
+                        self.y0_top = y0_top;
+                        self.backend = GpuPassthrough(gpu);
+                        flags.frame = true;
+                    }
+                    Err(e) => {
+                        let raw = u32::from(raw_fourcc);
+                        let sanitized = u32::from(sanitized_fourcc);
+                        mks_warn!(
+                            error:? = e;
+                            "Failed to import ScanoutDMABUF2 (raw_fourcc=0x{raw:08x}, \
+                             sanitized_fourcc=0x{sanitized:08x}, modifier=0x{modifier:016x}); keeping previous frame"
+                        );
+                    }
+                }
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
                 mks_trace!(

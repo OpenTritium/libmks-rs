@@ -33,6 +33,8 @@ const INCH_TO_MM: f32 = 25.4;
 const DEFAULT_DPI: f32 = 96.;
 const DEFAULT_PIXEL_PITCH_MM: f32 = INCH_TO_MM / DEFAULT_DPI;
 const TOAST_DURATION_SECS: u64 = 3;
+// GTK uses -1 as a sentinel meaning "unset size request" / use natural size.
+const UNSET_SIZE_REQUEST: i32 = -1;
 const RELATIVE_SEAMLESS_UNSUPPORTED_TOAST: &str =
     "Relative mouse mode does not support seamless capture. Switch to confined mode manually.";
 const CONFINED_CAPTURE_UNAVAILABLE_TOAST: &str =
@@ -46,7 +48,7 @@ fn ensure_css_loaded() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let provider = CssProvider::new();
-        provider.load_from_string(include_str!("capture-hint.css"));
+        provider.load_from_string(include_str!("vm-display.css"));
         if let Some(display) = Display::default() {
             style_context_add_provider_for_display(&display, &provider, STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
@@ -275,18 +277,24 @@ impl VmDisplayModel {
             return;
         }
         if dirty_flags.frame {
-            let canvas_w = widgets.input_overlay.width();
-            let canvas_h = widgets.input_overlay.height();
-            if canvas_w > 0
-                && canvas_h > 0
-                && (widgets.offload.width_request() != canvas_w || widgets.offload.height_request() != canvas_h)
-            {
-                widgets.offload.set_size_request(canvas_w, canvas_h);
-            }
-            if self.screen.y0_top && canvas_h > 0 {
-                let matrix = Transform::new().translate(&Point::new(0., canvas_h as f32)).scale(1., -1.);
+            if let Some((offset_x, offset_y, viewport_w, viewport_h)) = self.coord_system.vm_display_bounds() {
+                let req_w = viewport_w.ceil().max(1.) as i32;
+                let req_h = viewport_h.ceil().max(1.) as i32;
+                if widgets.offload.width_request() != req_w || widgets.offload.height_request() != req_h {
+                    widgets.offload.set_size_request(req_w, req_h);
+                }
+                let matrix = if self.screen.y0_top {
+                    Transform::new().translate(&Point::new(offset_x, offset_y + viewport_h)).scale(1., -1.)
+                } else {
+                    Transform::new().translate(&Point::new(offset_x, offset_y))
+                };
                 widgets.vm_fixed.set_child_transform(&widgets.offload, Some(&matrix));
             } else {
+                if widgets.offload.width_request() != UNSET_SIZE_REQUEST
+                    || widgets.offload.height_request() != UNSET_SIZE_REQUEST
+                {
+                    widgets.offload.set_size_request(UNSET_SIZE_REQUEST, UNSET_SIZE_REQUEST);
+                }
                 widgets.vm_fixed.set_child_transform(&widgets.offload, None);
             }
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
@@ -396,9 +404,8 @@ impl Component for VmDisplayModel {
             .build();
         let offload = GraphicsOffload::builder()
             .enabled(GraphicsOffloadEnabled::Enabled)
+            .black_background(true)
             .child(&vm_picture)
-            .hexpand(true)
-            .vexpand(true)
             .build();
         let vm_fixed = Fixed::builder().hexpand(true).vexpand(true).can_target(false).build();
         vm_fixed.put(&offload, 0., 0.);

@@ -7,7 +7,7 @@
 //! to minimize memory bandwidth and prevent screen tearing.
 use super::{
     Error,
-    pixman_4cc::{FourCC, Pixman},
+    pixman_4cc::{FourCC, Pixman, sanitize_opaque_fourcc},
     udma::{
         DRM_FORMAT_MOD_LINEAR, Damage, DmabufPlane, build_dmabuf_texture_planar, create_udmabuf_fd,
         utils::fetch_page_size,
@@ -320,7 +320,8 @@ impl Swapchain {
             self.shadow_buf_mut().as_mut().unwrap().update_all(width, height, stride_usize, pixman, buf);
         }
         let shadow_buf = self.shadow_buf_mut().as_ref().unwrap();
-        let texture = mk_texture(shadow_buf.dmabuf_fd(), pixman.try_into()?)?;
+        let fourcc = sanitize_opaque_fourcc(pixman.try_into()?);
+        let texture = mk_texture(shadow_buf.dmabuf_fd(), fourcc)?;
         self.swap_frame();
         *self.active_texture_mut() = Some(texture.clone());
         Ok(texture)
@@ -391,7 +392,7 @@ impl Swapchain {
         let shadow_buf = self.shadow_buf_mut().as_mut().unwrap();
         shadow_buf.update_rect(x, y, clipped_width, clipped_height, src_stride, buf.as_ptr());
         if texture_invalidated {
-            let fourcc: FourCC = pixman.try_into()?;
+            let fourcc: FourCC = sanitize_opaque_fourcc(pixman.try_into()?);
             let plane = DmabufPlane { fd: shadow_buf.dmabuf_fd(), stride: shadow_buf.stride as u32, offset: 0 };
             let texture = build_dmabuf_texture_planar(
                 shadow_buf.width,
