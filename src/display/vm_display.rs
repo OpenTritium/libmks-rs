@@ -27,6 +27,7 @@ use relm4::{
 };
 use std::{borrow::Cow, cell::RefCell, fmt, mem, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
 use tokio::{task::AbortHandle, time::sleep};
+use wayland_client::protocol::wl_surface::WlSurface;
 
 const LOG_TARGET: &str = "mks.display.vm";
 const INCH_TO_MM: f32 = 25.4;
@@ -258,6 +259,41 @@ impl VmDisplayModel {
     fn merge_dirty_flags(&mut self, flags: DirtyFlags) {
         self.dirty_flags.frame |= flags.frame;
         self.dirty_flags.cursor |= flags.cursor;
+    }
+
+    #[inline]
+    fn confined_widget_rect(&self) -> Rectangle {
+        let native = self.input_overlay.native();
+        if let Some(native) = &native
+            && let Some(bounds) = self.input_overlay.compute_bounds(native)
+        {
+            Rectangle::new(
+                bounds.x().floor() as i32,
+                bounds.y().floor() as i32,
+                bounds.width().ceil() as i32,
+                bounds.height().ceil() as i32,
+            )
+        } else {
+            Rectangle::new(0, 0, 0, 0)
+        }
+    }
+
+    #[inline]
+    fn current_wayland_surface(&self) -> Option<WlSurface> {
+        self.input_overlay
+            .native()
+            .and_then(|n| n.surface())
+            .and_then(|s| s.downcast::<WaylandSurface>().ok())
+            .and_then(|ws| ws.wl_surface())
+    }
+
+    #[inline]
+    fn show_confined_capture_unavailable_toast(&mut self, prefer_relative: bool, sender: &ComponentSender<Self>) {
+        if prefer_relative {
+            self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
+        } else {
+            self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
+        }
     }
 
     fn render_view(&self, widgets: &mut VmDisplayWidgets, dirty_flags: DirtyFlags) {
@@ -658,26 +694,10 @@ impl Component for VmDisplayModel {
                 let should_capture = event.should_capture();
                 let was_captured = self.capture_state.should_forward();
 
-                let native = self.input_overlay.native();
-                let widget_rect = if let Some(native) = &native
-                    && let Some(bounds) = self.input_overlay.compute_bounds(native)
-                {
-                    Rectangle::new(
-                        bounds.x().floor() as i32,
-                        bounds.y().floor() as i32,
-                        bounds.width().ceil() as i32,
-                        bounds.height().ceil() as i32,
-                    )
-                } else {
-                    Rectangle::new(0, 0, 0, 0)
-                };
+                let widget_rect = self.confined_widget_rect();
                 let click_pos = event.click_pos();
                 let vm_coords = click_pos.and_then(|(x, y)| self.coord_system.widget_to_guest(x, y));
-                let Some(proxy) = native
-                    .and_then(|n| n.surface())
-                    .and_then(|s| s.downcast::<WaylandSurface>().ok())
-                    .and_then(|ws| ws.wl_surface())
-                else {
+                let Some(proxy) = self.current_wayland_surface() else {
                     mks_warn!("Failed to get wl_surface proxy");
                     return;
                 };
@@ -697,11 +717,7 @@ impl Component for VmDisplayModel {
                         mks_warn!("Failed to establish confined pointer capture");
                         self.cancel_hint_timer();
                         self.hint_visible = false;
-                        if prefer_relative {
-                            self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
-                        } else {
-                            self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
-                        }
+                        self.show_confined_capture_unavailable_toast(prefer_relative, &sender);
                         if let Some(confine) = &mut self.confine_state {
                             confine.is_captured = false;
                         }
@@ -843,24 +859,8 @@ impl Component for VmDisplayModel {
                 mks_info!("Guest mouse mode changed: {}", mode_str);
                 self.input.set_mouse_mode(is_absolute);
                 if self.input_mode() == InputMode::Confined && self.capture_state.should_forward() {
-                    let native = self.input_overlay.native();
-                    let widget_rect = if let Some(native) = &native
-                        && let Some(bounds) = self.input_overlay.compute_bounds(native)
-                    {
-                        Rectangle::new(
-                            bounds.x().floor() as i32,
-                            bounds.y().floor() as i32,
-                            bounds.width().ceil() as i32,
-                            bounds.height().ceil() as i32,
-                        )
-                    } else {
-                        Rectangle::new(0, 0, 0, 0)
-                    };
-                    let Some(proxy) = native
-                        .and_then(|n| n.surface())
-                        .and_then(|s| s.downcast::<WaylandSurface>().ok())
-                        .and_then(|ws| ws.wl_surface())
-                    else {
+                    let widget_rect = self.confined_widget_rect();
+                    let Some(proxy) = self.current_wayland_surface() else {
                         mks_warn!("Failed to get wl_surface proxy while switching mouse mode");
                         return;
                     };
@@ -882,11 +882,7 @@ impl Component for VmDisplayModel {
                         self.capture_state.on_release();
                         self.cancel_hint_timer();
                         self.hint_visible = false;
-                        if prefer_relative {
-                            self.show_toast(RELATIVE_CONFINED_UNSUPPORTED_TOAST, sender.clone());
-                        } else {
-                            self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
-                        }
+                        self.show_confined_capture_unavailable_toast(prefer_relative, &sender);
                         sender.input(UpdateCaptureView);
                     }
                 }

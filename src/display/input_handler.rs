@@ -92,25 +92,26 @@ impl InputHandler {
 
     /// 处理键盘事件
     pub fn press_keyboard(&mut self, keycode: u32, transition: PressAction) {
-        let Some(ctrl) = self.keyboard_ctrl().cloned() else {
+        use PressAction::*;
+        let Some(ctrl) = self.keyboard_ctrl() else {
             mks_warn!("No keyboard controller available");
             return;
         };
         let qnum = Qnum::from_xorg_keycode(keycode);
-        if u32::from(qnum) == 0 {
+        if qnum.is_unmapped() {
             mks_warn!("Unmapped keyboard keycode {keycode}, ignore");
             return;
         }
         let result = match transition {
-            PressAction::Press => ctrl.press(qnum),
-            PressAction::Release => ctrl.release(qnum),
+            Press => ctrl.press(qnum),
+            Release => ctrl.release(qnum),
         };
         match result {
             Ok(()) => match transition {
-                PressAction::Press => {
+                Press => {
                     self.held_keys.insert(qnum);
                 }
-                PressAction::Release => {
+                Release => {
                     self.held_keys.remove(&qnum);
                 }
             },
@@ -124,7 +125,10 @@ impl InputHandler {
     pub fn release_all_keys(&mut self) {
         let ctrl = self.keyboard_ctrl().cloned();
         for qnum in self.held_keys.drain() {
-            let Some(ctrl) = &ctrl else { continue };
+            let Some(ctrl) = &ctrl else {
+                mks_warn!("Cannot drain held key {qnum:?} without controller");
+                continue;
+            };
             if let Err(e) = ctrl.release(qnum) {
                 mks_error!(error:? = e; "Failed to release keyboard key during capture reset");
             }

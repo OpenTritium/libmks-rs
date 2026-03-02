@@ -17,6 +17,9 @@ pub struct Qnum(u32);
 impl Qnum {
     #[inline]
     pub const fn from_xorg_keycode(keycode: u32) -> Self { Self(xorg_keycode_to_qnum(keycode)) }
+
+    #[inline]
+    pub const fn is_unmapped(&self) -> bool { self.0 == 0 }
 }
 
 pub const XORG_EVDEV_TO_QNUM: [u16; 533] = [
