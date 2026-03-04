@@ -63,7 +63,7 @@ pub enum Event {
         y: u32,
         width: u32,
         height: u32,
-        offset: Vec<u64>,
+        offset: Vec<u32>,
         stride: Vec<u32>,
         num_planes: u32,
         fourcc: u32,
@@ -193,7 +193,7 @@ impl Dmabuf2Handler {
     #[zbus(name = "ScanoutDMABUF2")]
     #[allow(clippy::too_many_arguments)]
     async fn scanout_dmabuf2(
-        &self, dmabuf: Vec<OwnedFd>, x: u32, y: u32, width: u32, height: u32, offset: Vec<u64>, stride: Vec<u32>,
+        &self, dmabuf: Vec<OwnedFd>, x: u32, y: u32, width: u32, height: u32, offset: Vec<u32>, stride: Vec<u32>,
         num_planes: u32, fourcc: u32, backing_width: u32, backing_height: u32, modifier: u64, y0_top: bool,
     ) -> Result<(), EmitError> {
         self.emit(ScanoutDmabuf2 {
@@ -396,6 +396,77 @@ mod tests {
         } else {
             panic!("Expected Scanout event, got {:?}", event);
         }
+    }
+
+    #[tokio::test]
+    async fn test_scanout_dmabuf2_message_passing() {
+        let (_server_conn, rx, client_conn) = setup_mock_env().await;
+        let fd = create_dummy_fd();
+
+        client_conn
+            .call_method(
+                Some("org.qemu.Display1.Listener"),
+                "/org/qemu/Display1/Listener",
+                Some(IFACE_SCANOUT_DMABUF2),
+                "ScanoutDMABUF2",
+                &(
+                    vec![fd],
+                    0u32,
+                    0u32,
+                    1920u32,
+                    1080u32,
+                    vec![0u32],
+                    vec![7680u32],
+                    1u32,
+                    0x34325258u32,
+                    1920u32,
+                    1080u32,
+                    0u64,
+                    false,
+                ),
+            )
+            .await
+            .expect("Failed to call ScanoutDMABUF2");
+
+        let event = rx.recv().await.expect("Should receive event");
+        if let Event::ScanoutDmabuf2 {
+            x,
+            y,
+            width,
+            height,
+            offset,
+            stride,
+            num_planes,
+            fourcc,
+            backing_width,
+            backing_height,
+            modifier,
+            y0_top,
+            ..
+        } = event
+        {
+            assert_eq!(x, 0);
+            assert_eq!(y, 0);
+            assert_eq!(width, 1920);
+            assert_eq!(height, 1080);
+            assert_eq!(offset, vec![0u32]);
+            assert_eq!(stride, vec![7680u32]);
+            assert_eq!(num_planes, 1);
+            assert_eq!(fourcc, 0x34325258);
+            assert_eq!(backing_width, 1920);
+            assert_eq!(backing_height, 1080);
+            assert_eq!(modifier, 0);
+            assert!(!y0_top);
+        } else {
+            panic!("Expected ScanoutDmabuf2 event, got {:?}", event);
+        }
+    }
+
+    #[test]
+    fn test_listener_from_opts_includes_dmabuf2_interface_when_enabled() {
+        let (tx, _rx) = kanal::bounded_async::<Event>(1);
+        let listener = Listener::from_opts(Options::builder().with_dmabuf2(true).with_map(false).build(), tx);
+        assert!(listener.ifaces.iter().any(|iface| *iface == IFACE_SCANOUT_DMABUF2));
     }
 
     #[tokio::test]

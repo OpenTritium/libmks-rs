@@ -213,9 +213,7 @@ impl Screen {
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
-                let offsets_u32: Box<[u32]> =
-                    offset.iter().map(|&v| u32::try_from(v).expect("offset exceeds u32::MAX")).collect();
-                match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offsets_u32, fourcc, modifier) {
+                match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offset, fourcc, modifier) {
                     Ok(gpu) => {
                         self.y0_top = y0_top;
                         self.backend = GpuPassthrough(gpu);
