@@ -1,6 +1,3 @@
 /target
-/libmks
-/qemu-display
-
 /test_suit/*.iso
 /test_suit/**/*.iso

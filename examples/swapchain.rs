@@ -292,7 +292,7 @@ fn draw_pattern(
 }
 
 fn main() {
-    let app_id = "tearing_test";
+    let app_id = "rs.libmks.swapchain";
     let app = relm4::RelmApp::new(app_id);
     app.run::<AppModel>(());
 }

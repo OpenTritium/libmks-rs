@@ -13,6 +13,7 @@ use libmks_rs::{
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};
 use std::time::Duration;
+use tokio::sync::watch;
 
 struct AppModel {
     display: Controller<VmDisplayModel>,
@@ -65,6 +66,7 @@ impl SimpleComponent for AppModel {
     fn init(_: (), _root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let (tx, rx) = kanal::unbounded_async::<Event>();
         let (console_ctrl, console_rx) = create_mock_console_controller();
+        let (ui_size_tx, ui_size_rx) = watch::channel((800u32, 600u32));
 
         let input_handler =
             InputHandler::builder().capability(Capability { keyboard: false, mouse: false, multitouch: false }).build();
@@ -76,10 +78,18 @@ impl SimpleComponent for AppModel {
         let display_widget = display.widget().clone();
         tokio::spawn(async move {
             while let Ok(cmd) = console_rx.recv().await {
-                info!("[Console] Command: {:?}", cmd);
+                match cmd {
+                    console::Command::SetUiInfo { width, height, .. } => {
+                        info!("[Console] SetUiInfo => guest resize to {}x{}", width, height);
+                        let _ = ui_size_tx.send((width, height));
+                    }
+                    other => {
+                        info!("[Console] Command: {:?}", other);
+                    }
+                }
             }
         });
-        tokio::spawn(mock_qemu_backend(tx));
+        tokio::spawn(mock_qemu_backend(tx, ui_size_rx));
 
         let model = AppModel { display };
         let widgets = view_output!();
@@ -126,23 +136,22 @@ fn generate_frame(width: u32, height: u32, tick: u32) -> Vec<u8> {
     data
 }
 
-async fn mock_qemu_backend(tx: AsyncSender<Event>) {
+async fn mock_qemu_backend(tx: AsyncSender<Event>, ui_size_rx: watch::Receiver<(u32, u32)>) {
     let mut width = 800u32;
     let mut height = 600u32;
     let mut tick = 0u32;
     let mut timer = tokio::time::interval(Duration::from_millis(33));
+    let mut ui_size_rx = ui_size_rx;
 
     loop {
         timer.tick().await;
         tick = tick.wrapping_add(1);
-        if tick.is_multiple_of(300) {
-            if (width, height) == (800, 600) {
-                width = 1280;
-                height = 720;
-            } else {
-                width = 800;
-                height = 600;
-            }
+
+        let (target_w, target_h) = *ui_size_rx.borrow_and_update();
+        if target_w > 0 && target_h > 0 && (target_w, target_h) != (width, height) {
+            width = target_w;
+            height = target_h;
+            info!("[MockQemu] Applied resize request: {}x{}", width, height);
         }
 
         let data = generate_frame(width, height, tick);

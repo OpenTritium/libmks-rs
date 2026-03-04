@@ -6,13 +6,15 @@ use libmks_rs::{
         listener::Event,
     },
     display::{
+        input_daemon::InputCommand,
         input_handler::{Capability, InputHandler},
         vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::info;
 use relm4::{Controller, gtk::prelude::*, prelude::*};
-use std::time::Duration;
+use std::{thread, time::Duration};
+use tokio::sync::watch;
 
 struct AppModel {
     display: Controller<VmDisplayModel>,
@@ -80,9 +82,15 @@ impl SimpleComponent for AppModel {
     fn init(_: (), _root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
         let (tx, rx) = kanal::unbounded_async::<Event>();
         let (console_ctrl, console_rx) = create_mock_console_controller();
+        let (ui_size_tx, ui_size_rx) = watch::channel((800u32, 600u32));
+        let (mouse_pos_tx, mouse_pos_rx) = watch::channel((400i32, 300i32, true));
+        let (input_cmd_tx, input_cmd_rx) = kanal::bounded::<InputCommand>(1024);
 
-        let input_handler =
-            InputHandler::builder().capability(Capability { keyboard: false, mouse: false, multitouch: false }).build();
+        let input_handler = InputHandler::builder()
+            .input_cmd_tx(input_cmd_tx)
+            .capability(Capability { keyboard: true, mouse: true, multitouch: false })
+            .is_absolute(true)
+            .build();
 
         let display = VmDisplayModel::builder()
             .launch(VmDisplayInit { rx, console_ctrl, input_handler, grab_shortcut: GrabShortcut::default() })
@@ -92,10 +100,38 @@ impl SimpleComponent for AppModel {
 
         tokio::spawn(async move {
             while let Ok(cmd) = console_rx.recv().await {
-                info!("[Console] Command: {:?}", cmd);
+                match cmd {
+                    console::Command::SetUiInfo { width, height, .. } => {
+                        info!("[Console] SetUiInfo => guest resize to {}x{}", width, height);
+                        let _ = ui_size_tx.send((width, height));
+                    }
+                    other => {
+                        info!("[Console] Command: {:?}", other);
+                    }
+                }
             }
         });
-        tokio::spawn(mock_qemu_backend(tx));
+        tokio::spawn(mock_qemu_backend(tx, ui_size_rx, mouse_pos_rx));
+        thread::spawn(move || {
+            let mut mouse_x = 400i32;
+            let mut mouse_y = 300i32;
+            while let Ok(cmd) = input_cmd_rx.recv() {
+                match cmd {
+                    InputCommand::MouseSetAbs(x, y) => {
+                        mouse_x = x as i32;
+                        mouse_y = y as i32;
+                        let _ = mouse_pos_tx.send((mouse_x, mouse_y, true));
+                    }
+                    InputCommand::MouseRel(dx, dy) => {
+                        mouse_x = mouse_x.saturating_add(dx);
+                        mouse_y = mouse_y.saturating_add(dy);
+                        let _ = mouse_pos_tx.send((mouse_x, mouse_y, true));
+                    }
+                    _ => {}
+                }
+                info!("[Input] Command: {:?}", cmd);
+            }
+        });
 
         let model = AppModel { display };
         let widgets = view_output!();
@@ -159,29 +195,70 @@ fn generate_frame(width: u32, height: u32, tick: u32) -> Vec<u8> {
     data
 }
 
-async fn mock_qemu_backend(tx: AsyncSender<Event>) {
+async fn mock_qemu_backend(
+    tx: AsyncSender<Event>, ui_size_rx: watch::Receiver<(u32, u32)>, mouse_pos_rx: watch::Receiver<(i32, i32, bool)>,
+) {
     let mut width = 800u32;
     let mut height = 600u32;
     let mut tick = 0u32;
     let mut timer = tokio::time::interval(Duration::from_millis(16));
+    let mut ui_size_rx = ui_size_rx;
+    let mut mouse_pos_rx = mouse_pos_rx;
+
+    let cursor_w = 64i32;
+    let cursor_h = 64i32;
+    let cursor_hot_x = cursor_w / 2;
+    let cursor_hot_y = cursor_h / 2;
+    let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
+    for y in 0..cursor_h {
+        for x in 0..cursor_w {
+            let i = ((y * cursor_w + x) * 4) as usize;
+            let is_cross = x == cursor_w / 2 || y == cursor_h / 2;
+            let is_center = x == cursor_w / 2 && y == cursor_h / 2;
+            if is_center {
+                cursor_data[i..i + 4].copy_from_slice(&[60, 200, 255, 255]);
+            } else if is_cross {
+                cursor_data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            } else {
+                cursor_data[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    let _ = tx
+        .send(Event::CursorDefine {
+            width: cursor_w,
+            height: cursor_h,
+            hot_x: cursor_hot_x,
+            hot_y: cursor_hot_y,
+            data: cursor_data.into(),
+        })
+        .await;
 
     loop {
         timer.tick().await;
         tick = tick.wrapping_add(1);
-        if tick.is_multiple_of(360) {
-            if (width, height) == (800, 600) {
-                width = 1280;
-                height = 720;
-            } else {
-                width = 800;
-                height = 600;
-            }
+
+        let (target_w, target_h) = *ui_size_rx.borrow_and_update();
+        if target_w > 0 && target_h > 0 && (target_w, target_h) != (width, height) {
+            width = target_w;
+            height = target_h;
+            info!("[MockQemu] Applied resize request: {}x{}", width, height);
         }
 
         let data = generate_frame(width, height, tick);
         let _ = tx
             .send(Event::Scanout { width, height, stride: width * 4, pixman_format: 0x20028888, data: data.into() })
             .await;
+
+        let (x, y, visible) = *mouse_pos_rx.borrow_and_update();
+        // VmDisplay currently positions guest cursor by image top-left, so convert center -> top-left.
+        let min_top_left_x = -cursor_hot_x;
+        let min_top_left_y = -cursor_hot_y;
+        let max_top_left_x = width.saturating_sub(1) as i32 - cursor_hot_x;
+        let max_top_left_y = height.saturating_sub(1) as i32 - cursor_hot_y;
+        let top_left_x = (x - cursor_hot_x).clamp(min_top_left_x, max_top_left_x);
+        let top_left_y = (y - cursor_hot_y).clamp(min_top_left_y, max_top_left_y);
+        let _ = tx.send(Event::MouseSet { x: top_left_x, y: top_left_y, on: i32::from(visible) }).await;
     }
 }
 
