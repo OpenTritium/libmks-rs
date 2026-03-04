@@ -3,7 +3,7 @@ use super::{
     pixman_4cc::{FourCC, sanitize_opaque_fourcc},
     udma::{Damage, DmabufPlane, build_dmabuf_texture_planar},
 };
-use crate::mks_debug;
+use crate::{mks_debug, mks_trace};
 use relm4::gtk::gdk::Texture;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -100,14 +100,25 @@ impl GpuPassthrough {
     }
 
     #[inline]
-    pub fn rebuild_texture(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<(), Error> {
+    pub fn rebuild_texture(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<bool, Error> {
         if self.fresh_from_scanout {
+            mks_trace!("DMABUF texture rebuild skipped: fresh scanout import");
             self.fresh_from_scanout = false;
-            return Ok(());
+            return Ok(false);
         }
         let Some(damage) = self.clip_damage(x, y, width, height) else {
-            return Ok(());
+            mks_trace!("DMABUF texture rebuild skipped: clipped damage is empty, rect=({x},{y} {width}x{height})");
+            return Ok(false);
         };
+        mks_trace!(
+            "DMABUF texture rebuilding: frame={}x{}, damage=({},{} {}x{})",
+            self.width,
+            self.height,
+            damage.x,
+            damage.y,
+            damage.width,
+            damage.height
+        );
         let gdk_planes: Box<[_]> = self
             .planes
             .iter()
@@ -122,8 +133,9 @@ impl GpuPassthrough {
             Some(&self.texture),
             Some(damage),
         )?;
+        mks_trace!("DMABUF texture rebuild finished");
         self.fresh_from_scanout = false;
-        Ok(())
+        Ok(true)
     }
 
     #[inline]

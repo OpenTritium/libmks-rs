@@ -13,7 +13,7 @@ use super::{
         utils::fetch_page_size,
     },
 };
-use crate::{mks_debug, mks_error};
+use crate::{mks_debug, mks_error, mks_trace};
 use relm4::gtk::gdk::Texture;
 use rustix::{
     fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
@@ -336,6 +336,10 @@ impl Swapchain {
     pub fn partial_update_texture(
         &mut self, x: u32, y: u32, width: u32, height: u32, stride: u32, pixman: Pixman, buf: &[u8],
     ) -> Result<Texture, Error> {
+        mks_trace!(
+            "Partial texture refresh requested: rect=({x},{y} {width}x{height}), stride={stride}, payload={}",
+            buf.len()
+        );
         if height == 0 || stride == 0 || width == 0 {
             return Err(Error::State("Partial update requires non-zero width/height/stride"));
         }
@@ -374,6 +378,9 @@ impl Swapchain {
                 active.height
             );
         }
+        mks_trace!(
+            "Partial texture refresh applying: rect=({x},{y} {clipped_width}x{clipped_height}), src_stride={stride}"
+        );
         let src_stride = stride as usize;
         let bpp = pixman.bytes_per_pixel();
         let row_bytes = clipped_width as usize * bpp;
@@ -396,6 +403,7 @@ impl Swapchain {
         let shadow_buf = self.shadow_buf_mut().as_mut().unwrap();
         shadow_buf.update_rect(x, y, clipped_width, clipped_height, src_stride, buf.as_ptr());
         if texture_invalidated {
+            mks_trace!("Partial texture refresh invalidated active texture; rebuilding texture wrapper");
             let fourcc: FourCC = pixman.try_into()?;
             let plane = DmabufPlane { fd: shadow_buf.dmabuf_fd(), stride: shadow_buf.stride as u32, offset: 0 };
             let texture = build_dmabuf_texture_planar(
@@ -411,6 +419,7 @@ impl Swapchain {
             *self.active_texture_mut() = Some(texture.clone());
             return Ok(texture);
         }
+        mks_trace!("Partial texture refresh finished without texture rebuild");
         // Texture is still valid, flip front/back
         self.swap_frame();
         let texture = self.active_texture().as_ref().cloned().unwrap();

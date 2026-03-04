@@ -270,13 +270,20 @@ impl Screen {
                          (GpuPassthrough Backend uninitialized)",
                     ));
                 };
-                if let Err(e) = gpu.rebuild_texture(x, y, width, height) {
-                    mks_error!(
-                        error:? = e;
-                        "Failed to rebuild DMABUF texture after UpdateDmabuf event; keeping previous texture"
-                    );
+                match gpu.rebuild_texture(x, y, width, height) {
+                    Ok(true) => {
+                        flags.frame = true;
+                    }
+                    Ok(false) => {
+                        mks_trace!("Skipping frame update signal after UpdateDMABUF: texture unchanged");
+                    }
+                    Err(e) => {
+                        mks_error!(
+                            error:? = e;
+                            "Failed to rebuild DMABUF texture after UpdateDmabuf event; keeping previous texture"
+                        );
+                    }
                 }
-                flags.frame = true;
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
                 if !self.cursor.looks_same(width, height, hot_x, hot_y, &data, 4) {

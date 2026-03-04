@@ -8,7 +8,7 @@ use super::{
 use crate::{
     dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent},
     display::input_daemon::InputCommand,
-    mks_debug, mks_error, mks_info,
+    mks_debug, mks_error, mks_info, mks_trace,
 };
 use gdk4_wayland::{
     WaylandDisplay, WaylandSurface,
@@ -21,8 +21,8 @@ use relm4::{
     Component, ComponentParts, ComponentSender,
     gtk::{
         Align, ContentFit, CssProvider, DrawingArea, EventController, EventControllerKey, EventControllerMotion,
-        EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, GraphicsOffload,
-        GraphicsOffloadEnabled, Label, Overlay, Picture, STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
+        EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, Label, Overlay, Picture,
+        STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
         gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
     },
 };
@@ -194,7 +194,6 @@ pub struct VmDisplayModel {
 pub struct VmDisplayWidgets {
     pub view_stack: Overlay,
     pub vm_fixed: Fixed,
-    pub offload: GraphicsOffload,
     pub vm_picture: Picture,
     pub input_overlay: DrawingArea,
     pub cursor_fixed: Fixed,
@@ -314,7 +313,6 @@ impl VmDisplayModel {
         widgets.capture_hint.remove_css_class(class_remove);
         let is_interactive = self.capture_state.should_forward();
         widgets.input_overlay.set_cursor_from_name(is_interactive.then_some("none"));
-        widgets.offload.set_enabled(GraphicsOffloadEnabled::Disabled);
         if !dirty_flags.any() {
             return;
         }
@@ -322,19 +320,28 @@ impl VmDisplayModel {
             if let Some((offset_x, offset_y, viewport_w, viewport_h)) = self.coord_system.vm_display_bounds() {
                 let req_w = viewport_w.ceil().max(1.) as i32;
                 let req_h = viewport_h.ceil().max(1.) as i32;
-                if widgets.offload.width_request() != req_w || widgets.offload.height_request() != req_h {
-                    widgets.offload.set_size_request(req_w, req_h);
+                if widgets.vm_picture.width_request() != req_w || widgets.vm_picture.height_request() != req_h {
+                    widgets.vm_picture.set_size_request(req_w, req_h);
                 }
                 let matrix = if self.screen.y0_top {
                     Transform::new().translate(&Point::new(offset_x, offset_y + viewport_h)).scale(1., -1.)
                 } else {
                     Transform::new().translate(&Point::new(offset_x, offset_y))
                 };
-                widgets.vm_fixed.set_child_transform(&widgets.offload, Some(&matrix));
+                widgets.vm_fixed.set_child_transform(&widgets.vm_picture, Some(&matrix));
             } else {
-                widgets.vm_fixed.set_child_transform(&widgets.offload, None);
+                widgets.vm_fixed.set_child_transform(&widgets.vm_picture, None);
             }
-            widgets.vm_picture.set_paintable(self.screen.get_background_texture());
+            let texture = self.screen.get_background_texture();
+            if let Some(texture) = texture {
+                let width = texture.width();
+                let height = texture.height();
+                mks_trace!("Frame texture presented: {width}x{height}, y0_top={}", self.screen.y0_top);
+                widgets.vm_picture.set_paintable(Some(texture));
+            } else {
+                mks_trace!("Frame texture cleared");
+                widgets.vm_picture.set_paintable(None::<&Texture>);
+            }
         }
         if dirty_flags.cursor || dirty_flags.frame {
             let cursor = &self.screen.cursor;
@@ -436,13 +443,8 @@ impl Component for VmDisplayModel {
             .valign(Align::Center)
             .can_target(false)
             .build();
-        let offload = GraphicsOffload::builder()
-            .enabled(GraphicsOffloadEnabled::Enabled)
-            .black_background(true)
-            .child(&vm_picture)
-            .build();
         let vm_fixed = Fixed::builder().hexpand(true).vexpand(true).can_target(false).build();
-        vm_fixed.put(&offload, 0., 0.);
+        vm_fixed.put(&vm_picture, 0., 0.);
         let sender_clone = sender.clone();
         let update_monitor_info = move |widget: &DrawingArea| {
             let display = widget.display();
@@ -597,7 +599,6 @@ impl Component for VmDisplayModel {
         let widgets = VmDisplayWidgets {
             view_stack,
             vm_fixed,
-            offload,
             vm_picture,
             input_overlay: input_plane,
             cursor_fixed,
