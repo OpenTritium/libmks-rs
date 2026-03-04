@@ -557,26 +557,24 @@ async fn connect_to_qemu(
     let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(enable_map).build();
     info!("Listener mode: {:?}, DMABUF2: {}, MAP: {}", mode, enable_dmabuf2, enable_map);
 
-    // Use kanal AsyncSender directly
-    // Use .serve_at() to register object before .build()
-    let builder = zbus::connection::Builder::unix_stream(socket_server).p2p().serve_at(
+    // Register all interfaces on the builder before .build()
+    // so QEMU sees the full interface set on first introspection.
+    let mut builder = zbus::connection::Builder::unix_stream(socket_server).p2p();
+    builder = builder.serve_at(
         "/org/qemu/Display1/Listener",
-        listener::Listener::from_opts(listener_opts.clone(), event_tx.clone()),
+        listener::Listener::from_opts(listener_opts, event_tx.clone()),
     )?;
-
-    // Only build at the end
-    let listener_conn = builder.build().await?;
-    info!("Listener D-Bus connection established");
-
-    // Register additional interfaces
-    if listener_opts.with_dmabuf2 {
+    if enable_dmabuf2 {
         let dmabuf2_handler = listener::Dmabuf2Handler(event_tx.clone());
-        listener_conn.object_server().at("/org/qemu/Display1/Listener", dmabuf2_handler).await?;
+        builder = builder.serve_at("/org/qemu/Display1/Listener", dmabuf2_handler)?;
     }
-    if listener_opts.with_map {
-        let map_handler = listener::MapHandler(event_tx);
-        listener_conn.object_server().at("/org/qemu/Display1/Listener", map_handler).await?;
+    if enable_map {
+        let map_handler = listener::MapHandler(event_tx.clone());
+        builder = builder.serve_at("/org/qemu/Display1/Listener", map_handler)?;
     }
+
+    let listener_conn = builder.build().await?;
+    info!("Listener D-Bus connection established with all interfaces");
 
     info!("Listener server registered at /org/qemu/Display1/Listener");
 

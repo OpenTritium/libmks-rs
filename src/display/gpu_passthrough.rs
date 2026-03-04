@@ -29,8 +29,7 @@ pub struct GpuPassthrough {
     modifier: u64,
     width: u32,
     height: u32,
-    // Skip the first UpdateDMABUF rebuild right after a fresh ScanoutDMABUF import.
-    fresh_from_scanout: bool,
+    pending_presentation: bool,
 }
 
 impl GpuPassthrough {
@@ -59,7 +58,7 @@ impl GpuPassthrough {
         let gdk_planes =
             [DmabufPlane { fd: planes[0].fd.as_raw_fd(), stride: planes[0].stride, offset: planes[0].offset }];
         let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
-        Ok(Self { texture, planes, fourcc, modifier, width, height, fresh_from_scanout: true })
+        Ok(Self { texture, planes, fourcc, modifier, width, height, pending_presentation: true })
     }
 
     #[inline]
@@ -79,7 +78,7 @@ impl GpuPassthrough {
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
         let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
-        Ok(Self { texture, planes, fourcc, modifier, width, height, fresh_from_scanout: true })
+        Ok(Self { texture, planes, fourcc, modifier, width, height, pending_presentation: true })
     }
 
     #[inline]
@@ -89,10 +88,12 @@ impl GpuPassthrough {
         }
         let max_x = i64::from(self.width);
         let max_y = i64::from(self.height);
-        let x0 = i64::from(x).clamp(0, max_x);
-        let y0 = i64::from(y).clamp(0, max_y);
-        let x1 = (i64::from(x) + i64::from(width)).clamp(0, max_x);
-        let y1 = (i64::from(y) + i64::from(height)).clamp(0, max_y);
+        let x = i64::from(x);
+        let y = i64::from(y);
+        let x0 = x.clamp(0, max_x);
+        let y0 = y.clamp(0, max_y);
+        let x1 = (x + i64::from(width)).clamp(0, max_x);
+        let y1 = (y + i64::from(height)).clamp(0, max_y);
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
@@ -101,10 +102,12 @@ impl GpuPassthrough {
 
     #[inline]
     pub fn rebuild_texture(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<bool, Error> {
-        if self.fresh_from_scanout {
-            mks_trace!("DMABUF texture rebuild skipped: fresh scanout import");
-            self.fresh_from_scanout = false;
-            return Ok(false);
+        if self.pending_presentation {
+            mks_trace!("DMABUF texture rebuild skipped: first update after fresh scanout import");
+            self.pending_presentation = false;
+            // The first UpdateDMABUF after ScanoutDMABUF is the first safe present point.
+            // Texture can be reused, but caller still must render this frame.
+            return Ok(true);
         }
         let Some(damage) = self.clip_damage(x, y, width, height) else {
             mks_trace!("DMABUF texture rebuild skipped: clipped damage is empty, rect=({x},{y} {width}x{height})");
@@ -134,7 +137,7 @@ impl GpuPassthrough {
             Some(damage),
         )?;
         mks_trace!("DMABUF texture rebuild finished");
-        self.fresh_from_scanout = false;
+        self.pending_presentation = false;
         Ok(true)
     }
 

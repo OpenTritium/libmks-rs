@@ -8,7 +8,7 @@ use super::{
 use crate::{
     dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent},
     display::input_daemon::InputCommand,
-    mks_debug, mks_error, mks_info, mks_trace,
+    mks_debug, mks_error, mks_info, mks_trace, mks_warn,
 };
 use gdk4_wayland::{
     WaylandDisplay, WaylandSurface,
@@ -22,8 +22,8 @@ use relm4::{
     gtk::{
         Align, ContentFit, CssProvider, DrawingArea, EventController, EventControllerKey, EventControllerMotion,
         EventControllerScroll, EventControllerScrollFlags, Fixed, GestureClick, Label, Overlay, Picture,
-        STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label,
-        gdk::Display, graphene::Point, gsk::Transform, prelude::*, style_context_add_provider_for_display,
+        STYLE_PROVIDER_PRIORITY_APPLICATION, accelerator_get_label, gdk::Display, graphene::Point, gsk::Transform,
+        prelude::*, style_context_add_provider_for_display,
     },
 };
 use std::{borrow::Cow, cell::RefCell, fmt, mem, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
@@ -615,7 +615,7 @@ impl Component for VmDisplayModel {
             SetInputCaptureMode(mode) => {
                 self.requested_input_mode = mode;
                 if mode == InputMode::Seamless && !self.input.is_absolute {
-                    mks_error!("Seamless capture requires absolute guest mouse mode; ignoring request");
+                    mks_warn!("Seamless capture requires absolute guest mouse mode; ignoring request");
                     self.capture_state.reset();
                     let _ = self.confine_state.take();
                     self.cancel_hint_timer();

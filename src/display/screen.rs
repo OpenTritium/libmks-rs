@@ -196,7 +196,6 @@ impl Screen {
                     Ok(gpu) => {
                         self.y0_top = y0_top;
                         self.backend = GpuPassthrough(gpu);
-                        flags.frame = true;
                     }
                     Err(e) => {
                         mks_error!(
@@ -220,7 +219,6 @@ impl Screen {
                     Ok(gpu) => {
                         self.y0_top = y0_top;
                         self.backend = GpuPassthrough(gpu);
-                        flags.frame = true;
                     }
                     Err(e) => {
                         mks_error!(
