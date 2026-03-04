@@ -97,7 +97,7 @@ impl ImportedTexture {
         let fourcc: FourCC = pixman.try_into()?;
         let buffer = DmabufImport::new(memfd, offset, width, height, stride, pixman)?;
         let plane = DmabufPlane { fd: buffer.as_raw_dmabuf_fd(), stride, offset: 0 };
-        let texture = build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane])?;
+        let texture = build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane], None, None)?;
         self.buffer = Some(buffer);
         self.texture = Some(texture.clone());
         Ok(texture)

@@ -312,7 +312,7 @@ impl Swapchain {
     ) -> Result<Texture, Error> {
         let mk_texture = |fd, fourcc: FourCC| {
             let plane = DmabufPlane { fd, stride, offset: 0 };
-            build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane])
+            build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane], None, None)
         };
         self.last_damage = Some(Damage { x: 0, y: 0, width, height });
         let stride_usize = stride as usize;
@@ -404,6 +404,8 @@ impl Swapchain {
                 fourcc,
                 DRM_FORMAT_MOD_LINEAR,
                 &[plane],
+                None,
+                None,
             )?;
             self.swap_frame();
             *self.active_texture_mut() = Some(texture.clone());

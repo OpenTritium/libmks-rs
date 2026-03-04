@@ -314,6 +314,7 @@ impl VmDisplayModel {
         widgets.capture_hint.remove_css_class(class_remove);
         let is_interactive = self.capture_state.should_forward();
         widgets.input_overlay.set_cursor_from_name(is_interactive.then_some("none"));
+        widgets.offload.set_enabled(GraphicsOffloadEnabled::Disabled);
         if !dirty_flags.any() {
             return;
         }
@@ -334,15 +335,12 @@ impl VmDisplayModel {
                 widgets.vm_fixed.set_child_transform(&widgets.offload, None);
             }
             widgets.vm_picture.set_paintable(self.screen.get_background_texture());
-            // DMABUF Update events often mutate the same underlying texture object.
-            // Explicit redraw is needed even when paintable identity does not change.
-            widgets.vm_picture.queue_draw();
         }
         if dirty_flags.cursor || dirty_flags.frame {
             let cursor = &self.screen.cursor;
-            let visiable = cursor.visible && is_interactive;
-            widgets.cursor_picture.set_visible(visiable);
-            if visiable {
+            let visible = cursor.visible && is_interactive;
+            widgets.cursor_picture.set_visible(visible);
+            if visible {
                 if let Some(texture) = &cursor.texture {
                     widgets.cursor_picture.set_paintable(Some(texture));
                     let tex_w = texture.width();

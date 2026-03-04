@@ -257,15 +257,20 @@ impl Screen {
             }
             UpdateDmabuf { x, y, width, height } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
+                if width <= 0 || height <= 0 {
+                    mks_error!("Ignoring invalid QEMU UpdateDmabuf rect: x={x}, y={y}, width={width}, height={height}");
+                    return Ok(flags);
+                }
                 // DMABUF content may be updated in-place. gdk::Texture is immutable,
                 // so recreate a lightweight wrapper to force GTK/GSK cache invalidation.
+                // Forward damage rect so GDK can reuse unchanged regions.
                 let GpuPassthrough(gpu) = &mut self.backend else {
                     return Err(Error::State(
                         "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf'/'ScanoutDmabuf2' \
                          (GpuPassthrough Backend uninitialized)",
                     ));
                 };
-                if let Err(e) = gpu.rebuild_texture() {
+                if let Err(e) = gpu.rebuild_texture(x, y, width, height) {
                     mks_error!(
                         error:? = e;
                         "Failed to rebuild DMABUF texture after UpdateDmabuf event; keeping previous texture"

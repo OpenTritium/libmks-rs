@@ -4,6 +4,7 @@
 //! for creating DMA-BUF file descriptors and building textures.
 use crate::display::{pixman_4cc::FourCC, udma::UdmabufCreate};
 use relm4::gtk::{
+    cairo::{RectangleInt, Region},
     gdk::{DmabufTextureBuilder, Texture},
     glib,
 };
@@ -87,15 +88,23 @@ pub fn create_udmabuf_fd(memfd: &impl AsFd, offset: u64, size: u64) -> io::Resul
 ///   `build_with_release_func`.
 #[inline]
 pub fn build_dmabuf_texture_planar(
-    width: u32, height: u32, fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],
+    width: u32, height: u32, fourcc: FourCC, modifier: u64, planes: &[DmabufPlane], update_texture: Option<&Texture>,
+    damage: Option<Damage>,
 ) -> Result<Texture, glib::Error> {
     let num_planes = planes.len() as u32;
-    let builder = DmabufTextureBuilder::new()
+    let mut builder = DmabufTextureBuilder::new()
         .set_width(width)
         .set_height(height)
         .set_fourcc(fourcc.into())
         .set_modifier(modifier)
-        .set_n_planes(num_planes);
+        .set_n_planes(num_planes)
+        .set_update_texture(update_texture);
+    if let Some(Damage { x, y, width, height }) = damage {
+        let to_i32 = |v: u32| i32::try_from(v).expect("Cannot coercion i32 into u32 when calculate damage");
+        let rect = RectangleInt::new(to_i32(x), to_i32(y), to_i32(width), to_i32(height));
+        let region = Region::create_rectangle(&rect);
+        builder = builder.set_update_region(Some(&region));
+    }
     let builder = planes.iter().enumerate().fold(builder, |b, (i, plane)| {
         let i = i as u32;
         let b = b.set_stride(i, plane.stride).set_offset(i, plane.offset);
@@ -204,6 +213,8 @@ mod tests {
             ARGB8888, // 假设 FourCC 枚举里有这个
             DRM_FORMAT_MOD_LINEAR,
             &planes,
+            None,
+            None,
         );
 
         match result {

@@ -1,7 +1,7 @@
 use super::{
     Error,
     pixman_4cc::{FourCC, sanitize_opaque_fourcc},
-    udma::{DmabufPlane, build_dmabuf_texture_planar},
+    udma::{Damage, DmabufPlane, build_dmabuf_texture_planar},
 };
 use crate::mks_debug;
 use relm4::gtk::gdk::Texture;
@@ -36,6 +36,7 @@ pub struct GpuPassthrough {
 impl GpuPassthrough {
     fn build_texture(
         width: u32, height: u32, raw_fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],
+        update_texture: Option<&Texture>, damage: Option<Damage>,
     ) -> Result<(Texture, FourCC), Error> {
         let fourcc = match sanitize_opaque_fourcc(raw_fourcc) {
             Ok(sanitized_fourcc) => sanitized_fourcc,
@@ -44,7 +45,7 @@ impl GpuPassthrough {
                 raw_fourcc
             }
         };
-        build_dmabuf_texture_planar(width, height, fourcc, modifier, planes)
+        build_dmabuf_texture_planar(width, height, fourcc, modifier, planes, update_texture, damage)
             .map(|t| (t, fourcc))
             .map_err(Error::Texture)
     }
@@ -57,7 +58,7 @@ impl GpuPassthrough {
         let raw_fourcc = FourCC::from(fourcc);
         let gdk_planes =
             [DmabufPlane { fd: planes[0].fd.as_raw_fd(), stride: planes[0].stride, offset: planes[0].offset }];
-        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes)?;
+        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
         Ok(Self { texture, planes, fourcc, modifier, width, height, fresh_from_scanout: true })
     }
 
@@ -77,22 +78,50 @@ impl GpuPassthrough {
             .iter()
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
-        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes)?;
+        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
         Ok(Self { texture, planes, fourcc, modifier, width, height, fresh_from_scanout: true })
     }
 
     #[inline]
-    pub fn rebuild_texture(&mut self) -> Result<(), Error> {
+    fn clip_damage(&self, x: i32, y: i32, width: i32, height: i32) -> Option<Damage> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let max_x = i64::from(self.width);
+        let max_y = i64::from(self.height);
+        let x0 = i64::from(x).clamp(0, max_x);
+        let y0 = i64::from(y).clamp(0, max_y);
+        let x1 = (i64::from(x) + i64::from(width)).clamp(0, max_x);
+        let y1 = (i64::from(y) + i64::from(height)).clamp(0, max_y);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Damage { x: x0 as u32, y: y0 as u32, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
+    }
+
+    #[inline]
+    pub fn rebuild_texture(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<(), Error> {
         if self.fresh_from_scanout {
             self.fresh_from_scanout = false;
             return Ok(());
         }
+        let Some(damage) = self.clip_damage(x, y, width, height) else {
+            return Ok(());
+        };
         let gdk_planes: Box<[_]> = self
             .planes
             .iter()
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
-        self.texture = build_dmabuf_texture_planar(self.width, self.height, self.fourcc, self.modifier, &gdk_planes)?;
+        self.texture = build_dmabuf_texture_planar(
+            self.width,
+            self.height,
+            self.fourcc,
+            self.modifier,
+            &gdk_planes,
+            Some(&self.texture),
+            Some(damage),
+        )?;
         self.fresh_from_scanout = false;
         Ok(())
     }
