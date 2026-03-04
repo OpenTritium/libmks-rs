@@ -156,16 +156,6 @@ impl SimpleComponent for AppModel {
                         set_sensitive: model.guest_mouse_is_absolute != Some(false),
                     },
 
-                    gtk::Label {
-                        #[watch]
-                        set_label: if model.guest_mouse_is_absolute == Some(false) {
-                            "Hint: Guest is in relative mouse mode; input is forced to Locked."
-                        } else {
-                            "Hint: Locked mode requires click to capture, Ctrl+Alt+G to release."
-                        },
-                        set_opacity: 0.6,
-                        set_margin_start: 10,
-                    },
                 },
 
                 #[local_ref]

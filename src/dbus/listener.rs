@@ -466,7 +466,7 @@ mod tests {
     fn test_listener_from_opts_includes_dmabuf2_interface_when_enabled() {
         let (tx, _rx) = kanal::bounded_async::<Event>(1);
         let listener = Listener::from_opts(Options::builder().with_dmabuf2(true).with_map(false).build(), tx);
-        assert!(listener.ifaces.iter().any(|iface| *iface == IFACE_SCANOUT_DMABUF2));
+        assert!(listener.ifaces.contains(&IFACE_SCANOUT_DMABUF2));
     }
 
     #[tokio::test]

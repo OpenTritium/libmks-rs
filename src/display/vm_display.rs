@@ -582,10 +582,14 @@ impl Component for VmDisplayModel {
         let handler_clone = resize_handler.clone();
         input_plane.connect_scale_factor_notify(move |widget| handler_clone(widget));
 
-        view_stack.set_child(Some(&vm_fixed));
-        view_stack.add_overlay(&input_plane);
+        // Keep a 0x0 minimum from the input plane while rendering layers float above it.
+        view_stack.set_child(Some(&input_plane));
+        view_stack.add_overlay(&vm_fixed);
+        view_stack.set_measure_overlay(&vm_fixed, false);
         view_stack.add_overlay(&cursor_fixed);
+        view_stack.set_measure_overlay(&cursor_fixed, false);
         view_stack.add_overlay(&capture_hint);
+        view_stack.set_measure_overlay(&capture_hint, false);
         root.set_child(Some(&view_stack));
 
         relm4::spawn(async move {
