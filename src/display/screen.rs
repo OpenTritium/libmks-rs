@@ -1,9 +1,9 @@
-//! 屏幕和鼠标的 model
+//! Screen and cursor state model.
 use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
 use crate::{
     dbus::listener::Event,
     display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
-    mks_trace, mks_warn,
+    mks_error, mks_trace,
 };
 use RenderBackend::*;
 use relm4::gtk::{
@@ -52,6 +52,10 @@ impl Default for CursorState {
 }
 
 impl CursorState {
+    /// Fast-path check for cursor image reuse.
+    ///
+    /// Compares metadata first, then validates a few key sample points to avoid
+    /// rebuilding the texture when the cursor payload is effectively unchanged.
     #[inline]
     pub fn looks_same(
         &self, width: i32, height: i32, hot_x: i32, hot_y: i32, new_data: &[u8], bytes_per_pixel: usize,
@@ -100,6 +104,11 @@ pub enum RenderBackend {
 }
 
 impl RenderBackend {
+    /// Ensures `SoftwareRasterizer` backend exists.
+    ///
+    /// Returns `(swapchain, created_now)`:
+    /// - `swapchain`: active software swapchain.
+    /// - `created_now`: `true` if backend was initialized by this call.
     #[inline]
     pub fn ensure_software_rasterizer(&mut self) -> (&mut Swapchain, bool) {
         let mut created = false;
@@ -111,6 +120,11 @@ impl RenderBackend {
         (swapchain, created)
     }
 
+    /// Ensures `DirectMapped` backend exists.
+    ///
+    /// Returns `(cache, created_now)`:
+    /// - `cache`: active imported texture cache.
+    /// - `created_now`: `true` if backend was initialized by this call.
     #[inline]
     pub fn ensure_direct_mapped(&mut self) -> (&mut ImportedTexture, bool) {
         let mut created = false;
@@ -133,6 +147,7 @@ pub struct Screen {
 impl Screen {
     pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, y0_top: false } }
 
+    /// Applies one display event and returns dirty flags for frame/cursor refresh.
     #[inline]
     pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
         use Event::*;
@@ -154,7 +169,7 @@ impl Screen {
                      bytes={bytes}"
                 );
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    mks_warn!("Ignoring invalid Update rect from QEMU: x={x}, y={y}, width={width}, height={height}");
+                    mks_error!("Ignoring invalid QEMU Update rect: x={x}, y={y}, width={width}, height={height}");
                     return Ok(flags);
                 }
                 let pixman = Pixman::from(pixman_format);
@@ -184,9 +199,9 @@ impl Screen {
                         flags.frame = true;
                     }
                     Err(e) => {
-                        mks_warn!(
+                        mks_error!(
                             error:? = e;
-                            "Failed to import ScanoutDMABUF (fourcc=0x{fourcc:08x}, \
+                            "Failed to import ScanoutDmabuf (fourcc=0x{fourcc:08x}, \
                              modifier=0x{modifier:016x}); keeping previous frame"
                         );
                     }
@@ -208,9 +223,9 @@ impl Screen {
                         flags.frame = true;
                     }
                     Err(e) => {
-                        mks_warn!(
+                        mks_error!(
                             error:? = e;
-                            "Failed to import ScanoutDMABUF2 (fourcc=0x{fourcc:08x}, \
+                            "Failed to import ScanoutDmabuf2 (fourcc=0x{fourcc:08x}, \
                              modifier=0x{modifier:016x}); keeping previous frame"
                         );
                     }
@@ -228,19 +243,16 @@ impl Screen {
             UpdateMap { x, y, width, height } => {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    mks_warn!(
-                        "Ignoring invalid UpdateMap rect from QEMU: x={x}, y={y}, width={width}, height={height}"
-                    );
+                    mks_error!("Ignoring invalid QEMU UpdateMap rect: x={x}, y={y}, width={width}, height={height}");
                     return Ok(flags);
                 }
-                let (cache, new_created) = self.backend.ensure_direct_mapped();
+                let (_, new_created) = self.backend.ensure_direct_mapped();
                 if new_created {
                     return Err(Error::State(
                         "Received partial 'UpdateMap' without preceding 'ScanoutMap' (DirectMapped Backend \
                          uninitialized)",
                     ));
                 }
-                cache.record_damage(x as u32, y as u32, width as u32, height as u32);
                 flags.frame = true;
             }
             UpdateDmabuf { x, y, width, height } => {
@@ -249,12 +261,15 @@ impl Screen {
                 // so recreate a lightweight wrapper to force GTK/GSK cache invalidation.
                 let GpuPassthrough(gpu) = &mut self.backend else {
                     return Err(Error::State(
-                        "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf' (GpuPassthrough Backend \
-                         uninitialized)",
+                        "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf'/'ScanoutDmabuf2' \
+                         (GpuPassthrough Backend uninitialized)",
                     ));
                 };
                 if let Err(e) = gpu.rebuild_texture() {
-                    mks_warn!(error:? = e; "Failed to rebuild DMABUF texture on update");
+                    mks_error!(
+                        error:? = e;
+                        "Failed to rebuild DMABUF texture after UpdateDmabuf event; keeping previous texture"
+                    );
                 }
                 flags.frame = true;
             }
@@ -301,7 +316,10 @@ impl Screen {
         }
     }
 
-    /// 宽 x 高
+    /// Returns `(width, height)` in pixels for the current backend.
+    ///
+    /// - `width`: frame width.
+    /// - `height`: frame height.
     pub fn resolution(&self) -> (u32, u32) {
         match &self.backend {
             SoftwareRasterizer(sw) => sw.resolution().unwrap_or((0, 0)),

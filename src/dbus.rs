@@ -1,3 +1,4 @@
+//! QEMU display D-Bus modules.
 pub mod console;
 pub mod keyboard;
 pub mod listener;

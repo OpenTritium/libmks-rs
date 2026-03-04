@@ -3,6 +3,7 @@ pub mod coordinate;
 pub mod direct_map;
 mod error;
 mod gpu_passthrough;
+pub mod input_daemon;
 pub mod input_handler;
 pub mod pixman_4cc;
 pub mod screen;

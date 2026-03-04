@@ -1,3 +1,4 @@
+//! Shared helpers and macros for D-Bus sessions.
 use futures_util::{
     Future, Stream, StreamExt,
     stream::{BoxStream, once},
@@ -5,6 +6,7 @@ use futures_util::{
 use zbus::proxy::PropertyChanged;
 use zvariant::OwnedValue;
 
+/// Returns a stream that emits one initial value, then all property updates.
 #[inline]
 pub fn fetch_then_update<Fut, S, T, U, F>(getter: Fut, updates: S, ctor: F) -> BoxStream<'static, zbus::Result<U>>
 where
@@ -108,7 +110,7 @@ pub mod macros {
                     if streams.is_empty() {
                         ::log::warn!(
                             target: concat!("mks.dbus.", $log_context),
-                            "No properties to watch for {}",
+                            "No D-Bus properties configured to watch for {}",
                             $log_context
                         );
                         return;
@@ -128,7 +130,7 @@ pub mod macros {
                                 ::log::error!(
                                     target: concat!("mks.dbus.", $log_context),
                                     error:? = e;
-                                    "Error reading {} property",
+                                    "Failed to read {} property update",
                                     $log_context
                                 );
                             }
@@ -179,7 +181,7 @@ pub mod macros {
                             ::log::error!(
                                 target: concat!("mks.dbus.", $log_context),
                                 error:? = e;
-                                "{} failed to call method",
+                                "Failed to invoke D-Bus method for {} command",
                                 $log_context
                             );
                         }

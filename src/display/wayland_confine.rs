@@ -1,6 +1,7 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
-use crate::{dbus::mouse::MouseController, mks_debug, mks_info, mks_warn};
+use crate::{display::input_daemon::InputCommand, mks_debug, mks_error, mks_info};
 use gdk4_wayland::{WaylandDisplay, gdk::Rectangle};
+use kanal::Sender;
 use std::{
     cell::RefCell,
     mem,
@@ -41,7 +42,7 @@ pub struct WaylandState {
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     pointer_capture: PointerCapture,
-    mouse_ctrl: Option<MouseController>,
+    input_tx: Option<Sender<InputCommand>>,
 }
 
 #[derive(Default)]
@@ -63,29 +64,29 @@ pub struct WaylandConfine {
 }
 
 impl WaylandConfine {
-    pub fn from_gdk(gdk_display: &WaylandDisplay, mouse_ctrl: MouseController) -> Self {
-        mks_info!("Initializing WaylandConfine using GDK safe bridge");
+    pub fn from_gdk(gdk_display: &WaylandDisplay, input_tx: Sender<InputCommand>) -> Self {
+        mks_info!("Initializing Wayland pointer confinement through the GDK bridge");
         let wl_display = gdk_display.wl_display().expect("Failed to get WlDisplay");
         let backend = wl_display.backend().upgrade().expect("Wayland connection is dead");
         let conn = Connection::from_backend(backend);
         let mut event_queue = conn.new_event_queue();
         let qh = event_queue.handle();
         let state = Rc::new(RefCell::new(WaylandState::default()));
-        state.borrow_mut().mouse_ctrl = Some(mouse_ctrl);
+        state.borrow_mut().input_tx = Some(input_tx);
         let display_proxy = conn.display();
         let _registry = display_proxy.get_registry(&qh, ());
-        // 等待服务器发回 Global 列表 (拿到 Seat 和 Constraints)
+        // Wait for globals so we can bind seat and pointer-constraints interfaces.
         if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
-            mks_warn!(error:? = e; "Roundtrip 1 failed");
+            mks_error!(error:? = e; "Wayland registry roundtrip failed");
         }
-        // 等待 Seat 发回 Capabilities -> 触发我们去拿 Pointer
+        // Wait for seat capabilities so we can request wl_pointer.
         if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
-            mks_warn!(error:? = e; "Roundtrip 2 failed");
+            mks_error!(error:? = e; "Wayland seat capability roundtrip failed");
         }
         Self { conn, event_queue: RefCell::new(event_queue), qh, state }
     }
 
-    /// 将指针约束在一个矩形内。
+    /// Constrains the pointer to `rect` on the target surface.
     ///
     /// Returns `true` only when pointer capture has been established successfully.
     ///
@@ -94,31 +95,31 @@ impl WaylandConfine {
     pub fn confine_pointer(&self, surface: &WlSurface, rect: &Rectangle, prefer_relative: bool) -> bool {
         let mut state = self.state.borrow_mut();
         let Some(constraints) = state.pointer_constraints.as_ref() else {
-            mks_warn!("Pointer constraints not available");
+            mks_error!("Wayland pointer-constraints protocol unavailable; cannot confine pointer");
             return false;
         };
         let Some(pointer) = state.pointer.as_ref() else {
-            mks_warn!("Pointer not available");
+            mks_error!("Wayland pointer unavailable; cannot confine pointer");
             return false;
         };
         if !matches!(state.pointer_capture, PointerCapture::None) {
-            mks_warn!("Pointer capture already active");
+            mks_error!("Pointer capture already active; ignoring duplicate confine request");
             return false;
         }
 
         if prefer_relative {
             let Some(relative_manager) = state.relative_pointer_manager.as_ref() else {
-                mks_warn!("Relative pointer protocol unavailable; refusing relative capture fallback");
+                mks_error!("Relative pointer protocol unavailable; cannot enable relative capture");
                 return false;
             };
             let relative = relative_manager.get_relative_pointer(pointer, &self.qh, ());
             let locked = constraints.lock_pointer(surface, pointer, None, Lifetime::Persistent, &self.qh, ());
             state.pointer_capture = PointerCapture::LockedRelative { locked, relative };
-            mks_info!("Pointer locked with native relative motion");
+            mks_info!("Pointer locked with native relative motion enabled");
         } else {
             // Absolute guest mode path.
             let Some(compositor) = state.compositor.as_ref() else {
-                mks_warn!("Compositor not available");
+                mks_error!("Wayland compositor unavailable; cannot confine pointer in absolute mode");
                 return false;
             };
             let region = compositor.create_region(&self.qh, ());
@@ -127,11 +128,11 @@ impl WaylandConfine {
                 constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.qh, ());
             region.destroy();
             state.pointer_capture = PointerCapture::Confined(confined);
-            mks_info!("Pointer confined with region mode (absolute guest mouse)");
+            mks_info!("Pointer confined to region for absolute guest mouse mode");
         }
         drop(state);
         if let Err(e) = self.conn.flush() {
-            mks_warn!(error:? = e; "Failed to flush connection");
+            mks_error!(error:? = e; "Failed to flush Wayland connection");
         }
         true
     }
@@ -143,12 +144,12 @@ impl WaylandConfine {
             PointerCapture::LockedRelative { locked, relative } => {
                 relative.destroy();
                 locked.destroy();
-                mks_info!("Pointer lock released");
+                mks_info!("Released pointer lock");
                 released = true;
             }
             PointerCapture::Confined(confined) => {
                 confined.destroy();
-                mks_info!("Pointer confine released");
+                mks_info!("Released pointer confinement");
                 released = true;
             }
             PointerCapture::None => {}
@@ -156,10 +157,10 @@ impl WaylandConfine {
 
         if released {
             if let Err(e) = self.conn.flush() {
-                mks_warn!(error:? = e; "Failed to flush connection");
+                mks_error!(error:? = e; "Failed to flush Wayland connection");
             }
         } else {
-            mks_warn!("Cannot unconfine a pointer that is not confined");
+            mks_error!("Pointer capture is not active; nothing to release");
         }
     }
 
@@ -167,10 +168,10 @@ impl WaylandConfine {
     pub fn dispatch_pending(&self) {
         let mut state = self.state.borrow_mut();
         if let Err(e) = self.event_queue.borrow_mut().dispatch_pending(state.deref_mut()) {
-            mks_warn!(error:? = e; "Failed to dispatch pending events");
+            mks_error!(error:? = e; "Failed to dispatch pending Wayland events");
         }
         if let Err(e) = self.conn.flush() {
-            mks_warn!(error:? = e; "Failed to flush connection");
+            mks_error!(error:? = e; "Failed to flush Wayland connection");
         }
     }
 
@@ -228,9 +229,9 @@ impl Dispatch<ZwpConfinedPointerV1, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwp_confined_pointer_v1::Event::Confined => mks_debug!("Recved pointer confined event"),
+            zwp_confined_pointer_v1::Event::Confined => mks_debug!("Received pointer confined event"),
             zwp_confined_pointer_v1::Event::Unconfined => {
-                mks_debug!("Receved pointer unconfined event")
+                mks_debug!("Received pointer unconfined event")
             }
             _ => {}
         }
@@ -281,10 +282,10 @@ impl Dispatch<ZwpRelativePointerV1, ()> for WaylandState {
             let step_y = quantize_realtime_delta(dy);
 
             if (step_x != 0 || step_y != 0)
-                && let Some(ctrl) = state.mouse_ctrl.as_ref()
-                && let Err(e) = ctrl.rel_motion(step_x, step_y)
+                && let Some(tx) = state.input_tx.as_ref()
+                && let Err(e) = tx.send(InputCommand::MouseRel(step_x, step_y))
             {
-                mks_warn!(error:? = e; "Failed to send native relative motion");
+                mks_error!(error:? = e; "Failed to forward native relative motion; dropping event");
             }
         }
     }

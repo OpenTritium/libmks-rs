@@ -258,31 +258,33 @@ pub struct UnknownPixmanFormat;
 ///
 /// This helps avoid unintended composition with transparent guest content on DMABUF paths.
 #[inline]
-pub const fn sanitize_opaque_fourcc(fourcc: drm_4cc::FourCC) -> drm_4cc::FourCC {
-    match fourcc {
-        drm_4cc::ARGB4444 => drm_4cc::XRGB4444,
-        drm_4cc::ABGR4444 => drm_4cc::XBGR4444,
-        drm_4cc::RGBA4444 => drm_4cc::RGBX4444,
-        drm_4cc::BGRA4444 => drm_4cc::BGRX4444,
-        drm_4cc::ARGB1555 => drm_4cc::XRGB1555,
-        drm_4cc::ABGR1555 => drm_4cc::XBGR1555,
-        drm_4cc::RGBA5551 => drm_4cc::RGBX5551,
-        drm_4cc::BGRA5551 => drm_4cc::BGRX5551,
-        drm_4cc::ARGB8888 => drm_4cc::XRGB8888,
-        drm_4cc::ABGR8888 => drm_4cc::XBGR8888,
-        drm_4cc::RGBA8888 => drm_4cc::RGBX8888,
-        drm_4cc::BGRA8888 => drm_4cc::BGRX8888,
-        drm_4cc::ARGB2101010 => drm_4cc::XRGB2101010,
-        drm_4cc::ABGR2101010 => drm_4cc::XBGR2101010,
-        drm_4cc::RGBA1010102 => drm_4cc::RGBX1010102,
-        drm_4cc::BGRA1010102 => drm_4cc::BGRX1010102,
-        drm_4cc::ARGB16161616 => drm_4cc::XRGB16161616,
-        drm_4cc::ABGR16161616 => drm_4cc::XBGR16161616,
-        drm_4cc::ARGB16161616F => drm_4cc::XRGB16161616F,
-        drm_4cc::ABGR16161616F => drm_4cc::XBGR16161616F,
-        drm_4cc::AVUY8888 => drm_4cc::XVUY8888,
-        _ => fourcc,
-    }
+pub const fn sanitize_opaque_fourcc(fourcc: FourCC) -> Result<FourCC, FourCC> {
+    use drm_4cc::*;
+    let fourcc = match fourcc {
+        ARGB4444 => XRGB4444,
+        ABGR4444 => XBGR4444,
+        RGBA4444 => RGBX4444,
+        BGRA4444 => BGRX4444,
+        ARGB1555 => XRGB1555,
+        ABGR1555 => XBGR1555,
+        RGBA5551 => RGBX5551,
+        BGRA5551 => BGRX5551,
+        ARGB8888 => XRGB8888,
+        ABGR8888 => XBGR8888,
+        RGBA8888 => RGBX8888,
+        BGRA8888 => BGRX8888,
+        ARGB2101010 => XRGB2101010,
+        ABGR2101010 => XBGR2101010,
+        RGBA1010102 => RGBX1010102,
+        BGRA1010102 => BGRX1010102,
+        ARGB16161616 => XRGB16161616,
+        ABGR16161616 => XBGR16161616,
+        ARGB16161616F => XRGB16161616F,
+        ABGR16161616F => XBGR16161616F,
+        AVUY8888 => XVUY8888,
+        _ => return Err(fourcc),
+    };
+    Ok(fourcc)
 }
 
 impl TryFrom<Pixman> for drm_4cc::FourCC {
@@ -408,19 +410,19 @@ mod tests {
 
     #[test]
     fn test_sanitize_opaque_fourcc_converts_alpha_formats() {
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB8888), drm_4cc::XRGB8888);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ABGR8888), drm_4cc::XBGR8888);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGBA8888), drm_4cc::RGBX8888);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::BGRA8888), drm_4cc::BGRX8888);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB2101010), drm_4cc::XRGB2101010);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB16161616F), drm_4cc::XRGB16161616F);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB8888), Ok(drm_4cc::XRGB8888));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ABGR8888), Ok(drm_4cc::XBGR8888));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGBA8888), Ok(drm_4cc::RGBX8888));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::BGRA8888), Ok(drm_4cc::BGRX8888));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB2101010), Ok(drm_4cc::XRGB2101010));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::ARGB16161616F), Ok(drm_4cc::XRGB16161616F));
     }
 
     #[test]
     fn test_sanitize_opaque_fourcc_keeps_opaque_formats() {
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XRGB8888), drm_4cc::XRGB8888);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XBGR2101010), drm_4cc::XBGR2101010);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::YUYV), drm_4cc::YUYV);
-        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGB565), drm_4cc::RGB565);
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XRGB8888), Err(drm_4cc::XRGB8888));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::XBGR2101010), Err(drm_4cc::XBGR2101010));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::YUYV), Err(drm_4cc::YUYV));
+        assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGB565), Err(drm_4cc::RGB565));
     }
 }

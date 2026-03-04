@@ -31,12 +31,11 @@
 use libmks_rs::{
     dbus::{
         console::{ConsoleController, ConsoleSession},
-        keyboard::KeyboardController,
         listener::{self, Event as QemuEvent},
-        mouse::MouseController,
         vm,
     },
     display::{
+        input_daemon::{InputBusSetup, InputDaemon, InputStateEvent},
         input_handler::InputHandler,
         vm_display::{GrabShortcut, InputMode, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
@@ -53,6 +52,8 @@ struct AppResources {
     _listener_conn: zbus::Connection,
     /// Console session (kept alive to keep background tasks running)
     _console_session: ConsoleSession,
+    /// Input daemon (kept alive to keep input worker and watchers running)
+    _input_daemon: InputDaemon,
 }
 
 struct AppModel {
@@ -74,8 +75,8 @@ enum AppMsg {
     Connected {
         resources: AppResources,
         console_ctrl: ConsoleController,
-        mouse: Option<(MouseController, libmks_rs::dbus::mouse::MouseSession)>,
-        keyboard: Option<(KeyboardController, libmks_rs::dbus::keyboard::KeyboardSession)>,
+        input_handler: InputHandler,
+        input_state_rx: kanal::AsyncReceiver<InputStateEvent>,
         event_rx: kanal::AsyncReceiver<QemuEvent>,
     },
     ConnectFailed(String),
@@ -206,15 +207,19 @@ impl SimpleComponent for AppModel {
         // Spawn background connection task using the global Tokio runtime
         // This works because #[tokio::main] creates a persistent multi-threaded runtime
         let sender_clone = sender.clone();
-        tokio::spawn(async move {
+        relm4::spawn_local(async move {
             info!("[BACKGROUND] Starting connection task...");
             match connect_to_qemu(socket_path, mode).await {
-                Ok((resources, console_ctrl, mouse, keyboard, event_rx)) => {
+                Ok((resources, console_ctrl, input_handler, input_state_rx, event_rx)) => {
                     info!("[BACKGROUND] Connection successful, sending message to UI...");
                     // Note: resources now contains console_session to keep background tasks alive
-                    sender_clone.input(AppMsg::Connected { resources, console_ctrl, mouse, keyboard, event_rx });
-                    // Keep the async runtime alive forever
-                    futures_util::future::pending::<()>().await;
+                    sender_clone.input(AppMsg::Connected {
+                        resources,
+                        console_ctrl,
+                        input_handler,
+                        input_state_rx,
+                        event_rx,
+                    });
                 }
                 Err(e) => {
                     error!("[BACKGROUND] Connection failed: {}", e);
@@ -296,19 +301,13 @@ impl SimpleComponent for AppModel {
                     display.emit(VmDisplayMsg::MouseModeChanged { is_absolute });
                 }
             }
-            AppMsg::Connected { resources, console_ctrl, mut mouse, keyboard, event_rx } => {
+            AppMsg::Connected { resources, console_ctrl, input_handler, input_state_rx, event_rx } => {
                 info!("[UPDATE] Connected message received, setting up display...");
 
                 // 1. Store resources to keep D-Bus connections alive
                 self.resources = Some(resources);
 
-                // 2. Extract MouseSession's event receiver for listening to IsAbsolute events
-                let mouse_rx = mouse.as_mut().map(|(_, session)| session.rx.clone());
-
-                // 3. Create input handler (sessions are kept alive by the AppMsg tuple)
-                let input_handler = InputHandler::builder().mouse(mouse).keyboard(keyboard).build();
-
-                // 4. Launch VmDisplayModel
+                // 2. Launch VmDisplayModel
                 let display_controller = VmDisplayModel::builder()
                     .launch(VmDisplayInit {
                         rx: event_rx,
@@ -318,27 +317,23 @@ impl SimpleComponent for AppModel {
                     })
                     .forward(sender.input_sender(), |_| AppMsg::Ignore);
 
-                // 5. Listen to D-Bus mouse events and forward to UI
-                if let Some(rx) = mouse_rx {
-                    use libmks_rs::dbus::mouse::Event;
-
-                    let app_sender = sender.clone();
-                    tokio::spawn(async move {
-                        while let Ok(event) = rx.recv().await {
-                            match event {
-                                Event::IsAbsolute(is_abs) => {
-                                    app_sender.input(AppMsg::GuestMouseModeChanged { is_absolute: is_abs });
-                                }
+                // 3. Listen to input state events and forward to UI
+                {
+                    let app_sender = sender.input_sender().clone();
+                    relm4::spawn_local(async move {
+                        while let Ok(event) = input_state_rx.recv().await {
+                            if let InputStateEvent::MouseIsAbsolute(is_abs) = event {
+                                app_sender.emit(AppMsg::GuestMouseModeChanged { is_absolute: is_abs });
                             }
                         }
                     });
                 }
 
-                // 6. Get the widget and replace loading with VM display
+                // 4. Get the widget and replace loading with VM display
                 let display_widget = display_controller.widget();
                 self.main_container.set_child(Some(display_widget));
 
-                // 7. Store controller to prevent it from being dropped
+                // 5. Store controller to prevent it from being dropped
                 self.display = Some(display_controller);
                 if let Some(display) = &self.display {
                     display.emit(VmDisplayMsg::SetScalingMode(self.scaling_mode));
@@ -410,19 +405,18 @@ fn print_usage(bin: &str) {
 /// Connect to QEMU and send events via the provided kanal async channel.
 ///
 /// Returns:
-/// - console_ctrl: Console controller for sending commands
 /// - resources: D-Bus connections that must be kept alive
 /// - console_ctrl: Console controller for sending commands
-/// - mouse: Option<(MouseController, MouseSession)>
-/// - keyboard: Option<(KeyboardController, KeyboardSession)>
+/// - input_handler: UI-thread input handler that sends commands to the input worker
+/// - input_state_rx: Input state events (mouse mode/modifiers/touch slots)
 /// - event_rx: Receiver for display events (to pass to VmDisplayModel)
 async fn connect_to_qemu(
     socket_path: std::path::PathBuf, mode: ListenerMode,
 ) -> anyhow::Result<(
     AppResources,
     ConsoleController,
-    Option<(MouseController, libmks_rs::dbus::mouse::MouseSession)>,
-    Option<(KeyboardController, libmks_rs::dbus::keyboard::KeyboardSession)>,
+    InputHandler,
+    kanal::AsyncReceiver<InputStateEvent>,
     kanal::AsyncReceiver<QemuEvent>,
 )> {
     info!("Connecting to QEMU at {:?}", socket_path);
@@ -492,6 +486,7 @@ async fn connect_to_qemu(
     let mut console_height = 600u32;
     let mut has_keyboard = false;
     let mut has_mouse = false;
+    let mut has_multitouch = false;
 
     // Use timeout to avoid waiting forever
     let mut events_received = 0;
@@ -515,6 +510,7 @@ async fn connect_to_qemu(
                             libmks_rs::dbus::console::Event::Interfaces(ifaces) => {
                                 has_keyboard = ifaces.contains(&"org.qemu.Display1.Keyboard".to_string());
                                 has_mouse = ifaces.contains(&"org.qemu.Display1.Mouse".to_string());
+                                has_multitouch = ifaces.contains(&"org.qemu.Display1.MultiTouch".to_string());
                                 info!("Console interfaces: {:?}", ifaces);
                             }
                             _ => {}
@@ -532,31 +528,6 @@ async fn connect_to_qemu(
             }
         }
     }
-
-    // Create keyboard and mouse controllers
-    // These need proper sessions to be created for the console's keyboard/mouse interfaces
-    let kbd_path = format!("/org/qemu/Display1/Console_{}", console_id);
-    let mouse_path = format!("/org/qemu/Display1/Console_{}", console_id);
-
-    // Create keyboard session if available
-    info!("Creating keyboard session, has_keyboard: {}", has_keyboard);
-    let keyboard = if has_keyboard {
-        let kbd_session = libmks_rs::dbus::keyboard::KeyboardSession::connect(&conn, &kbd_path).await?;
-        Some((kbd_session.tx.clone(), kbd_session))
-    } else {
-        None
-    };
-    info!("Keyboard session created");
-
-    // Create mouse session if available
-    info!("Creating mouse session, has_mouse: {}", has_mouse);
-    let mouse = if has_mouse {
-        let mouse_session = libmks_rs::dbus::mouse::MouseSession::connect(&conn, &mouse_path).await?;
-        Some((mouse_session.tx.clone(), mouse_session))
-    } else {
-        None
-    };
-    info!("Mouse session created");
 
     // ================================================================
     // FIX: Use correct timing - send FD to QEMU first, then establish D-Bus connection
@@ -620,11 +591,27 @@ async fn connect_to_qemu(
     )?;
     info!("Set UI info: {}x{}", console_width, console_height);
 
+    // Build unified input bus from discovered console interfaces.
+    info!("Setting up input bus: keyboard={}, mouse={}, multitouch={}", has_keyboard, has_mouse, has_multitouch);
+    let input_setup = InputBusSetup::builder()
+        .conn(conn.clone())
+        .console_path(console_path.clone())
+        .with_keyboard(has_keyboard)
+        .with_mouse(has_mouse)
+        .with_multitouch(has_multitouch)
+        .build();
+    let (input_handler, input_state_rx, input_daemon) = input_setup.dispatch().await?;
+
     // Create resources package to keep connections alive
     // Note: console_session must be kept alive to maintain background tasks (watch_task, cmd_handler)
-    let resources = AppResources { _conn: conn, _listener_conn: listener_conn, _console_session: console_session };
+    let resources = AppResources {
+        _conn: conn,
+        _listener_conn: listener_conn,
+        _console_session: console_session,
+        _input_daemon: input_daemon,
+    };
 
-    Ok((resources, console_ctrl, mouse, keyboard, event_rx))
+    Ok((resources, console_ctrl, input_handler, input_state_rx, event_rx))
 }
 
 #[tokio::main]

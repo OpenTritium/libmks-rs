@@ -1,4 +1,5 @@
-//! https://github.com/torvalds/linux/blob/master/include/uapi/linux/udmabuf.h
+//! Linux UDMABUF ioctl binding.
+//! Reference: <https://github.com/torvalds/linux/blob/master/include/uapi/linux/udmabuf.h>
 pub mod utils;
 use rustix::{
     fd::{FromRawFd, OwnedFd, RawFd},
@@ -12,6 +13,7 @@ const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
 
 #[repr(C)]
 #[derive(Debug, Default)]
+/// ABI-compatible payload for `UDMABUF_CREATE`.
 pub struct UdmabufCreate {
     memfd: u32,
     flags: u32,

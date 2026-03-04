@@ -13,7 +13,7 @@ use super::{
         utils::fetch_page_size,
     },
 };
-use crate::{mks_debug, mks_error, mks_warn};
+use crate::{mks_debug, mks_error};
 use relm4::gtk::gdk::Texture;
 use rustix::{
     fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
@@ -162,8 +162,8 @@ impl UdmaSurface {
             || width > self.width.saturating_sub(x)
             || height > self.height.saturating_sub(y)
         {
-            mks_warn!(
-                "Dropping out-of-bounds partial update: rect=({},{} {}x{}), surface={}x{}",
+            mks_error!(
+                "Ignoring out-of-bounds partial update: rect=({},{} {}x{}), surface={}x{}",
                 x,
                 y,
                 width,
@@ -211,7 +211,7 @@ impl Drop for UdmaSurface {
         // SAFETY: We must use the original aligned allocation size.
         unsafe {
             if let Err(e) = munmap(self.ptr.as_ptr() as *mut _, self.capacity) {
-                mks_error!(error:?=e; "Failed to unmap memory")
+                mks_error!(error:?=e; "Failed to unmap UDMA surface memory during drop")
             }
         }
     }
@@ -263,6 +263,10 @@ impl Swapchain {
         unsafe { self.buffers.get_unchecked_mut(shadow_idx) }
     }
 
+    /// Returns `(width, height)` of the active frame buffer.
+    ///
+    /// - `width`: active frame width in pixels.
+    /// - `height`: active frame height in pixels.
     #[inline]
     pub fn resolution(&self) -> Option<(u32, u32)> { self.active_buf().as_ref().map(|b| (b.width, b.height)) }
 
@@ -376,7 +380,7 @@ impl Swapchain {
         let required = (clipped_height as usize - 1).saturating_mul(src_stride) + row_bytes;
         if buf.len() < required {
             mks_debug!(
-                "Ignoring partial update with short payload: need={required}, got={}, rect={}x{}, stride={}",
+                "Ignoring partial update: payload too short (need={required}, got={}, rect={}x{}, stride={})",
                 buf.len(),
                 clipped_width,
                 clipped_height,

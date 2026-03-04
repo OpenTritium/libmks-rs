@@ -18,12 +18,15 @@ use typed_builder::TypedBuilder;
 use zbus::{Connection, DBusError, interface};
 use zvariant::{OwnedFd, Type};
 
+/// Errors returned by listener methods.
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "org.qemu.Display1.Listener")]
 pub enum EmitError {
+    /// Event channel closed before the event could be forwarded.
     ChannelClosed(String),
 }
 
+/// Byte payload wrapper used in listener events.
 #[derive(Clone, PartialEq, Eq, AsRef, Deref, From, Into, Type)]
 pub struct Blob(pub Vec<u8>);
 
@@ -36,52 +39,24 @@ impl Borrow<[u8]> for Blob {
     fn borrow(&self) -> &[u8] { &self.0 }
 }
 
+/// Unified event stream for all listener interfaces.
 #[derive(Debug, PartialEq)]
 pub enum Event {
-    Scanout {
-        width: u32,
-        height: u32,
-        stride: u32,
-        pixman_format: u32,
-        data: Blob,
-    },
-    Update {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        stride: u32,
-        pixman_format: u32,
-        data: Blob,
-    },
-    ScanoutDmabuf {
-        dmabuf: OwnedFd,
-        width: u32,
-        height: u32,
-        stride: u32,
-        fourcc: u32,
-        modifier: u64,
-        y0_top: bool,
-    },
-    UpdateDmabuf {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    },
+    /// Full framebuffer image.
+    Scanout { width: u32, height: u32, stride: u32, pixman_format: u32, data: Blob },
+    /// Partial framebuffer rectangle update.
+    Update { x: i32, y: i32, width: i32, height: i32, stride: u32, pixman_format: u32, data: Blob },
+    /// Framebuffer export through a single DMABUF fd.
+    ScanoutDmabuf { dmabuf: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64, y0_top: bool },
+    /// Partial update for the current DMABUF scanout.
+    UpdateDmabuf { x: i32, y: i32, width: i32, height: i32 },
+    /// Disable display output.
     Disable,
-    MouseSet {
-        x: i32,
-        y: i32,
-        on: i32,
-    },
-    CursorDefine {
-        width: i32,
-        height: i32,
-        hot_x: i32,
-        hot_y: i32,
-        data: Blob,
-    },
+    /// Update host cursor position/visibility.
+    MouseSet { x: i32, y: i32, on: i32 },
+    /// Define a cursor image and hotspot.
+    CursorDefine { width: i32, height: i32, hot_x: i32, hot_y: i32, data: Blob },
+    /// Multi-plane DMABUF scanout payload.
     ScanoutDmabuf2 {
         dmabuf: Vec<OwnedFd>,
         x: u32,
@@ -97,20 +72,10 @@ pub enum Event {
         modifier: u64,
         y0_top: bool,
     },
-    ScanoutMap {
-        memfd: OwnedFd,
-        offset: u32,
-        width: u32,
-        height: u32,
-        stride: u32,
-        pixman_format: u32,
-    },
-    UpdateMap {
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    },
+    /// Framebuffer export through shared memory mapping.
+    ScanoutMap { memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32 },
+    /// Partial update for the current mapped scanout.
+    UpdateMap { x: i32, y: i32, width: i32, height: i32 },
 }
 
 trait EventEmitter {
@@ -121,8 +86,11 @@ trait EventEmitter {
     }
 }
 
+/// Main implementation of `org.qemu.Display1.Listener`.
 pub struct Listener {
+    /// Event sink shared by all interface handlers.
     pub tx: AsyncSender<Event>,
+    /// Interface names exposed by the `Interfaces` property.
     pub ifaces: Box<[&'static str]>,
 }
 
@@ -177,19 +145,26 @@ impl Listener {
     }
 }
 
+/// Core listener interface name.
 pub const IFACE_DISPLAY_LISTENER: &str = "org.qemu.Display1.Listener";
+/// Optional shared-memory scanout interface name.
 pub const IFACE_SCANOUT_MAP: &str = "org.qemu.Display1.Listener.Unix.Map";
+/// Optional multi-plane DMABUF scanout interface name.
 pub const IFACE_SCANOUT_DMABUF2: &str = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2";
 
+/// Feature flags controlling which listener interfaces are exported.
 #[derive(TypedBuilder, Clone, Debug)]
 pub struct Options {
     #[builder(default = true)]
+    /// Export `org.qemu.Display1.Listener.Unix.ScanoutDMABUF2`.
     pub with_dmabuf2: bool,
     #[builder(default = false)]
+    /// Export `org.qemu.Display1.Listener.Unix.Map`.
     pub with_map: bool,
 }
 
 impl Listener {
+    /// Builds a listener and computes the `Interfaces` property from [`Options`].
     #[inline]
     pub fn from_opts(opts: Options, tx: AsyncSender<Event>) -> Self {
         let mut ifaces = Vec::with_capacity(3);
@@ -204,6 +179,7 @@ impl Listener {
     }
 }
 
+/// Handler for `org.qemu.Display1.Listener.Unix.ScanoutDMABUF2`.
 #[derive(Debug, Clone, AsRef, Deref)]
 pub struct Dmabuf2Handler(pub AsyncSender<Event>);
 
@@ -239,6 +215,7 @@ impl Dmabuf2Handler {
     }
 }
 
+/// Handler for `org.qemu.Display1.Listener.Unix.Map`.
 #[derive(Debug, Clone, AsRef, Deref)]
 pub struct MapHandler(pub AsyncSender<Event>);
 
@@ -261,6 +238,7 @@ impl MapHandler {
     }
 }
 
+/// Registers listener objects on `/org/qemu/Display1/Listener` and returns the event receiver.
 pub async fn serve(conn: &Connection, opts: Options) -> MksResult<AsyncReceiver<Event>> {
     let (event_tx, event_rx) = kanal::bounded_async::<Event>(8192);
     const LISTENER_PATH: &str = "/org/qemu/Display1/Listener";

@@ -56,30 +56,45 @@ trait Console {
     fn interfaces(&self) -> Result<Vec<String>>;
 }
 
+/// Console class reported by QEMU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type, Deserialize, Value, OwnedValue)]
 #[zvariant(signature = "s")]
 pub enum ConsoleType {
+    /// Text-only terminal output.
     Text,
+    /// Pixel-based graphical output.
     Graphic,
 }
 
+/// Commands consumed by the console command handler.
 #[derive(Debug)]
 pub enum Command {
+    /// Update UI geometry and viewport metadata.
     SetUiInfo { width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32 },
+    /// Register a listener object that implements `org.qemu.Display1.Listener`.
     RegisterListener(OwnedFd),
 }
 
+/// Property change events emitted by the console watcher.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// New display height in pixels.
     Height(u32),
+    /// New display width in pixels.
     Width(u32),
+    /// New human-readable console label.
     Label(String),
+    /// New console type.
     Type(ConsoleType),
+    /// New hardware device address.
     DeviceAddress(String),
+    /// New head index on the device.
     Head(u32),
+    /// New list of optional interfaces exposed by this console.
     Interfaces(Vec<String>),
 }
 
+/// Non-blocking command sender for a console session.
 #[derive(AsRef, Deref, From, Clone)]
 pub struct ConsoleController(pub AsyncSender<Command>);
 

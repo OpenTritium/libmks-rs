@@ -1,7 +1,7 @@
 use super::{
     Error,
     pixman_4cc::{FourCC, Pixman},
-    udma::{DRM_FORMAT_MOD_LINEAR, Damage, DmabufPlane, build_dmabuf_texture_planar, create_udmabuf_fd},
+    udma::{DRM_FORMAT_MOD_LINEAR, DmabufPlane, build_dmabuf_texture_planar, create_udmabuf_fd},
 };
 use relm4::gtk::gdk::Texture;
 use rustix::fs::{Stat, fstat};
@@ -67,7 +67,6 @@ impl DmabufImport {
 pub struct ImportedTexture {
     buffer: Option<DmabufImport>,
     texture: Option<Texture>,
-    last_damage: Option<Damage>,
 }
 
 impl Default for ImportedTexture {
@@ -76,7 +75,7 @@ impl Default for ImportedTexture {
 
 impl ImportedTexture {
     #[inline]
-    pub const fn new() -> Self { Self { buffer: None, texture: None, last_damage: None } }
+    pub const fn new() -> Self { Self { buffer: None, texture: None } }
 
     /// Updates the texture, reusing the existing mapping if the underlying memory object (inode) matches.
     #[inline]
@@ -84,10 +83,8 @@ impl ImportedTexture {
         &mut self, memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32,
     ) -> Result<Texture, Error> {
         let pixman = Pixman::from(pixman_format);
-
         // Check file identity. QEMU may send different FDs for the same underlying memory.
         let stat = fstat(&memfd)?;
-
         // Attempt to reuse existing mapping
         if let Some(buf) = &self.buffer
             && buf.matches(&stat, offset, width, height, stride, pixman)
@@ -96,7 +93,6 @@ impl ImportedTexture {
             // `memfd` is dropped here, closing the duplicate FD, which is correct.
             return Ok(self.texture.as_ref().expect("Texture missing in cache").clone());
         }
-
         // Cache miss: Create new mapping and texture
         let fourcc: FourCC = pixman.try_into()?;
         let buffer = DmabufImport::new(memfd, offset, width, height, stride, pixman)?;
@@ -105,11 +101,6 @@ impl ImportedTexture {
         self.buffer = Some(buffer);
         self.texture = Some(texture.clone());
         Ok(texture)
-    }
-
-    #[inline]
-    pub const fn record_damage(&mut self, x: u32, y: u32, width: u32, height: u32) {
-        self.last_damage = Some(Damage { x, y, width, height });
     }
 
     #[inline]
@@ -123,7 +114,6 @@ impl ImportedTexture {
     pub fn clear(&mut self) {
         self.buffer = None;
         self.texture = None;
-        self.last_damage = None;
     }
 }
 
@@ -240,5 +230,27 @@ mod tests {
         if let Some(buf) = &cache.buffer {
             assert!(!buf.matches(&stat2, 0, 1920, 1080, 7680, pixman));
         }
+    }
+
+    #[test]
+    fn test_imported_texture_new_has_empty_state() {
+        let cache = ImportedTexture::new();
+        assert!(cache.texture().is_none());
+        assert!(cache.resolution().is_none());
+    }
+
+    #[test]
+    fn test_imported_texture_clear_resets_buffer_state() {
+        let memfd = memfd_create("clear_test", MemfdFlags::CLOEXEC).unwrap();
+        let pixman = Pixman::from(0);
+        let mapping = create_mock_mapping(memfd, 1024, 768, 4096, pixman);
+
+        let mut cache = ImportedTexture::new();
+        cache.buffer = Some(mapping);
+        assert_eq!(cache.resolution(), Some((1024, 768)));
+
+        cache.clear();
+        assert!(cache.texture().is_none());
+        assert!(cache.resolution().is_none());
     }
 }

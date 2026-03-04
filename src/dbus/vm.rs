@@ -24,25 +24,31 @@ pub trait Vm {
     #[zbus(property, name = "ConsoleIDs")]
     fn console_ids(&self) -> Result<Vec<u32>>;
 
-    /// This property lists extra interfaces provided by the /org/qemu/Display1/VM object, and can be used to detect the
-    /// capabilities with which they are communicating. Unlike the standard D-Bus Introspectable interface, querying
-    /// this property does not require parsing XML. (earlier version of the display interface do not provide this
-    /// property)
+    /// Extra interfaces exposed by `/org/qemu/Display1/VM` for capability detection.
+    ///
+    /// This avoids XML introspection and may be missing on older display protocol versions.
     #[zbus(property)]
     fn interfaces(&self) -> Result<Vec<String>>;
 }
 
+/// VM property change events.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// VM name changed.
     Name(String),
+    /// VM UUID changed.
     Uuid(String),
+    /// Console id list changed.
     ConsoleIds(Vec<u32>),
+    /// Optional interface list changed.
     Interfaces(Vec<String>),
 }
 
 /// VM event listener and its watch task.
 pub struct VmListener {
+    /// Stream of VM property events.
     pub rx: AsyncReceiver<Event>,
+    /// Background watcher task handle.
     pub watch_task: AbortHandle,
 }
 
@@ -50,7 +56,7 @@ impl Drop for VmListener {
     fn drop(&mut self) { self.watch_task.abort(); }
 }
 
-/// Connect to the VM interface and return an event listener with its watch task.
+/// Connects to the VM interface and starts a property watcher task.
 pub async fn connect(conn: &Connection) -> crate::MksResult<VmListener> {
     let proxy = VmProxy::new(conn).await?;
     let (event_tx, event_rx) = kanal::unbounded_async::<Event>();
