@@ -1,6 +1,20 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
 use crate::{display::input_daemon::InputCommand, mks_debug, mks_error, mks_info};
-use gdk4_wayland::{WaylandDisplay, gdk::Rectangle};
+use gdk4_wayland::{
+    WaylandDisplay,
+    gdk::Rectangle,
+    wayland_client::{
+        Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
+        protocol::{
+            wl_compositor::{self, WlCompositor},
+            wl_pointer::{self, WlPointer},
+            wl_region::{self, WlRegion},
+            wl_registry::{self, WlRegistry},
+            wl_seat::{self, Capability, WlSeat},
+            wl_surface::WlSurface,
+        },
+    },
+};
 use kanal::Sender;
 use std::{
     cell::RefCell,
@@ -9,17 +23,17 @@ use std::{
     os::unix::io::{AsFd, RawFd},
     rc::Rc,
 };
-use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
-    protocol::{
-        wl_compositor::{self, WlCompositor},
-        wl_pointer::{self, WlPointer},
-        wl_region::{self, WlRegion},
-        wl_registry::{self, WlRegistry},
-        wl_seat::{self, Capability, WlSeat},
-        wl_surface::WlSurface,
-    },
-};
+// use wayland_client::{
+//     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
+//     protocol::{
+//         wl_compositor::{self, WlCompositor},
+//         wl_pointer::{self, WlPointer},
+//         wl_region::{self, WlRegion},
+//         wl_registry::{self, WlRegistry},
+//         wl_seat::{self, Capability, WlSeat},
+//         wl_surface::WlSurface,
+//     },
+// };
 use wayland_protocols::wp::{
     pointer_constraints::zv1::client::{
         zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},

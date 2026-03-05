@@ -15,6 +15,7 @@ use gdk4_wayland::{
     gdk::{Key, ModifierType, Rectangle, Texture},
     glib::{ControlFlow, IOCondition, Propagation, SourceId, translate::IntoGlib, unix_fd_add_local},
     prelude::*,
+    wayland_client::protocol::wl_surface::WlSurface,
 };
 use kanal::AsyncReceiver;
 use relm4::{
@@ -28,7 +29,6 @@ use relm4::{
 };
 use std::{borrow::Cow, cell::RefCell, fmt, mem, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
 use tokio::{task::AbortHandle, time::sleep};
-use wayland_client::protocol::wl_surface::WlSurface;
 
 const LOG_TARGET: &str = "mks.display.vm";
 const INCH_TO_MM: f32 = 25.4;

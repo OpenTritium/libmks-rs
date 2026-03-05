@@ -2,36 +2,39 @@
 name = "libmks-rs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
 description = "Rust port of libmks - Mouse, Keyboard, Screen for QEMU"
 repository = "https://github.com/yourusername/libmks-rs"
 license = "LGPL-2.1-or-later"
 
 [dependencies]
-anyhow = "1.0"
-bitflags = { version = "2.0", features = ["serde"] }
-bytemuck = "1.21"
+anyhow = "1"
+bitflags = { version = "2", features = ["serde"] }
 derive_more = { version = "2", features = ["full"] }
 env_logger = "0.11"
 fastrace = { version = "0.7", features = ["enable"] }
 futures-util = "0.3"
 kanal = "0.1.1"
 log = { version = "0.4", features = ["kv_unstable"] }
-num_enum = "0.7"
 relm4 = { version = "0.10.1", features = ["gnome_48"] }
-rustix = { version = "1.1.3", features = ["fs", "io_uring", "mm", "net", "param", "process", "thread"] }
-serde = { version = "1.0", features = ["derive"] }
+rustix = { version = "1.1", features = [
+  "fs",
+  "io_uring",
+  "mm",
+  "net",
+  "param",
+  "process",
+  "thread",
+] }
+serde = { version = "1", features = ["derive"] }
 serde_repr = "0.1"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["full"] }
-zbus = "5.13.2"
+tokio = { version = "1.50", features = ["full"] }
+zbus = "5.14"
 zvariant = "5"
 typed-builder = "0.23"
-either = "1.15.0"
 
 # Wayland pointer constraints support
-wayland-client = { version = "0.31" }
-wayland-protocols = { version = "0.32", features = ["unstable", "wayland-client"] }
+wayland-protocols = { version = "0.32", features = ["unstable"] }
 gdk4-wayland = { version = "0.10.3", features = ["wayland_crate", "v4_18"] }
 
 [dev-dependencies]
