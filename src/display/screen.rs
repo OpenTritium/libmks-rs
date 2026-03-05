@@ -1,5 +1,8 @@
 //! Screen and cursor state model.
-use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
+use super::{
+    gpu_passthrough::{DmabufScanout, GpuPassthrough},
+    pixman_4cc::Pixman,
+};
 use crate::{
     dbus::listener::Event,
     display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
@@ -141,11 +144,19 @@ impl RenderBackend {
 pub struct Screen {
     pub cursor: CursorState,
     pub backend: RenderBackend,
+    pub staged_scanout: Option<(DmabufScanout, bool)>,
     pub y0_top: bool,
 }
 
 impl Screen {
-    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, y0_top: false } }
+    pub fn new() -> Self {
+        Self {
+            cursor: CursorState::default(),
+            backend: RenderBackend::None,
+            staged_scanout: Option::None,
+            y0_top: false,
+        }
+    }
 
     /// Applies one display event and returns dirty flags for frame/cursor refresh.
     #[inline]
@@ -156,6 +167,7 @@ impl Screen {
             Scanout { width, height, stride, pixman_format, data } => {
                 let bytes = data.len();
                 mks_trace!("Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={bytes}");
+                self.staged_scanout = Option::None;
                 self.y0_top = false;
                 let pixman = Pixman::from(pixman_format);
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
@@ -191,20 +203,10 @@ impl Screen {
                     "ScanoutDMABUF: {width}x{height}, stride={stride}, fourcc=0x{fourcc:08x}, \
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
+                self.staged_scanout = Option::None;
                 let fd: OwnedFd = dmabuf.into();
-                match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
-                    Ok(gpu) => {
-                        self.y0_top = y0_top;
-                        self.backend = GpuPassthrough(gpu);
-                    }
-                    Err(e) => {
-                        mks_error!(
-                            error:? = e;
-                            "Failed to import ScanoutDmabuf (fourcc=0x{fourcc:08x}, \
-                             modifier=0x{modifier:016x}); keeping previous frame"
-                        );
-                    }
-                }
+                self.staged_scanout =
+                    Some((DmabufScanout::new(vec![fd], width, height, vec![stride], &[0], fourcc, modifier), y0_top));
             }
             ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
                 let planes = dmabuf.len();
@@ -212,25 +214,16 @@ impl Screen {
                     "ScanoutDMABUF2: {width}x{height}, planes={planes}, fourcc=0x{fourcc:08x}, \
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
+                self.staged_scanout = Option::None;
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
-                match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offset, fourcc, modifier) {
-                    Ok(gpu) => {
-                        self.y0_top = y0_top;
-                        self.backend = GpuPassthrough(gpu);
-                    }
-                    Err(e) => {
-                        mks_error!(
-                            error:? = e;
-                            "Failed to import ScanoutDmabuf2 (fourcc=0x{fourcc:08x}, \
-                             modifier=0x{modifier:016x}); keeping previous frame"
-                        );
-                    }
-                }
+                self.staged_scanout =
+                    Some((DmabufScanout::new(fds, width, height, stride, &offset, fourcc, modifier), y0_top));
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
                 mks_trace!(
                     "ScanoutMap: {width}x{height}, stride={stride}, offset={offset}, pixman=0x{pixman_format:08x}"
                 );
+                self.staged_scanout = Option::None;
                 self.y0_top = false;
                 let (cache, _) = self.backend.ensure_direct_mapped();
                 let _texture = cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
@@ -257,6 +250,24 @@ impl Screen {
                     mks_error!("Ignoring invalid QEMU UpdateDmabuf rect: x={x}, y={y}, width={width}, height={height}");
                     return Ok(flags);
                 }
+
+                // Promote a newly imported scanout only when the first update arrives,
+                // avoiding presentation of half-initialized content.
+                if let Some((scanout, y0_top)) = self.staged_scanout.take() {
+                    match scanout.import() {
+                        Ok(gpu) => {
+                            self.backend = RenderBackend::GpuPassthrough(gpu);
+                            self.y0_top = y0_top;
+                        }
+                        Err(e) => {
+                            mks_error!(
+                                error:? = e;
+                                "Failed to import deferred ScanoutDmabuf; keeping previous frame"
+                            );
+                        }
+                    }
+                }
+
                 // DMABUF content may be updated in-place. gdk::Texture is immutable,
                 // so recreate a lightweight wrapper to force GTK/GSK cache invalidation.
                 // Forward damage rect so GDK can reuse unchanged regions.
@@ -306,6 +317,7 @@ impl Screen {
             Disable => {
                 self.y0_top = false;
                 self.backend = RenderBackend::None;
+                self.staged_scanout = Option::None;
                 self.cursor.visible = false;
                 self.cursor.texture = Option::None;
                 flags.frame = true;
