@@ -192,6 +192,51 @@ impl Screen {
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
                 let fd: OwnedFd = dmabuf.into();
+                if let GpuPassthrough(gpu) = &self.backend {
+                    match gpu.is_equivalent(
+                        std::slice::from_ref(&fd),
+                        width,
+                        height,
+                        &[stride],
+                        &[0_u32],
+                        fourcc,
+                        modifier,
+                    ) {
+                        Ok(true) => {
+                            mks_trace!("ScanoutDMABUF unchanged: reusing existing GPU import");
+                            self.y0_top = y0_top;
+                            return Ok(flags);
+                        }
+                        Ok(false) => {
+                            match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
+                                Ok(gpu) => {
+                                    mks_trace!(
+                                        "ScanoutDMABUF detected FD switch: replacing previous GPU import \
+                                         (fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, {}x{})",
+                                        width,
+                                        height
+                                    );
+                                    self.y0_top = y0_top;
+                                    self.backend = GpuPassthrough(gpu);
+                                }
+                                Err(e) => {
+                                    mks_error!(
+                                        error:? = e;
+                                        "Failed to import ScanoutDmabuf (fourcc=0x{fourcc:08x}, \
+                                         modifier=0x{modifier:016x}); keeping previous frame"
+                                    );
+                                }
+                            }
+                            return Ok(flags);
+                        }
+                        Err(e) => {
+                            mks_error!(
+                                error:? = e;
+                                "Failed to compare ScanoutDmabuf FD identity; falling back to reimport"
+                            );
+                        }
+                    }
+                }
                 match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
                     Ok(gpu) => {
                         self.y0_top = y0_top;
@@ -213,6 +258,45 @@ impl Screen {
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
                 let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
+                if let GpuPassthrough(gpu) = &self.backend {
+                    match gpu.is_equivalent(&fds, width, height, &stride, &offset, fourcc, modifier) {
+                        Ok(true) => {
+                            mks_trace!("ScanoutDMABUF2 unchanged: reusing existing GPU import");
+                            self.y0_top = y0_top;
+                            return Ok(flags);
+                        }
+                        Ok(false) => {
+                            match GpuPassthrough::from_multi_plane(
+                                fds, width, height, stride, &offset, fourcc, modifier,
+                            ) {
+                                Ok(gpu) => {
+                                    mks_trace!(
+                                        "ScanoutDMABUF2 detected FD switch: replacing previous GPU import \
+                                         (planes={planes}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, {}x{})",
+                                        width,
+                                        height
+                                    );
+                                    self.y0_top = y0_top;
+                                    self.backend = GpuPassthrough(gpu);
+                                }
+                                Err(e) => {
+                                    mks_error!(
+                                        error:? = e;
+                                        "Failed to import ScanoutDmabuf2 (fourcc=0x{fourcc:08x}, \
+                                         modifier=0x{modifier:016x}); keeping previous frame"
+                                    );
+                                }
+                            }
+                            return Ok(flags);
+                        }
+                        Err(e) => {
+                            mks_error!(
+                                error:? = e;
+                                "Failed to compare ScanoutDmabuf2 FD identity; falling back to reimport"
+                            );
+                        }
+                    }
+                }
                 match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offset, fourcc, modifier) {
                     Ok(gpu) => {
                         self.y0_top = y0_top;

@@ -550,10 +550,8 @@ async fn connect_to_qemu(
     // Register all interfaces on the builder before .build()
     // so QEMU sees the full interface set on first introspection.
     let mut builder = zbus::connection::Builder::unix_stream(socket_server).p2p();
-    builder = builder.serve_at(
-        "/org/qemu/Display1/Listener",
-        listener::Listener::from_opts(listener_opts, event_tx.clone()),
-    )?;
+    builder = builder
+        .serve_at("/org/qemu/Display1/Listener", listener::Listener::from_opts(listener_opts, event_tx.clone()))?;
     if enable_dmabuf2 {
         let dmabuf2_handler = listener::Dmabuf2Handler(event_tx.clone());
         builder = builder.serve_at("/org/qemu/Display1/Listener", dmabuf2_handler)?;
