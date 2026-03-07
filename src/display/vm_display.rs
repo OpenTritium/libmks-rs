@@ -91,7 +91,7 @@ impl ConfineState {
         let fd = confine.borrow().get_conn_raw_fd();
         let confine_clone = confine.clone();
         let poll_source = unix_fd_add_local(fd, IOCondition::IN, move |_fd, _condition| {
-            confine_clone.borrow().dispatch_pending();
+            confine_clone.borrow_mut().dispatch_pending();
             ControlFlow::Continue
         });
         mks_debug!("Attached Wayland FD monitor to GLib main context");
@@ -228,18 +228,17 @@ impl VmDisplayModel {
         let console = self.console_ctrl.clone();
         let w = w.get();
         let h = h.get();
-        self.resize_timer = Some(
-            relm4::spawn(async move {
-                sleep(Duration::from_millis(200)).await;
-                let w_mm = (w as f32 * pixel_pitch_mm) as u16;
-                let h_mm = (h as f32 * pixel_pitch_mm) as u16;
-                mks_info!("Sending debounced guest resize: {w}x{h} ({w_mm}mm x {h_mm}mm)");
-                if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h) {
-                    mks_error!(error:? = e; "Failed to send debounced guest resize update");
-                }
-            })
-            .abort_handle(),
-        );
+        self.resize_timer = relm4::spawn(async move {
+            sleep(Duration::from_millis(200)).await;
+            let w_mm = (w as f32 * pixel_pitch_mm) as u16;
+            let h_mm = (h as f32 * pixel_pitch_mm) as u16;
+            mks_info!("Sending debounced guest resize: {w}x{h} ({w_mm}mm x {h_mm}mm)");
+            if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h) {
+                mks_error!(error:? = e; "Failed to send debounced guest resize update");
+            }
+        })
+        .abort_handle()
+        .into();
     }
 
     #[inline]
@@ -343,40 +342,38 @@ impl VmDisplayModel {
                 widgets.vm_picture.set_paintable(None::<&Texture>);
             }
         }
-        if dirty_flags.cursor || dirty_flags.frame {
-            let cursor = &self.screen.cursor;
-            let visible = cursor.visible && is_interactive;
-            widgets.cursor_picture.set_visible(visible);
-            if visible {
-                if let Some(texture) = &cursor.texture {
-                    widgets.cursor_picture.set_paintable(Some(texture));
-                    let tex_w = texture.width();
-                    let tex_h = texture.height();
-                    // Only update size request when dimensions actually change to avoid GTK layout thrashing
-                    if widgets.cursor_picture.width_request() != tex_w
-                        || widgets.cursor_picture.height_request() != tex_h
-                    {
-                        widgets.cursor_picture.set_size_request(tex_w, tex_h);
-                    }
-                    if let Some(transform) = self.coord_system.get_cached_viewport() {
-                        let logical_scale = transform.scale;
-                        let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
-                        // Intentionally align by cursor image top-left, not hotspot.
-                        let top_left_guest_x = cursor.x;
-                        let top_left_guest_y = cursor.y;
-                        let anchor_x = logical_offset_x + top_left_guest_x as f32 * logical_scale;
-                        let anchor_y = logical_offset_y + top_left_guest_y as f32 * logical_scale;
-                        let draw_x = anchor_x.round();
-                        let draw_y = anchor_y.round();
-                        let transform_matrix =
-                            Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
-                        widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
-                    }
-                } else {
-                    widgets.cursor_picture.set_paintable(None::<&Texture>);
-                }
-            }
+        let cursor = &self.screen.cursor;
+        let cursor_visible = cursor.visible && is_interactive;
+        widgets.cursor_picture.set_visible(cursor_visible);
+        if !cursor_visible {
+            return;
         }
+        let Some(texture) = cursor.texture.as_ref() else {
+            widgets.cursor_picture.set_paintable(None::<&Texture>);
+            return;
+        };
+        widgets.cursor_picture.set_paintable(Some(texture));
+        let tex_w = texture.width();
+        let tex_h = texture.height();
+        // Only update size request when dimensions actually change to avoid GTK layout thrashing
+        if widgets.cursor_picture.width_request() != tex_w || widgets.cursor_picture.height_request() != tex_h {
+            widgets.cursor_picture.set_size_request(tex_w, tex_h);
+        }
+        let Some(transform) = self.coord_system.get_cached_viewport() else {
+            return;
+        };
+        let logical_scale = transform.scale;
+        let (logical_offset_x, logical_offset_y) = (transform.offset_x, transform.offset_y);
+        // Intentionally align by cursor image top-left, not hotspot.
+        let top_left_guest_x = cursor.x;
+        let top_left_guest_y = cursor.y;
+        let anchor_x = logical_offset_x + top_left_guest_x as f32 * logical_scale;
+        let anchor_y = logical_offset_y + top_left_guest_y as f32 * logical_scale;
+        let draw_x = anchor_x.round();
+        let draw_y = anchor_y.round();
+        let transform_matrix =
+            Transform::new().translate(&Point::new(draw_x, draw_y)).scale(logical_scale, logical_scale);
+        widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&transform_matrix));
     }
 
     fn show_toast(&mut self, text: impl Into<Cow<'static, str>>, sender: ComponentSender<Self>) {
@@ -384,13 +381,12 @@ impl VmDisplayModel {
         self.hint_visible = true;
         self.mark_cursor_dirty();
         self.cancel_hint_timer();
-        self.hint_timer = Some(
-            relm4::spawn(async move {
-                sleep(Duration::from_secs(TOAST_DURATION_SECS)).await;
-                sender.input(Message::HideCaptureHint);
-            })
-            .abort_handle(),
-        );
+        self.hint_timer = relm4::spawn(async move {
+            sleep(Duration::from_secs(TOAST_DURATION_SECS)).await;
+            sender.input(Message::HideCaptureHint);
+        })
+        .abort_handle()
+        .into();
     }
 }
 
@@ -487,7 +483,7 @@ impl Component for VmDisplayModel {
         let updater = update_monitor_info.clone();
         input_plane.connect_realize(move |widget| updater(widget));
 
-        let mut controllers = Vec::new();
+        let mut controllers = Vec::with_capacity(4);
         let motion_ctrl = EventControllerMotion::new();
         let sender_clone = sender.clone();
         motion_ctrl.connect_motion(move |_, x, y| {
@@ -621,7 +617,7 @@ impl Component for VmDisplayModel {
                 if mode == InputMode::Seamless && !self.input.is_absolute {
                     mks_warn!("Seamless capture requires absolute guest mouse mode; ignoring request");
                     self.capture_state.reset();
-                    let _ = self.confine_state.take();
+                    self.confine_state = None;
                     self.cancel_hint_timer();
                     self.hint_visible = false;
                     self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());

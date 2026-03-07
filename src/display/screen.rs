@@ -154,19 +154,19 @@ impl Screen {
         let mut flags = DirtyFlags::default();
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
-                let bytes = data.len();
-                mks_trace!("Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={bytes}");
                 self.y0_top = false;
+                mks_trace!(
+                    "Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
+                    data.len()
+                );
                 let pixman = Pixman::from(pixman_format);
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
                 swapchain.full_update_texture(width, height, stride, pixman, &data)?;
-                flags.frame = true;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
-                let bytes = data.len();
                 mks_trace!(
-                    "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, \
-                     bytes={bytes}"
+                    "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
+                    data.len()
                 );
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
                     mks_error!("Ignoring invalid QEMU Update rect: x={x}, y={y}, width={width}, height={height}");
@@ -187,138 +187,46 @@ impl Screen {
                 flags.frame = true;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
+                self.y0_top = y0_top;
                 mks_trace!(
                     "ScanoutDMABUF: {width}x{height}, stride={stride}, fourcc=0x{fourcc:08x}, \
                      modifier=0x{modifier:016x}, y0_top={y0_top}"
                 );
                 let fd: OwnedFd = dmabuf.into();
-                if let GpuPassthrough(gpu) = &self.backend {
-                    match gpu.is_equivalent(
-                        std::slice::from_ref(&fd),
-                        width,
-                        height,
-                        &[stride],
-                        &[0_u32],
-                        fourcc,
-                        modifier,
-                    ) {
-                        Ok(true) => {
-                            mks_trace!("ScanoutDMABUF unchanged: reusing existing GPU import");
-                            self.y0_top = y0_top;
-                            return Ok(flags);
-                        }
-                        Ok(false) => {
-                            match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
-                                Ok(gpu) => {
-                                    mks_trace!(
-                                        "ScanoutDMABUF detected FD switch: replacing previous GPU import \
-                                         (fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, {}x{})",
-                                        width,
-                                        height
-                                    );
-                                    self.y0_top = y0_top;
-                                    self.backend = GpuPassthrough(gpu);
-                                }
-                                Err(e) => {
-                                    mks_error!(
-                                        error:? = e;
-                                        "Failed to import ScanoutDmabuf (fourcc=0x{fourcc:08x}, \
-                                         modifier=0x{modifier:016x}); keeping previous frame"
-                                    );
-                                }
-                            }
-                            return Ok(flags);
-                        }
-                        Err(e) => {
-                            mks_error!(
-                                error:? = e;
-                                "Failed to compare ScanoutDmabuf FD identity; falling back to reimport"
-                            );
-                        }
-                    }
+                if let GpuPassthrough(gpu) = &mut self.backend {
+                    gpu.stage_single_plane(fd, width, height, stride, fourcc, modifier);
+                } else {
+                    let mut gpu = GpuPassthrough::new();
+                    gpu.stage_single_plane(fd, width, height, stride, fourcc, modifier);
+                    self.backend = GpuPassthrough(gpu);
                 }
-                match GpuPassthrough::from_single_plane(fd, width, height, stride, fourcc, modifier) {
-                    Ok(gpu) => {
-                        self.y0_top = y0_top;
-                        self.backend = GpuPassthrough(gpu);
-                    }
-                    Err(e) => {
-                        mks_error!(
-                            error:? = e;
-                            "Failed to import ScanoutDmabuf (fourcc=0x{fourcc:08x}, \
-                             modifier=0x{modifier:016x}); keeping previous frame"
-                        );
-                    }
-                }
+                mks_trace!("ScanoutDMABUF staged; waiting for UpdateDMABUF commit");
             }
             ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
-                let planes = dmabuf.len();
+                self.y0_top = y0_top;
                 mks_trace!(
-                    "ScanoutDMABUF2: {width}x{height}, planes={planes}, fourcc=0x{fourcc:08x}, \
-                     modifier=0x{modifier:016x}, y0_top={y0_top}"
+                    "ScanoutDMABUF2: {width}x{height}, planes={}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, \
+                     y0_top={y0_top}",
+                    dmabuf.len()
                 );
-                let fds: Vec<OwnedFd> = dmabuf.into_iter().map(OwnedFd::from).collect();
-                if let GpuPassthrough(gpu) = &self.backend {
-                    match gpu.is_equivalent(&fds, width, height, &stride, &offset, fourcc, modifier) {
-                        Ok(true) => {
-                            mks_trace!("ScanoutDMABUF2 unchanged: reusing existing GPU import");
-                            self.y0_top = y0_top;
-                            return Ok(flags);
-                        }
-                        Ok(false) => {
-                            match GpuPassthrough::from_multi_plane(
-                                fds, width, height, stride, &offset, fourcc, modifier,
-                            ) {
-                                Ok(gpu) => {
-                                    mks_trace!(
-                                        "ScanoutDMABUF2 detected FD switch: replacing previous GPU import \
-                                         (planes={planes}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, {}x{})",
-                                        width,
-                                        height
-                                    );
-                                    self.y0_top = y0_top;
-                                    self.backend = GpuPassthrough(gpu);
-                                }
-                                Err(e) => {
-                                    mks_error!(
-                                        error:? = e;
-                                        "Failed to import ScanoutDmabuf2 (fourcc=0x{fourcc:08x}, \
-                                         modifier=0x{modifier:016x}); keeping previous frame"
-                                    );
-                                }
-                            }
-                            return Ok(flags);
-                        }
-                        Err(e) => {
-                            mks_error!(
-                                error:? = e;
-                                "Failed to compare ScanoutDmabuf2 FD identity; falling back to reimport"
-                            );
-                        }
-                    }
+                let fds: Box<_> = dmabuf.into_iter().map(OwnedFd::from).collect();
+                if let GpuPassthrough(gpu) = &mut self.backend {
+                    gpu.stage_multi_plane(fds, width, height, &stride, &offset, fourcc, modifier);
+                } else {
+                    let mut gpu = GpuPassthrough::new();
+                    gpu.stage_multi_plane(fds, width, height, &stride, &offset, fourcc, modifier);
+                    self.backend = GpuPassthrough(gpu);
                 }
-                match GpuPassthrough::from_multi_plane(fds, width, height, stride, &offset, fourcc, modifier) {
-                    Ok(gpu) => {
-                        self.y0_top = y0_top;
-                        self.backend = GpuPassthrough(gpu);
-                    }
-                    Err(e) => {
-                        mks_error!(
-                            error:? = e;
-                            "Failed to import ScanoutDmabuf2 (fourcc=0x{fourcc:08x}, \
-                             modifier=0x{modifier:016x}); keeping previous frame"
-                        );
-                    }
-                }
+                mks_trace!("ScanoutDMABUF2 staged; waiting for UpdateDMABUF commit");
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
+                self.y0_top = false;
+
                 mks_trace!(
                     "ScanoutMap: {width}x{height}, stride={stride}, offset={offset}, pixman=0x{pixman_format:08x}"
                 );
-                self.y0_top = false;
                 let (cache, _) = self.backend.ensure_direct_mapped();
-                let _texture = cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
-                flags.frame = true;
+                cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
             }
             UpdateMap { x, y, width, height } => {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
@@ -337,30 +245,24 @@ impl Screen {
             }
             UpdateDmabuf { x, y, width, height } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
-                if width <= 0 || height <= 0 {
-                    mks_error!("Ignoring invalid QEMU UpdateDmabuf rect: x={x}, y={y}, width={width}, height={height}");
-                    return Ok(flags);
-                }
-                // DMABUF content may be updated in-place. gdk::Texture is immutable,
-                // so recreate a lightweight wrapper to force GTK/GSK cache invalidation.
-                // Forward damage rect so GDK can reuse unchanged regions.
                 let GpuPassthrough(gpu) = &mut self.backend else {
                     return Err(Error::State(
                         "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf'/'ScanoutDmabuf2' \
                          (GpuPassthrough Backend uninitialized)",
                     ));
                 };
-                match gpu.rebuild_texture(x, y, width, height) {
-                    Ok(true) => {
-                        flags.frame = true;
-                    }
+                match gpu.commit_update(x, y, width, height) {
+                    Ok(true) => flags.frame = true,
                     Ok(false) => {
-                        mks_trace!("Skipping frame update signal after UpdateDMABUF: texture unchanged");
+                        mks_trace!(
+                            "Skipping frame signal after UpdateDMABUF: commit was a no-op (invalid damage or missing \
+                             active/pending frame)"
+                        );
                     }
                     Err(e) => {
                         mks_error!(
                             error:? = e;
-                            "Failed to rebuild DMABUF texture after UpdateDmabuf event; keeping previous texture"
+                            "Failed to commit DMABUF update; keeping previous texture"
                         );
                     }
                 }
@@ -402,7 +304,7 @@ impl Screen {
     pub fn get_background_texture(&self) -> Option<&Texture> {
         match &self.backend {
             SoftwareRasterizer(sw) => sw.active_texture().as_ref(),
-            GpuPassthrough(gpu) => Some(gpu.texture()),
+            GpuPassthrough(gpu) => gpu.texture(),
             DirectMapped(cache) => cache.texture(),
             None => Option::None,
         }

@@ -81,7 +81,7 @@ impl ImportedTexture {
     #[inline]
     pub fn update_texture(
         &mut self, memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32,
-    ) -> Result<Texture, Error> {
+    ) -> Result<(), Error> {
         let pixman = Pixman::from(pixman_format);
         // Check file identity. QEMU may send different FDs for the same underlying memory.
         let stat = fstat(&memfd)?;
@@ -91,7 +91,7 @@ impl ImportedTexture {
         {
             // Cache hit: Reuse the existing texture.
             // `memfd` is dropped here, closing the duplicate FD, which is correct.
-            return Ok(self.texture.as_ref().expect("Texture missing in cache").clone());
+            return Ok(());
         }
         // Cache miss: Create new mapping and texture
         let fourcc: FourCC = pixman.try_into()?;
@@ -99,8 +99,8 @@ impl ImportedTexture {
         let plane = DmabufPlane { fd: buffer.as_raw_dmabuf_fd(), stride, offset: 0 };
         let texture = build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane], None, None)?;
         self.buffer = Some(buffer);
-        self.texture = Some(texture.clone());
-        Ok(texture)
+        self.texture = Some(texture);
+        Ok(())
     }
 
     #[inline]

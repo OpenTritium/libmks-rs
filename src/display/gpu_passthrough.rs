@@ -1,3 +1,13 @@
+//! DMA-BUF GPU passthrough state machine.
+//!
+//! This module follows a strict `Prepare (Scanout*) -> Commit (UpdateDMABUF)`
+//! flow:
+//! - `Scanout*` only stages the latest incoming buffers into `pending`.
+//! - `UpdateDMABUF` promotes `pending` to `active` and performs the actual texture import/update.
+//!
+//! Reference:
+//! <https://www.qemu.org/docs/master/interop/dbus-display.html#org-qemu-display1-listener-section>
+
 use super::{
     Error,
     pixman_4cc::{FourCC, sanitize_opaque_fourcc},
@@ -5,235 +15,145 @@ use super::{
 };
 use crate::{mks_debug, mks_trace};
 use relm4::gtk::gdk::Texture;
-use rustix::fs::fstat;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 const LOG_TARGET: &str = "mks.display.gpu_passthrough";
-type DmabufId = (u64, u64);
 
 #[derive(Debug)]
 struct PlaneDesc {
     fd: OwnedFd,
-    dmabuf_id: DmabufId,
     stride: u32,
     offset: u32,
 }
 
-#[inline]
-fn get_dmabuf_id(fd: &OwnedFd) -> Result<DmabufId, Error> {
-    let stat = fstat(fd)?;
-    Ok((stat.st_dev, stat.st_ino))
-}
-
-/// GPU-backed scanout state for DMA-BUF paths.
-///
-/// This keeps both the imported texture and the plane metadata so `UpdateDMABUF`
-/// can rebuild the texture without requiring a fresh `ScanoutDMABUF`.
 #[derive(Debug)]
-pub struct GpuPassthrough {
-    texture: Texture,
-    // Keep FD ownership + per-plane layout in one place for rebuilds.
+struct DmabufState {
     planes: Box<[PlaneDesc]>,
     fourcc: FourCC,
     modifier: u64,
     width: u32,
     height: u32,
-    pending_presentation: bool,
+}
+
+/// GPU-backed scanout state for DMA-BUF paths.
+///
+/// Prepare (`Scanout*`) only stages state. Commit (`UpdateDMABUF`) performs
+/// the actual import/rebuild, so scanout bursts collapse into a single build.
+#[derive(Debug, Default)]
+pub struct GpuPassthrough {
+    texture: Option<Texture>,
+    active: Option<DmabufState>,
+    pending: Option<DmabufState>,
 }
 
 impl GpuPassthrough {
-    fn build_texture(
-        width: u32, height: u32, raw_fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],
-        update_texture: Option<&Texture>, damage: Option<Damage>,
-    ) -> Result<(Texture, FourCC), Error> {
-        let fourcc = match sanitize_opaque_fourcc(raw_fourcc) {
-            Ok(sanitized_fourcc) => sanitized_fourcc,
-            Err(raw_fourcc) => {
-                mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
-                raw_fourcc
-            }
-        };
-        build_dmabuf_texture_planar(width, height, fourcc, modifier, planes, update_texture, damage)
-            .map(|t| (t, fourcc))
-            .map_err(Error::Texture)
+    #[inline]
+    pub const fn new() -> Self { Self { texture: None, active: None, pending: None } }
+
+    /// Stages a single-plane scanout frame into `pending`.
+    ///
+    /// Any previous not-yet-committed `pending` frame is replaced.
+    #[inline]
+    pub fn stage_single_plane(
+        &mut self, dmabuf_fd: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64,
+    ) {
+        let planes = vec![PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into_boxed_slice();
+        self.pending = DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height }.into();
+        mks_trace!("DMABUF prepared (single-plane): {width}x{height}; import deferred until UpdateDMABUF");
     }
 
+    /// Stages a multi-plane scanout frame into `pending`.
+    ///
+    /// FDs/strides/offsets are paired by plane index; any previous `pending`
+    /// frame is replaced.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn from_single_plane(
-        dmabuf_fd: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64,
-    ) -> Result<Self, Error> {
-        let dmabuf_id = get_dmabuf_id(&dmabuf_fd)?;
-        let planes = vec![PlaneDesc { fd: dmabuf_fd, dmabuf_id, stride, offset: 0 }].into_boxed_slice();
-        let raw_fourcc = FourCC::from(fourcc);
-        let gdk_planes =
-            [DmabufPlane { fd: planes[0].fd.as_raw_fd(), stride: planes[0].stride, offset: planes[0].offset }];
-        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
-        Ok(Self { texture, planes, fourcc, modifier, width, height, pending_presentation: true })
-    }
-
-    #[inline]
-    pub fn from_multi_plane(
-        dmabuf_fds: Vec<OwnedFd>, width: u32, height: u32, plane_strides: Vec<u32>, plane_offsets: &[u32], fourcc: u32,
-        modifier: u64,
-    ) -> Result<Self, Error> {
-        let planes: Box<[PlaneDesc]> = dmabuf_fds
+    pub fn stage_multi_plane(
+        &mut self, dmabuf_fds: impl IntoIterator<Item = OwnedFd>, width: u32, height: u32, plane_strides: &[u32],
+        plane_offsets: &[u32], fourcc: u32, modifier: u64,
+    ) {
+        let planes: Box<_> = dmabuf_fds
             .into_iter()
-            .zip(plane_strides)
+            .zip(plane_strides.iter().copied())
             .zip(plane_offsets.iter().copied())
-            .map(|((fd, stride), offset)| {
-                let dmabuf_id = get_dmabuf_id(&fd)?;
-                Ok(PlaneDesc { fd, dmabuf_id, stride, offset })
-            })
-            .collect::<Result<Vec<_>, Error>>()?
-            .into_boxed_slice();
-        let raw_fourcc = FourCC::from(fourcc);
-        let gdk_planes: Box<[_]> = planes
-            .iter()
-            .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
+            .map(|((fd, stride), offset)| PlaneDesc { fd, stride, offset })
             .collect();
-        let (texture, fourcc) = Self::build_texture(width, height, raw_fourcc, modifier, &gdk_planes, None, None)?;
-        Ok(Self { texture, planes, fourcc, modifier, width, height, pending_presentation: true })
+        mks_trace!(
+            "DMABUF prepared (multi-plane): {width}x{height}, planes={}; import deferred until UpdateDMABUF",
+            planes.len()
+        );
+        self.pending = Some(DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height });
     }
 
+    /// Commits a staged DMABUF update and (re)builds the presentation texture.
+    ///
+    /// Behavior:
+    /// - If `pending` exists: treat this as a page flip, promote `pending` to `active`, and rebuild from the new buffer
+    ///   (`old_texture = None`).
+    /// - If `pending` does not exist: treat this as an in-place update on the current `active` buffer and forward
+    ///   incoming `damage` for partial reuse.
+    ///
+    /// Returns:
+    /// - `Ok(true)`: texture is ready to present.
+    /// - `Ok(false)`: no visible work was needed (e.g. invalid/empty damage rect or no active/pending state).
+    /// - `Err(..)`: texture rebuild failed.
     #[inline]
-    pub(super) fn is_equivalent(
-        &self, dmabuf_fds: &[OwnedFd], width: u32, height: u32, plane_strides: &[u32], plane_offsets: &[u32],
-        fourcc: u32, modifier: u64,
-    ) -> Result<bool, Error> {
-        let raw_fourcc = FourCC::from(fourcc);
-        let incoming_fourcc = sanitize_opaque_fourcc(raw_fourcc).unwrap_or(raw_fourcc);
-        if self.width != width || self.height != height {
-            mks_trace!(
-                "DMABUF changed: reason=resolution current={}x{} incoming={}x{}",
-                self.width,
-                self.height,
-                width,
-                height
-            );
-            return Ok(false);
+    pub fn commit_update(&mut self, x: i32, y: i32, damage_width: i32, damage_height: i32) -> Result<bool, Error> {
+        let mut is_page_flip = false;
+        if let Some(pending) = self.pending.take() {
+            is_page_flip = true;
+            self.active = Some(pending);
         }
-        if self.fourcc != incoming_fourcc {
-            mks_trace!(
-                "DMABUF changed: reason=fourcc current=0x{:08x} incoming=0x{:08x}",
-                *self.fourcc,
-                *incoming_fourcc
-            );
-            return Ok(false);
-        }
-        if self.modifier != modifier {
-            mks_trace!("DMABUF changed: reason=modifier current=0x{:016x} incoming=0x{:016x}", self.modifier, modifier);
-            return Ok(false);
-        }
-        if self.planes.len() != dmabuf_fds.len()
-            || self.planes.len() != plane_strides.len()
-            || self.planes.len() != plane_offsets.len()
-        {
-            mks_trace!(
-                "DMABUF changed: reason=plane_count current={} incoming_fds={} incoming_strides={} incoming_offsets={}",
-                self.planes.len(),
-                dmabuf_fds.len(),
-                plane_strides.len(),
-                plane_offsets.len()
-            );
-            return Ok(false);
-        }
-        for ((idx, incoming_fd), (&incoming_stride, &incoming_offset)) in
-            dmabuf_fds.iter().enumerate().zip(plane_strides.iter().zip(plane_offsets.iter()))
-        {
-            let plane = &self.planes[idx];
-            if plane.stride != incoming_stride || plane.offset != incoming_offset {
-                mks_trace!(
-                    "DMABUF changed: reason=plane_layout plane={} current_stride={} incoming_stride={} \
-                     current_offset={} incoming_offset={}",
-                    idx,
-                    plane.stride,
-                    incoming_stride,
-                    plane.offset,
-                    incoming_offset
-                );
-                return Ok(false);
-            }
-            let (incoming_dev, incoming_ino) = get_dmabuf_id(incoming_fd)?;
-            let (current_dev, current_ino) = plane.dmabuf_id;
-            if plane.dmabuf_id != (incoming_dev, incoming_ino) {
-                mks_trace!(
-                    "DMABUF changed: reason=plane_identity plane={} current_dev={} current_ino={} incoming_dev={} \
-                     incoming_ino={}",
-                    idx,
-                    current_dev,
-                    current_ino,
-                    incoming_dev,
-                    incoming_ino
-                );
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    #[inline]
-    fn clip_damage(&self, x: i32, y: i32, width: i32, height: i32) -> Option<Damage> {
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-        let max_x = i64::from(self.width);
-        let max_y = i64::from(self.height);
-        let x = i64::from(x);
-        let y = i64::from(y);
-        let x0 = x.clamp(0, max_x);
-        let y0 = y.clamp(0, max_y);
-        let x1 = (x + i64::from(width)).clamp(0, max_x);
-        let y1 = (y + i64::from(height)).clamp(0, max_y);
-        if x1 <= x0 || y1 <= y0 {
-            return None;
-        }
-        Some(Damage { x: x0 as u32, y: y0 as u32, width: (x1 - x0) as u32, height: (y1 - y0) as u32 })
-    }
-
-    #[inline]
-    pub fn rebuild_texture(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<bool, Error> {
-        if self.pending_presentation {
-            mks_trace!("DMABUF texture rebuild skipped: first update after fresh scanout import");
-            self.pending_presentation = false;
-            // The first UpdateDMABUF after ScanoutDMABUF is the first safe present point.
-            // Texture can be reused, but caller still must render this frame.
-            return Ok(true);
-        }
-        let Some(damage) = self.clip_damage(x, y, width, height) else {
-            mks_trace!("DMABUF texture rebuild skipped: clipped damage is empty, rect=({x},{y} {width}x{height})");
+        let Some(active) = self.active.as_ref() else {
+            mks_trace!("UpdateDMABUF commit skipped: no active frame and no pending frame");
             return Ok(false);
         };
-        mks_trace!(
-            "DMABUF texture rebuilding: frame={}x{}, damage=({},{} {}x{})",
-            self.width,
-            self.height,
-            damage.x,
-            damage.y,
-            damage.width,
-            damage.height
-        );
-        let gdk_planes: Box<[_]> = self
+        let damage = if is_page_flip {
+            mks_trace!("DMABUF commit: page flip detected; rebuilding from pending frame");
+            None
+        } else {
+            if x < 0 || y < 0 || damage_width <= 0 || damage_height <= 0 {
+                mks_trace!("UpdateDMABUF commit skipped: invalid damage rect ({x},{y} {damage_width}x{damage_height})",);
+                return Ok(false);
+            }
+            let damage = Damage { x: x as u32, y: y as u32, width: damage_width as u32, height: damage_height as u32 };
+            mks_trace!("DMABUF commit: in-place update (trust QEMU damage)={damage:?}");
+            Some(damage)
+        };
+        let gdk_planes: Box<[_]> = active
             .planes
             .iter()
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
-        self.texture = build_dmabuf_texture_planar(
-            self.width,
-            self.height,
-            self.fourcc,
-            self.modifier,
+        let raw_fourcc = active.fourcc;
+        let sanitized = sanitize_opaque_fourcc(raw_fourcc).unwrap_or_else(|raw| {
+            mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
+            raw
+        });
+        let old_texture = if is_page_flip { None } else { self.texture.as_ref() };
+        self.texture = Some(build_dmabuf_texture_planar(
+            active.width,
+            active.height,
+            sanitized,
+            active.modifier,
             &gdk_planes,
-            Some(&self.texture),
-            Some(damage),
-        )?;
-        mks_trace!("DMABUF texture rebuild finished");
-        self.pending_presentation = false;
+            old_texture,
+            damage,
+        )?);
         Ok(true)
     }
 
+    /// Returns the current presentation texture, if available.
     #[inline]
-    pub const fn texture(&self) -> &Texture { &self.texture }
+    pub const fn texture(&self) -> Option<&Texture> { self.texture.as_ref() }
 
+    /// Returns the active frame resolution.
+    ///
+    /// Tuple fields:
+    /// - `0`: width in pixels.
+    /// - `1`: height in pixels.
     #[inline]
-    pub const fn resolution(&self) -> (u32, u32) { (self.width, self.height) }
+    pub fn resolution(&self) -> (u32, u32) {
+        self.active.as_ref().map(|active| (active.width, active.height)).unwrap_or_default()
+    }
 }

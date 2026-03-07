@@ -181,7 +181,7 @@ impl InputBusSetup {
             .capability(init_cap)
             .build();
         let shutdown = Box::new(move || {
-            if let Err(e) = input_cmd_tx.send(InputCommand::Shutdown) {
+            if let Err(e) = input_cmd_tx.try_send(InputCommand::Shutdown) {
                 mks_error!(error:? =e; "Failed to send shutdown command to input daemon");
             }
         });

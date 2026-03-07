@@ -5,7 +5,7 @@ use super::{
 use crate::{
     dbus::{keyboard::PressAction, mouse::Button, multitouch::Kind},
     keymaps::Qnum,
-    mks_debug, mks_error,
+    mks_debug, mks_error, mks_warn,
 };
 use InputCommand::*;
 use kanal::{AsyncSender, Sender};
@@ -71,7 +71,7 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping absolute move command");
             return;
         };
-        if let Err(e) = tx.send(MouseSetAbs(x, y)) {
+        if let Err(e) = tx.try_send(MouseSetAbs(x, y)) {
             mks_error!(error:? = e; "Failed to queue absolute mouse move");
         }
     }
@@ -86,7 +86,7 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping relative move command");
             return;
         };
-        if let Err(e) = tx.send(MouseRel(dx, dy)) {
+        if let Err(e) = tx.try_send(MouseRel(dx, dy)) {
             mks_error!(error:? = e; "Failed to queue relative mouse move");
         }
     }
@@ -139,8 +139,8 @@ impl InputHandler {
             } else {
                 Button::WheelUp
             };
-            let Err(e) = tx.send(MousePress(btn)) else {
-                let Err(e) = tx.send(MouseRelease(btn)) else { continue };
+            let Err(e) = tx.try_send(MousePress(btn)) else {
+                let Err(e) = tx.try_send(MouseRelease(btn)) else { continue };
                 mks_error!(error:? = e; "Failed to release mouse button");
                 continue;
             };
@@ -168,8 +168,8 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping keyboard event");
             return;
         };
-        match tx.send(command) {
-            Ok(()) => match transition {
+        match tx.try_send(command) {
+            Ok(true) => match transition {
                 Press => {
                     self.held_keys.insert(qnum);
                 }
@@ -177,6 +177,9 @@ impl InputHandler {
                     self.held_keys.remove(&qnum);
                 }
             },
+            Ok(false) => {
+                mks_warn!("Failed to send because of channel capacity");
+            }
             Err(e) => {
                 mks_error!(error:? = e; "Failed to send keyboard {transition} event");
             }
@@ -195,7 +198,7 @@ impl InputHandler {
             return;
         };
         for qnum in self.held_keys.drain() {
-            if let Err(e) = tx.send(KbdRelease(qnum)) {
+            if let Err(e) = tx.try_send(KbdRelease(qnum)) {
                 mks_error!(error:? = e; "Failed to release tracked key during capture reset");
             }
         }
