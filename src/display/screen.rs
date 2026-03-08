@@ -60,6 +60,9 @@ impl CursorState {
     pub fn looks_same(
         &self, width: i32, height: i32, hot_x: i32, hot_y: i32, new_data: &[u8], bytes_per_pixel: usize,
     ) -> bool {
+        if bytes_per_pixel == 0 {
+            return false;
+        }
         if self.hot_x != hot_x
             || self.hot_y != hot_y
             || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width
@@ -76,17 +79,19 @@ impl CursorState {
         }
         let points = [
             0,
-            (w - 1) * 4,
+            (w - 1) * bytes_per_pixel,
             (h - 1) * stride,
-            (h - 1) * stride + (w - 1) * 4,
-            (h / 2) * stride + (w / 2) * 4,
-            (w / 2) * 4,
-            (h - 1) * stride + (w / 2) * 4,
+            (h - 1) * stride + (w - 1) * bytes_per_pixel,
+            (h / 2) * stride + (w / 2) * bytes_per_pixel,
+            (w / 2) * bytes_per_pixel,
+            (h - 1) * stride + (w / 2) * bytes_per_pixel,
             (h / 2) * stride,
-            (h / 2) * stride + (w - 1) * 4,
+            (h / 2) * stride + (w - 1) * bytes_per_pixel,
         ];
         for &offset in &points {
-            if offset + 4 <= new_data.len() && self.last_data[offset..offset + 4] != new_data[offset..offset + 4] {
+            if offset + bytes_per_pixel <= new_data.len()
+                && self.last_data[offset..offset + bytes_per_pixel] != new_data[offset..offset + bytes_per_pixel]
+            {
                 return false;
             }
         }
@@ -221,7 +226,6 @@ impl Screen {
             }
             ScanoutMap { memfd, offset, width, height, stride, pixman_format } => {
                 self.y0_top = false;
-
                 mks_trace!(
                     "ScanoutMap: {width}x{height}, stride={stride}, offset={offset}, pixman=0x{pixman_format:08x}"
                 );

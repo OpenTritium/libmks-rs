@@ -224,14 +224,14 @@ impl VmDisplayModel {
         if let Some(handle) = self.resize_timer.take() {
             handle.abort();
         }
-        let pixel_pitch_mm = self.pixel_pitch_mm;
+        let ppm = self.pixel_pitch_mm;
         let console = self.console_ctrl.clone();
         let w = w.get();
         let h = h.get();
         self.resize_timer = relm4::spawn(async move {
             sleep(Duration::from_millis(200)).await;
-            let w_mm = (w as f32 * pixel_pitch_mm) as u16;
-            let h_mm = (h as f32 * pixel_pitch_mm) as u16;
+            let w_mm = (w as f32 * ppm) as u16;
+            let h_mm = (h as f32 * ppm) as u16;
             mks_info!("Sending debounced guest resize: {w}x{h} ({w_mm}mm x {h_mm}mm)");
             if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h) {
                 mks_error!(error:? = e; "Failed to send debounced guest resize update");
@@ -466,16 +466,11 @@ impl Component for VmDisplayModel {
             if width_mm > 0. && height_mm > 0. && geometry_width_physical > 0. && geometry_height_physical > 0. {
                 let pixel_pitch_mm = width_mm / geometry_width_physical;
                 mks_debug!(
-                    "Monitor {}: {}×{}mm, {}×{} logical px (scale={:.2}) → {}×{} physical px (pitch={:.4}mm/px)",
+                    "Monitor {}: {width_mm}×{height_mm}mm, {}×{} logical px (scale={scale_factor:.2}) → \
+                     {geometry_width_physical}×{geometry_height_physical} physical px (pitch={pixel_pitch_mm:.4}mm/px)",
                     monitor.model().as_deref().unwrap_or("unknown"),
-                    width_mm,
-                    height_mm,
                     geometry.width(),
                     geometry.height(),
-                    scale_factor,
-                    geometry_width_physical,
-                    geometry_height_physical,
-                    pixel_pitch_mm
                 );
                 sender_clone.input(UpdateMonitorInfo { pixel_pitch_mm });
             }

@@ -50,6 +50,11 @@ impl GpuPassthrough {
     #[inline]
     pub const fn new() -> Self { Self { texture: None, active: None, pending: None } }
 
+    #[inline]
+    fn stage_pending(&mut self, planes: Box<[PlaneDesc]>, width: u32, height: u32, fourcc: u32, modifier: u64) {
+        self.pending = Some(DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height });
+    }
+
     /// Stages a single-plane scanout frame into `pending`.
     ///
     /// Any previous not-yet-committed `pending` frame is replaced.
@@ -57,8 +62,8 @@ impl GpuPassthrough {
     pub fn stage_single_plane(
         &mut self, dmabuf_fd: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64,
     ) {
-        let planes = vec![PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into_boxed_slice();
-        self.pending = DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height }.into();
+        let planes: Box<_> = [PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into();
+        self.stage_pending(planes, width, height, fourcc, modifier);
         mks_trace!("DMABUF prepared (single-plane): {width}x{height}; import deferred until UpdateDMABUF");
     }
 
@@ -82,7 +87,7 @@ impl GpuPassthrough {
             "DMABUF prepared (multi-plane): {width}x{height}, planes={}; import deferred until UpdateDMABUF",
             planes.len()
         );
-        self.pending = Some(DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height });
+        self.stage_pending(planes, width, height, fourcc, modifier);
     }
 
     /// Commits a staged DMABUF update and (re)builds the presentation texture.
@@ -99,11 +104,12 @@ impl GpuPassthrough {
     /// - `Err(..)`: texture rebuild failed.
     #[inline]
     pub fn commit_update(&mut self, x: i32, y: i32, damage_width: i32, damage_height: i32) -> Result<bool, Error> {
-        let mut is_page_flip = false;
-        if let Some(pending) = self.pending.take() {
-            is_page_flip = true;
+        let is_page_flip = if let Some(pending) = self.pending.take() {
             self.active = Some(pending);
-        }
+            true
+        } else {
+            false
+        };
         let Some(active) = self.active.as_ref() else {
             mks_trace!("UpdateDMABUF commit skipped: no active frame and no pending frame");
             return Ok(false);
@@ -125,8 +131,7 @@ impl GpuPassthrough {
             .iter()
             .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
             .collect();
-        let raw_fourcc = active.fourcc;
-        let sanitized = sanitize_opaque_fourcc(raw_fourcc).unwrap_or_else(|raw| {
+        let sanitized = sanitize_opaque_fourcc(active.fourcc).unwrap_or_else(|raw| {
             mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
             raw
         });
