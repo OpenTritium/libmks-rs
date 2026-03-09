@@ -5,7 +5,10 @@ use super::{
 };
 use relm4::gtk::gdk::Texture;
 use rustix::fs::{Stat, fstat};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::{
+    num::NonZeroU32,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+};
 
 /// Represents a guest memory region mapped for host GPU access via DMA-BUF.
 ///
@@ -17,9 +20,9 @@ pub struct DmabufImport {
     dmabuf_fd: OwnedFd,
     dev: u64,
     ino: u64,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
+    pub stride: NonZeroU32,
     pub offset: u32,
     pub pixman: Pixman,
 }
@@ -28,11 +31,11 @@ impl DmabufImport {
     /// Creates a new mapping, capturing file identity for caching.
     #[inline]
     pub fn new(
-        memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman: Pixman,
+        memfd: OwnedFd, stat: Stat, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32,
+        pixman: Pixman,
     ) -> Result<Self, Error> {
-        // Capture file identity (inode) to detect reuse of the same physical memory.
-        let stat = fstat(&memfd)?;
-        let size = (offset as u64) + (height as u64 * stride as u64);
+        // `/dev/udmabuf` expects the sub-view length, not the memfd end offset.
+        let size = height.checked_mul(stride).unwrap().into();
         let dmabuf_fd = create_udmabuf_fd(&memfd, offset as u64, size)?;
         Ok(Self {
             _guest_memfd: memfd,
@@ -49,10 +52,10 @@ impl DmabufImport {
 
     /// Checks if the provided file identity and metadata match this mapping.
     #[inline]
-    pub fn matches(&self, stat: &Stat, offset: u32, width: u32, height: u32, stride: u32, pixman: Pixman) -> bool {
-        self.dev == stat.st_dev
-            && self.ino == stat.st_ino
-            && self.offset == offset
+    pub fn matches_view(
+        &self, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32, pixman: Pixman,
+    ) -> bool {
+        self.offset == offset
             && self.width == width
             && self.height == height
             && self.stride == stride
@@ -60,7 +63,15 @@ impl DmabufImport {
     }
 
     #[inline]
+    pub const fn matches_inode(&self, stat: &Stat) -> bool { self.dev == stat.st_dev && self.ino == stat.st_ino }
+
+    #[inline]
     pub fn as_raw_dmabuf_fd(&self) -> RawFd { self.dmabuf_fd.as_raw_fd() }
+
+    #[inline]
+    fn plane(&self) -> DmabufPlane {
+        DmabufPlane { fd: self.as_raw_dmabuf_fd(), stride: self.stride, offset: self.offset }
+    }
 }
 
 #[derive(Debug)]
@@ -69,38 +80,42 @@ pub struct ImportedTexture {
     texture: Option<Texture>,
 }
 
-impl Default for ImportedTexture {
-    fn default() -> Self { Self::new() }
-}
-
 impl ImportedTexture {
     #[inline]
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self { Self { buffer: None, texture: None } }
 
-    /// Updates the texture, reusing the existing mapping if the underlying memory object (inode) matches.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn update_texture(
-        &mut self, memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32,
+    fn rebuild_texture(
+        &mut self, memfd: OwnedFd, stat: Stat, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32,
+        pixman: Pixman,
     ) -> Result<(), Error> {
-        let pixman = Pixman::from(pixman_format);
-        // Check file identity. QEMU may send different FDs for the same underlying memory.
-        let stat = fstat(&memfd)?;
-        // Attempt to reuse existing mapping
-        if let Some(buf) = &self.buffer
-            && buf.matches(&stat, offset, width, height, stride, pixman)
-        {
-            // Cache hit: Reuse the existing texture.
-            // `memfd` is dropped here, closing the duplicate FD, which is correct.
-            return Ok(());
-        }
-        // Cache miss: Create new mapping and texture
         let fourcc: FourCC = pixman.try_into()?;
-        let buffer = DmabufImport::new(memfd, offset, width, height, stride, pixman)?;
-        let plane = DmabufPlane { fd: buffer.as_raw_dmabuf_fd(), stride, offset: 0 };
+        let buffer = DmabufImport::new(memfd, stat, offset, width, height, stride, pixman)?;
+        let plane = buffer.plane();
         let texture = build_dmabuf_texture_planar(width, height, fourcc, DRM_FORMAT_MOD_LINEAR, &[plane], None, None)?;
         self.buffer = Some(buffer);
         self.texture = Some(texture);
         Ok(())
+    }
+
+    /// Updates the texture, reusing the existing mapping if the underlying memory object (inode) matches.
+    #[inline]
+    pub fn update_texture(
+        &mut self, memfd: OwnedFd, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32,
+        pixman_format: Pixman,
+    ) -> Result<(), Error> {
+        let stat = fstat(&memfd)?;
+        if let Some(buf) = &self.buffer
+            && buf.matches_view(offset, width, height, stride, pixman_format)
+        {
+            if buf.matches_inode(&stat) {
+                return Ok(());
+            }
+            return self.rebuild_texture(memfd, stat, offset, width, height, stride, pixman_format);
+        }
+        self.rebuild_texture(memfd, stat, offset, width, height, stride, pixman_format)
     }
 
     #[inline]
@@ -108,7 +123,9 @@ impl ImportedTexture {
 
     /// Returns the resolution (width, height) of the current buffer.
     #[inline]
-    pub fn resolution(&self) -> Option<(u32, u32)> { self.buffer.as_ref().map(|b| (b.width, b.height)) }
+    pub fn resolution(&self) -> (u32, u32) {
+        self.buffer.as_ref().map(|b| (b.width.get(), b.height.get())).unwrap_or_default()
+    }
 
     #[inline]
     pub fn clear(&mut self) {
@@ -124,7 +141,9 @@ mod tests {
 
     /// 辅助函数：安全地创建一个用于测试的 Mock GuestMapping
     /// 避免使用 FD 1 (stdout) 导致测试输出被关闭
-    fn create_mock_mapping(memfd: OwnedFd, width: u32, height: u32, stride: u32, pixman: Pixman) -> DmabufImport {
+    fn create_mock_mapping(
+        memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman: Pixman,
+    ) -> DmabufImport {
         let stat = fstat(&memfd).unwrap();
         // 克隆 memfd 作为假的 dmabuf_fd，这样 Drop 时是安全的
         let fake_dmabuf_fd = memfd.try_clone().unwrap();
@@ -134,10 +153,10 @@ mod tests {
             dmabuf_fd: fake_dmabuf_fd,
             dev: stat.st_dev,
             ino: stat.st_ino,
-            width,
-            height,
-            stride,
-            offset: 0,
+            width: NonZeroU32::new(width).unwrap(),
+            height: NonZeroU32::new(height).unwrap(),
+            stride: NonZeroU32::new(stride).unwrap(),
+            offset,
             pixman,
         }
     }
@@ -149,9 +168,16 @@ mod tests {
         let stat = fstat(&memfd).unwrap();
         let pixman = Pixman::from(0);
 
-        let mapping = create_mock_mapping(memfd, 1920, 1080, 7680, pixman);
+        let mapping = create_mock_mapping(memfd, 0, 1920, 1080, 7680, pixman);
 
-        assert!(mapping.matches(&stat, 0, 1920, 1080, 7680, pixman));
+        assert!(mapping.matches_view(
+            0,
+            NonZeroU32::new(1920).unwrap(),
+            NonZeroU32::new(1080).unwrap(),
+            NonZeroU32::new(7680).unwrap(),
+            pixman
+        ));
+        assert!(mapping.matches_inode(&stat));
     }
 
     /// 测试 2: 验证 matches() 在不同 inode 时返回 false
@@ -163,9 +189,9 @@ mod tests {
         let stat2 = fstat(&memfd2).unwrap();
         let pixman = Pixman::from(0);
 
-        let mapping = create_mock_mapping(memfd1, 1920, 1080, 7680, pixman);
+        let mapping = create_mock_mapping(memfd1, 0, 1920, 1080, 7680, pixman);
 
-        assert!(!mapping.matches(&stat2, 0, 1920, 1080, 7680, pixman));
+        assert!(!mapping.matches_inode(&stat2));
     }
 
     /// 测试 3: 验证 matches() 在不同元数据时返回 false
@@ -175,16 +201,27 @@ mod tests {
         let stat = fstat(&memfd).unwrap();
         let pixman = Pixman::from(0);
 
-        let mapping = create_mock_mapping(memfd, 1920, 1080, 7680, pixman);
+        let mapping = create_mock_mapping(memfd, 0, 1920, 1080, 7680, pixman);
 
         // Inode 相同但参数不同
-        assert!(!mapping.matches(&stat, 0, 2560, 1080, 7680, pixman)); // width
-        assert!(!mapping.matches(&stat, 0, 1920, 1440, 7680, pixman)); // height
-        assert!(!mapping.matches(&stat, 0, 1920, 1080, 10240, pixman)); // stride
-        assert!(!mapping.matches(&stat, 100, 1920, 1080, 7680, pixman)); // offset
+        let w = NonZeroU32::new(1920).unwrap();
+        let h = NonZeroU32::new(1080).unwrap();
+        let s = NonZeroU32::new(7680).unwrap();
+        let s2 = NonZeroU32::new(10240).unwrap();
+        let w2 = NonZeroU32::new(2560).unwrap();
+        let h2 = NonZeroU32::new(1440).unwrap();
+
+        assert!(mapping.matches_view(0, w, h, s, pixman));
+        assert!(!mapping.matches_view(64, w, h, s, pixman));
+        assert!(!mapping.matches_view(0, w2, h, s, pixman)); // width
+        assert!(!mapping.matches_view(0, w, h2, s, pixman)); // height
+        assert!(!mapping.matches_view(0, w, h, s2, pixman)); // stride
+        assert!(!mapping.matches_view(100, w, h, s, pixman)); // offset
+
+        assert!(mapping.matches_inode(&stat));
 
         let different_pixman = Pixman::from(1);
-        assert!(!mapping.matches(&stat, 0, 1920, 1080, 7680, different_pixman));
+        assert!(!mapping.matches_view(0, w, h, s, different_pixman));
     }
 
     /// 测试 4: 验证缓存命中场景 (相同底层内存)
@@ -200,13 +237,17 @@ mod tests {
         let stat_dup = fstat(&memfd_dup).unwrap();
 
         let pixman = Pixman::from(0);
-        let mapping = create_mock_mapping(memfd1, 1920, 1080, 7680, pixman);
+        let mapping = create_mock_mapping(memfd1, 0, 1920, 1080, 7680, pixman);
 
         cache.buffer = Some(mapping);
 
         // 验证：使用 dup 出来的 FD 的 stat 应该命中缓存
         if let Some(buf) = &cache.buffer {
-            assert!(buf.matches(&stat_dup, 0, 1920, 1080, 7680, pixman));
+            let w = NonZeroU32::new(1920).unwrap();
+            let h = NonZeroU32::new(1080).unwrap();
+            let s = NonZeroU32::new(7680).unwrap();
+            assert!(buf.matches_view(0, w, h, s, pixman));
+            assert!(buf.matches_inode(&stat_dup));
         }
     }
 
@@ -219,7 +260,7 @@ mod tests {
         let memfd1 = memfd_create("miss_test1", MemfdFlags::CLOEXEC).unwrap();
         let pixman = Pixman::from(0);
 
-        let buffer = create_mock_mapping(memfd1, 1920, 1080, 7680, pixman);
+        let buffer = create_mock_mapping(memfd1, 0, 1920, 1080, 7680, pixman);
         cache.buffer = Some(buffer);
 
         // Create a different memfd (different inode)
@@ -228,7 +269,7 @@ mod tests {
 
         // Verify that matches returns false for different memory
         if let Some(buf) = &cache.buffer {
-            assert!(!buf.matches(&stat2, 0, 1920, 1080, 7680, pixman));
+            assert!(!buf.matches_inode(&stat2));
         }
     }
 
@@ -236,21 +277,33 @@ mod tests {
     fn test_imported_texture_new_has_empty_state() {
         let cache = ImportedTexture::new();
         assert!(cache.texture().is_none());
-        assert!(cache.resolution().is_none());
+        assert_eq!(cache.resolution(), (0, 0));
     }
 
     #[test]
     fn test_imported_texture_clear_resets_buffer_state() {
         let memfd = memfd_create("clear_test", MemfdFlags::CLOEXEC).unwrap();
         let pixman = Pixman::from(0);
-        let mapping = create_mock_mapping(memfd, 1024, 768, 4096, pixman);
+        let mapping = create_mock_mapping(memfd, 0, 1024, 768, 4096, pixman);
 
         let mut cache = ImportedTexture::new();
         cache.buffer = Some(mapping);
-        assert_eq!(cache.resolution(), Some((1024, 768)));
+        assert_eq!(cache.resolution(), (1024, 768));
 
         cache.clear();
         assert!(cache.texture().is_none());
-        assert!(cache.resolution().is_none());
+        assert_eq!(cache.resolution(), (0, 0));
+    }
+
+    #[test]
+    fn test_plane_offset_matches_import_offset() {
+        let memfd = memfd_create("plane_offset", MemfdFlags::CLOEXEC).unwrap();
+        let pixman = Pixman::from(0);
+        let mapping = create_mock_mapping(memfd, 4096, 1024, 768, 4096, pixman);
+
+        let plane = mapping.plane();
+
+        assert_eq!(plane.offset, 4096);
+        assert_eq!(plane.stride.get(), 4096);
     }
 }

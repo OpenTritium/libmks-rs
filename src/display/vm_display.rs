@@ -12,7 +12,7 @@ use crate::{
 };
 use gdk4_wayland::{
     WaylandDisplay, WaylandSurface,
-    gdk::{Key, ModifierType, Rectangle, Texture},
+    gdk::{Key, ModifierType, Texture},
     glib::{ControlFlow, IOCondition, Propagation, SourceId, translate::IntoGlib, unix_fd_add_local},
     prelude::*,
     wayland_client::protocol::wl_surface::WlSurface,
@@ -27,7 +27,15 @@ use relm4::{
         prelude::*, style_context_add_provider_for_display,
     },
 };
-use std::{borrow::Cow, cell::RefCell, fmt, mem, num::NonZeroU32, rc::Rc, sync::Once, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    fmt, mem,
+    num::{NonZeroU16, NonZeroU32},
+    rc::Rc,
+    sync::Once,
+    time::Duration,
+};
 use tokio::{task::AbortHandle, time::sleep};
 
 const LOG_TARGET: &str = "mks.display.vm";
@@ -174,12 +182,12 @@ pub enum Message {
 pub struct VmDisplayModel {
     pub screen: Screen,
     pub dirty_flags: DirtyFlags,
+    pub confine_state: Option<ConfineState>,
+    pub scaling_mode: ScalingMode,
     console_ctrl: ConsoleController,
     pixel_pitch_mm: f32,
     resize_timer: Option<AbortHandle>,
     input_overlay: DrawingArea,
-    pub confine_state: Option<ConfineState>,
-    pub scaling_mode: ScalingMode,
     grab_shortcut: GrabShortcut,
     hint_visible: bool,
     hint_text: Cow<'static, str>,
@@ -211,7 +219,7 @@ pub struct VmDisplayInit {
 
 impl VmDisplayModel {
     #[inline]
-    const fn input_mode(&self) -> InputMode {
+    const fn current_input_mode(&self) -> InputMode {
         if self.confine_state.is_some() {
             InputMode::Confined
         } else {
@@ -226,13 +234,13 @@ impl VmDisplayModel {
         }
         let ppm = self.pixel_pitch_mm;
         let console = self.console_ctrl.clone();
-        let w = w.get();
-        let h = h.get();
         self.resize_timer = relm4::spawn(async move {
             sleep(Duration::from_millis(200)).await;
-            let w_mm = (w as f32 * ppm) as u16;
-            let h_mm = (h as f32 * ppm) as u16;
-            mks_info!("Sending debounced guest resize: {w}x{h} ({w_mm}mm x {h_mm}mm)");
+            let width_px = w.get();
+            let height_px = h.get();
+            let w_mm = NonZeroU16::new((width_px as f32 * ppm).round().clamp(1., u16::MAX as f32) as u16).unwrap();
+            let h_mm = NonZeroU16::new((height_px as f32 * ppm).round().clamp(1., u16::MAX as f32) as u16).unwrap();
+            mks_info!("Sending debounced guest resize: {width_px}x{height_px} ({w_mm}mm x {h_mm}mm)");
             if let Err(e) = console.set_ui_info(w_mm, h_mm, 0, 0, w, h) {
                 mks_error!(error:? = e; "Failed to send debounced guest resize update");
             }
@@ -267,19 +275,18 @@ impl VmDisplayModel {
     }
 
     #[inline]
-    fn confined_widget_rect(&self) -> Rectangle {
+    fn confined_widget_rect(&self) -> (u32, u32, u32, u32) {
         let native = self.input_overlay.native();
         if let Some(native) = &native
             && let Some(bounds) = self.input_overlay.compute_bounds(native)
         {
-            Rectangle::new(
-                bounds.x().floor() as i32,
-                bounds.y().floor() as i32,
-                bounds.width().ceil() as i32,
-                bounds.height().ceil() as i32,
-            )
+            let x = bounds.x().floor() as u32;
+            let y = bounds.y().floor() as u32;
+            let w = bounds.width().ceil() as u32;
+            let h = bounds.height().ceil() as u32;
+            (x, y, w, h)
         } else {
-            Rectangle::new(0, 0, 0, 0)
+            (0, 0, 0, 0)
         }
     }
 
@@ -457,16 +464,16 @@ impl Component for VmDisplayModel {
                 return;
             };
             let geometry = monitor.geometry();
-            let width_mm = monitor.width_mm() as f32;
-            let height_mm = monitor.height_mm() as f32;
+            let w_mm = monitor.width_mm() as f32;
+            let h_mm = monitor.height_mm() as f32;
             let scale_factor = (widget.scale_factor() as f32).max(0.5).clamp(0.5, 8.);
             let geometry_width_physical = geometry.width() as f32 * scale_factor;
             let geometry_height_physical = geometry.height() as f32 * scale_factor;
 
-            if width_mm > 0. && height_mm > 0. && geometry_width_physical > 0. && geometry_height_physical > 0. {
-                let pixel_pitch_mm = width_mm / geometry_width_physical;
+            if w_mm > 0. && h_mm > 0. && geometry_width_physical > 0. && geometry_height_physical > 0. {
+                let pixel_pitch_mm = w_mm / geometry_width_physical;
                 mks_debug!(
-                    "Monitor {}: {width_mm}×{height_mm}mm, {}×{} logical px (scale={scale_factor:.2}) → \
+                    "Monitor {}: {w_mm}×{h_mm}mm, {}×{} logical px (scale={scale_factor:.2}) → \
                      {geometry_width_physical}×{geometry_height_physical} physical px (pitch={pixel_pitch_mm:.4}mm/px)",
                     monitor.model().as_deref().unwrap_or("unknown"),
                     geometry.width(),
@@ -619,7 +626,7 @@ impl Component for VmDisplayModel {
                     sender.input(UpdateCaptureView);
                     return;
                 }
-                if self.input_mode() == mode {
+                if self.current_input_mode() == mode {
                     mks_debug!("Input capture mode already set to {mode:?}; ignoring duplicate request");
                     return;
                 }
@@ -654,7 +661,7 @@ impl Component for VmDisplayModel {
             }
 
             MouseMove { x, y } => {
-                let mode = self.input_mode();
+                let mode = self.current_input_mode();
                 if self.requested_input_mode == InputMode::Seamless
                     && mode == InputMode::Seamless
                     && !self.input.is_absolute
@@ -667,8 +674,7 @@ impl Component for VmDisplayModel {
                     return;
                 }
                 let current_capture = self.capture_state.current();
-                let point = Point::new(x, y);
-                let is_in_viewport = self.coord_system.is_in_viewport(&point);
+                let is_in_viewport = self.coord_system.is_in_viewport(x, y);
                 match (mode, current_capture, is_in_viewport) {
                     // Pointer just entered VM viewport.
                     (InputMode::Seamless, Capture::Idle, true) => {
@@ -693,7 +699,7 @@ impl Component for VmDisplayModel {
             }
 
             SetConfined(event) => {
-                let mode = self.input_mode();
+                let mode = self.current_input_mode();
                 if mode != InputMode::Confined {
                     // Capture requests are meaningful only in confined mode.
                     return;
@@ -720,7 +726,7 @@ impl Component for VmDisplayModel {
                     }
                     let prefer_relative = !self.input.is_absolute;
                     let confine_ok = self.confine_state.as_ref().is_some_and(|confine| {
-                        confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect, prefer_relative)
+                        confine.wayland_confine.borrow_mut().confine_pointer(&proxy, widget_rect, prefer_relative)
                     });
                     if !confine_ok {
                         mks_error!("Failed to establish Wayland pointer confinement");
@@ -813,7 +819,7 @@ impl Component for VmDisplayModel {
 
             MouseButton { button, transition } => {
                 if self.requested_input_mode == InputMode::Seamless
-                    && self.input_mode() == InputMode::Seamless
+                    && self.current_input_mode() == InputMode::Seamless
                     && !self.input.is_absolute
                 {
                     if transition == PressAction::Press {
@@ -825,7 +831,7 @@ impl Component for VmDisplayModel {
                     }
                     return;
                 }
-                if self.input_mode() == InputMode::Confined
+                if self.current_input_mode() == InputMode::Confined
                     && !self.input.is_absolute
                     && !self.capture_state.should_forward()
                 {
@@ -863,7 +869,7 @@ impl Component for VmDisplayModel {
                 let mode_str = if is_absolute { "absolute" } else { "relative" };
                 mks_info!("Guest mouse mode switched to {}", mode_str);
                 self.input.set_mouse_mode(is_absolute);
-                if self.input_mode() == InputMode::Confined && self.capture_state.should_forward() {
+                if self.current_input_mode() == InputMode::Confined && self.capture_state.should_forward() {
                     let widget_rect = self.confined_widget_rect();
                     let Some(proxy) = self.current_wayland_surface() else {
                         mks_error!("Failed to resolve wl_surface proxy; cannot reconfigure confined capture");
@@ -873,7 +879,7 @@ impl Component for VmDisplayModel {
                     let recapture_ok = self.confine_state.as_mut().is_some_and(|confine| {
                         confine.wayland_confine.borrow_mut().unconfine();
                         let ok =
-                            confine.wayland_confine.borrow_mut().confine_pointer(&proxy, &widget_rect, prefer_relative);
+                            confine.wayland_confine.borrow_mut().confine_pointer(&proxy, widget_rect, prefer_relative);
                         confine.is_captured = ok;
                         ok
                     });
@@ -895,7 +901,7 @@ impl Component for VmDisplayModel {
                 }
                 if !is_absolute
                     && self.requested_input_mode == InputMode::Seamless
-                    && self.input_mode() == InputMode::Seamless
+                    && self.current_input_mode() == InputMode::Seamless
                 {
                     let had_capture = self.capture_state.should_forward();
                     self.capture_state.reset();

@@ -2,7 +2,6 @@
 use crate::{display::input_daemon::InputCommand, mks_error, mks_info};
 use gdk4_wayland::{
     WaylandDisplay,
-    gdk::Rectangle,
     wayland_client::{
         Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
         protocol::{
@@ -101,7 +100,9 @@ impl WaylandConfine {
     ///
     /// When `prefer_relative` is true, this requires native relative-pointer protocol.
     /// Otherwise use region confinement for absolute guest mouse mode.
-    pub fn confine_pointer(&mut self, surface: &WlSurface, rect: &Rectangle, prefer_relative: bool) -> bool {
+    pub fn confine_pointer(
+        &mut self, surface: &WlSurface, (x, y, w, h): (u32, u32, u32, u32), prefer_relative: bool,
+    ) -> bool {
         if self.state.pointer_capture != PointerCapture::None {
             mks_error!("Pointer capture already active; ignoring duplicate confine request");
             return false;
@@ -133,7 +134,7 @@ impl WaylandConfine {
                 return false;
             };
             let region = compositor.create_region(&self.handle, ());
-            region.add(rect.x(), rect.y(), rect.width(), rect.height());
+            region.add(x.try_into().unwrap(), y.try_into().unwrap(), w.try_into().unwrap(), h.try_into().unwrap());
             let confined =
                 constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.handle, ());
             region.destroy();

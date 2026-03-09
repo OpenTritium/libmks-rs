@@ -1,12 +1,17 @@
 /// include/uapi/drm/drm_fourcc
 pub mod drm_4cc {
     use derive_more::{Deref, From, Into};
+    use std::fmt;
 
     #[derive(Copy, Clone, PartialEq, Eq, Deref, From, Debug, Into)]
-    pub struct FourCC(u32);
+    pub struct FourCC(pub u32);
+
+    impl fmt::LowerHex for FourCC {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+    }
 
     #[inline]
-    pub(crate) const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> FourCC {
+    pub const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> FourCC {
         FourCC((a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24))
     }
 
@@ -159,9 +164,14 @@ pub mod drm_4cc {
 /// from libpixman
 pub mod pixman {
     use derive_more::{From, Into};
+    use std::fmt;
 
     #[derive(Debug, From, Clone, Copy, Into, PartialEq, Eq)]
     pub struct Pixman(u32);
+
+    impl fmt::LowerHex for Pixman {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+    }
 
     impl Pixman {
         #[inline]
@@ -190,10 +200,9 @@ pub mod pixman {
         }
 
         #[inline]
-        pub const fn bytes_per_pixel(&self) -> usize {
+        pub const fn bytes_per_pixel(&self) -> u8 {
             let Pixman(raw) = *self;
-            let bpp = ((raw >> 24) & 0xFF) as usize;
-            bpp.div_ceil(8)
+            (((raw >> 24) + 7) >> 3) as u8
         }
     }
 

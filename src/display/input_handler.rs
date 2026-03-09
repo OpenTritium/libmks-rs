@@ -56,8 +56,11 @@ impl InputHandler {
             mks_error!("Watch command channel unavailable; skipping capability update");
             return;
         };
-        if let Err(e) = tx.try_send(WatchCommand::Update(cap)) {
-            mks_error!(error:? = e; "Failed to update capability watchers");
+        let result = tx.try_send(WatchCommand::Update(cap));
+        match result {
+            Err(e) => mks_error!(error:? = e; "Failed to send capability update {cap:?} to watch channel"),
+            Ok(false) => mks_warn!("Skipped capability update {cap:?} because watch command channel was full"),
+            Ok(true) => (),
         }
     }
 
@@ -71,8 +74,11 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping absolute move command");
             return;
         };
-        if let Err(e) = tx.try_send(MouseSetAbs(x, y)) {
-            mks_error!(error:? = e; "Failed to queue absolute mouse move");
+        let result = tx.try_send(MouseSetAbs(x, y));
+        match result {
+            Err(e) => mks_error!(error:? = e; "Failed to queue absolute mouse move to ({x}, {y})"),
+            Ok(false) => mks_warn!("Dropped absolute mouse move to ({x}, {y}) because input command channel was full"),
+            Ok(true) => (),
         }
     }
 
@@ -86,8 +92,13 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping relative move command");
             return;
         };
-        if let Err(e) = tx.try_send(MouseRel(dx, dy)) {
-            mks_error!(error:? = e; "Failed to queue relative mouse move");
+        let result = tx.try_send(MouseRel(dx, dy));
+        match result {
+            Err(e) => mks_error!(error:? = e; "Failed to queue relative mouse move by ({dx}, {dy})"),
+            Ok(false) => {
+                mks_warn!("Dropped relative mouse move by ({dx}, {dy}) because input command channel was full")
+            }
+            Ok(true) => (),
         }
     }
 
@@ -139,12 +150,27 @@ impl InputHandler {
             } else {
                 Button::WheelUp
             };
-            let Err(e) = tx.try_send(MousePress(btn)) else {
-                let Err(e) = tx.try_send(MouseRelease(btn)) else { continue };
-                mks_error!(error:? = e; "Failed to release mouse button");
-                continue;
+            let result = tx.try_send(MousePress(btn));
+            match result {
+                Err(e) => mks_error!(error:? = e; "Failed to queue scroll mouse press for {btn:?} (steps={steps})"),
+                Ok(false) => {
+                    mks_warn!(
+                        "Dropped scroll mouse press for {btn:?} (steps={steps}) because input command channel was full"
+                    )
+                }
+                Ok(true) => (),
             };
-            mks_error!(error:? = e; "Failed to press mouse button");
+            let result = tx.try_send(MouseRelease(btn));
+            match result {
+                Err(e) => mks_error!(error:? = e; "Failed to queue scroll mouse release for {btn:?} (steps={steps})"),
+                Ok(false) => {
+                    mks_warn!(
+                        "Dropped scroll mouse release for {btn:?} (steps={steps}) because input command channel was \
+                         full"
+                    )
+                }
+                Ok(true) => (),
+            };
         }
     }
 
@@ -169,19 +195,23 @@ impl InputHandler {
             return;
         };
         match tx.try_send(command) {
-            Ok(true) => match transition {
-                Press => {
-                    self.held_keys.insert(qnum);
-                }
-                Release => {
-                    self.held_keys.remove(&qnum);
-                }
-            },
+            Ok(true) if transition == Press => {
+                self.held_keys.insert(qnum);
+            }
+            Ok(true) => {
+                self.held_keys.remove(&qnum);
+            }
             Ok(false) => {
-                mks_warn!("Failed to send because of channel capacity");
+                mks_warn!(
+                    "Dropped keyboard {transition} event for keycode {keycode} ({qnum:?}) because input command \
+                     channel was full"
+                );
             }
             Err(e) => {
-                mks_error!(error:? = e; "Failed to send keyboard {transition} event");
+                mks_error!(
+                    error:? = e;
+                    "Failed to send keyboard {transition} event for keycode {keycode} ({qnum:?})"
+                );
             }
         }
     }
@@ -198,8 +228,16 @@ impl InputHandler {
             return;
         };
         for qnum in self.held_keys.drain() {
-            if let Err(e) = tx.try_send(KbdRelease(qnum)) {
-                mks_error!(error:? = e; "Failed to release tracked key during capture reset");
+            let result = tx.try_send(KbdRelease(qnum));
+            match result {
+                Err(e) => mks_error!(error:? = e; "Failed to release tracked key {qnum:?} during capture reset"),
+                Ok(false) => {
+                    mks_warn!(
+                        "Dropped tracked key release for {qnum:?} during capture reset because input command channel \
+                         was full"
+                    )
+                }
+                Ok(true) => (),
             }
         }
     }
@@ -218,11 +256,18 @@ impl InputHandler {
             return;
         };
         let result = match transition {
-            PressAction::Press => tx.send(MousePress(btn)),
-            PressAction::Release => tx.send(MouseRelease(btn)),
+            PressAction::Press => tx.try_send(MousePress(btn)),
+            PressAction::Release => tx.try_send(MouseRelease(btn)),
         };
-        if let Err(e) = result {
-            mks_error!(error:? = e; "Failed to send mouse {transition} event");
+        match result {
+            Err(e) => mks_error!(error:? = e; "Failed to send mouse {transition} event for button {button} ({btn:?})"),
+            Ok(false) => {
+                mks_warn!(
+                    "Dropped mouse {transition} event for button {button} ({btn:?}) because input command channel was \
+                     full"
+                )
+            }
+            Ok(true) => (),
         }
     }
 
@@ -236,8 +281,18 @@ impl InputHandler {
             mks_error!("Input command channel unavailable; dropping touch event");
             return;
         };
-        if let Err(e) = tx.send(Touch { kind, num_slot, x, y }) {
-            mks_error!(error:? = e; "Failed to queue touch event");
+        let result = tx.try_send(Touch { kind, num_slot, x, y });
+        match result {
+            Err(e) => {
+                mks_error!(error:? = e; "Failed to queue touch event kind={kind:?}, slot={num_slot}, pos=({x}, {y})")
+            }
+            Ok(false) => {
+                mks_warn!(
+                    "Dropped touch event kind={kind:?}, slot={num_slot}, pos=({x}, {y}) because input command channel \
+                     was full"
+                )
+            }
+            Ok(true) => (),
         }
     }
 }

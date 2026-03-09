@@ -5,10 +5,13 @@ use relm4::{
 };
 use std::{
     cmp::{max, min},
+    num::NonZeroU32,
     time::Duration,
 };
 
 const PIXMAN_FORMAT_A8R8G8B8: u32 = 0x20028888;
+
+fn nz(value: u32) -> NonZeroU32 { NonZeroU32::new(value).expect("example always uses non-zero dimensions") }
 
 struct AppModel {
     swapchain: Swapchain,
@@ -82,7 +85,7 @@ impl SimpleComponent for AppModel {
         model.current_texture = Some(
             model
                 .swapchain
-                .full_update_texture(canvas_w, canvas_h, stride, format, &full_buf)
+                .full_update_texture(nz(canvas_w), nz(canvas_h), nz(stride), format, &full_buf)
                 .expect("初始化失败！请检查 /dev/udmabuf 是否存在以及权限是否正确"),
         );
 
@@ -208,9 +211,9 @@ impl SimpleComponent for AppModel {
                 match self.swapchain.partial_update_texture(
                     dirty_x,
                     dirty_y,
-                    dirty_w,
-                    dirty_h,
-                    dirty_stride,
+                    nz(dirty_w),
+                    nz(dirty_h),
+                    nz(dirty_stride),
                     format,
                     &dirty_buf,
                 ) {

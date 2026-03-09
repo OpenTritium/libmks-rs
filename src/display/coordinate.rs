@@ -1,4 +1,3 @@
-use relm4::gtk::graphene::{Point, Rect};
 use std::{cell::Cell, num::NonZeroU32};
 
 /// Cached viewport transform from VM space to widget space.
@@ -18,7 +17,7 @@ pub struct Viewport {
 /// The viewport step follows CSS `object-fit: contain` semantics and is cached.
 #[derive(Debug, Clone)]
 pub struct Coordinate {
-    vm_resolution: (u32, u32),
+    pub vm_resolution: (u32, u32),
     widget_size_logical: (f32, f32),
     pub ui_scale: f32,
     cached_viewport: Cell<Option<Viewport>>,
@@ -31,8 +30,8 @@ impl Coordinate {
             vm_resolution: (vm_w, vm_h),
             widget_size_logical: (widget_w, widget_h),
             ui_scale,
-            cached_viewport: Cell::new(None),
-            transform_dirty: Cell::new(true),
+            cached_viewport: None.into(),
+            transform_dirty: true.into(),
         }
     }
 
@@ -41,10 +40,6 @@ impl Coordinate {
         self.vm_resolution = (w, h);
         self.transform_dirty.set(true);
     }
-
-    /// Returns VM resolution as `(width, height)`.
-    #[inline]
-    pub fn vm_resolution(&self) -> (u32, u32) { self.vm_resolution }
 
     #[inline]
     pub fn set_widget_size(&mut self, w: f32, h: f32) {
@@ -121,8 +116,8 @@ impl Coordinate {
             return None;
         }
         let viewport = self.get_cached_viewport()?;
-        let guest_x = ((logical_x - viewport.offset_x) / viewport.scale).floor().clamp(0., (vm_w - 1) as f32);
-        let guest_y = ((logical_y - viewport.offset_y) / viewport.scale).floor().clamp(0., (vm_h - 1) as f32);
+        let guest_x = ((logical_x - viewport.offset_x) / viewport.scale).round().clamp(0., (vm_w - 1) as f32);
+        let guest_y = ((logical_y - viewport.offset_y) / viewport.scale).round().clamp(0., (vm_h - 1) as f32);
         Some((guest_x as u32, guest_y as u32))
     }
 
@@ -131,19 +126,16 @@ impl Coordinate {
     pub fn vm_display_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         let viewport = self.get_cached_viewport()?;
         let (vm_w, vm_h) = self.vm_resolution;
-        let vm_w = vm_w as f32;
-        let vm_h = vm_h as f32;
-        Some((viewport.offset_x, viewport.offset_y, vm_w * viewport.scale, vm_h * viewport.scale))
+        Some((viewport.offset_x, viewport.offset_y, vm_w as f32 * viewport.scale, vm_h as f32 * viewport.scale))
     }
 
     /// Checks whether a widget-space point lies inside the VM display rect.
     #[inline]
-    pub fn is_in_viewport(&self, point: &Point) -> bool {
+    pub fn is_in_viewport(&self, px: f32, py: f32) -> bool {
         let Some((x, y, w, h)) = self.vm_display_bounds() else {
             return false;
         };
-        let vm_rect = Rect::new(x, y, w, h);
-        vm_rect.contains_point(point)
+        px >= x && px <= (x + w) && py >= y && py <= (y + h)
     }
 }
 
@@ -294,9 +286,9 @@ mod tests {
         let coord = Coordinate::new(800, 600, 1600.0, 900.0, 1.0);
 
         // Integration contract for vm_display capture gating.
-        assert!(coord.is_in_viewport(&Point::new(800.0, 450.0)));
-        assert!(!coord.is_in_viewport(&Point::new(100.0, 450.0)));
-        assert!(!coord.is_in_viewport(&Point::new(1500.0, 450.0)));
+        assert!(coord.is_in_viewport(800.0, 450.0));
+        assert!(!coord.is_in_viewport(100.0, 450.0));
+        assert!(!coord.is_in_viewport(1500.0, 450.0));
     }
 
     #[test]
@@ -304,10 +296,10 @@ mod tests {
         let coord = Coordinate::new(800, 600, 1600.0, 900.0, 1.0);
 
         // Lock current graphene boundary semantics used by capture transitions.
-        assert!(coord.is_in_viewport(&Point::new(200.0, 0.0)));
-        assert!(coord.is_in_viewport(&Point::new(1399.999, 899.999)));
-        assert!(!coord.is_in_viewport(&Point::new(1400.001, 450.0)));
-        assert!(!coord.is_in_viewport(&Point::new(800.0, 900.001)));
+        assert!(coord.is_in_viewport(200.0, 0.0));
+        assert!(coord.is_in_viewport(1399.999, 899.999));
+        assert!(!coord.is_in_viewport(1400.001, 450.0));
+        assert!(!coord.is_in_viewport(800.0, 900.001));
     }
 
     #[test]

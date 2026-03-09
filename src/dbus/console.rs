@@ -4,6 +4,7 @@ use crate::{generate_handler, generate_watcher, impl_controller, impl_session_co
 use derive_more::{AsRef, Deref, From};
 use kanal::AsyncSender;
 use serde::Deserialize;
+use std::num::{NonZeroU16, NonZeroU32};
 use zbus::{Result, proxy};
 use zvariant::{OwnedFd, OwnedValue, Type, Value};
 
@@ -70,7 +71,14 @@ pub enum ConsoleType {
 #[derive(Debug)]
 pub enum Command {
     /// Update UI geometry and viewport metadata.
-    SetUiInfo { width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32 },
+    SetUiInfo {
+        width_mm: NonZeroU16,
+        height_mm: NonZeroU16,
+        xoff: u32,
+        yoff: u32,
+        width: NonZeroU32,
+        height: NonZeroU32,
+    },
     /// Register a listener object that implements `org.qemu.Display1.Listener`.
     RegisterListener(OwnedFd),
 }
@@ -99,7 +107,7 @@ pub enum Event {
 pub struct ConsoleController(pub AsyncSender<Command>);
 
 impl_controller!(ConsoleController, Command, {
-    pub fn set_ui_info(width_mm: u16, height_mm: u16, xoff: i32, yoff: i32, width: u32, height: u32)
+    pub fn set_ui_info(width_mm: NonZeroU16, height_mm: NonZeroU16, xoff: u32, yoff: u32, width:NonZeroU32, height: NonZeroU32)
         => SetUiInfo { width_mm, height_mm, xoff, yoff, width, height };
     pub fn register_listener(fd: OwnedFd)
         => RegisterListener(fd);
@@ -139,7 +147,14 @@ generate_handler!(
     "console",
     |p| {
         Command::SetUiInfo { width_mm, height_mm, xoff, yoff, width, height }
-            => p.set_ui_info(width_mm, height_mm, xoff, yoff, width, height).await,
+            => p.set_ui_info(
+                width_mm.get(),
+                height_mm.get(),
+                xoff.try_into().unwrap(),
+                yoff.try_into().unwrap(),
+                width.get(),
+                height.get(),
+            ).await,
         Command::RegisterListener(fd)
             => p.register_listener(&fd).await,
     }

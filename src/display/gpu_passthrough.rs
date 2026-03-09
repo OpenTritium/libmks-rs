@@ -7,32 +7,37 @@
 //!
 //! Reference:
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org-qemu-display1-listener-section>
-
 use super::{
     Error,
     pixman_4cc::{FourCC, sanitize_opaque_fourcc},
     udma::{Damage, DmabufPlane, build_dmabuf_texture_planar},
 };
 use crate::{mks_debug, mks_trace};
+use arrayvec::ArrayVec;
 use relm4::gtk::gdk::Texture;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::{
+    num::NonZeroU32,
+    os::fd::{AsRawFd, OwnedFd},
+};
 
 const LOG_TARGET: &str = "mks.display.gpu_passthrough";
 
 #[derive(Debug)]
 struct PlaneDesc {
     fd: OwnedFd,
-    stride: u32,
+    stride: NonZeroU32,
     offset: u32,
 }
 
+const MAX_PLANES: usize = 4;
+
 #[derive(Debug)]
 struct DmabufState {
-    planes: Box<[PlaneDesc]>,
+    planes: ArrayVec<PlaneDesc, MAX_PLANES>,
     fourcc: FourCC,
     modifier: u64,
-    width: u32,
-    height: u32,
+    width: NonZeroU32,
+    height: NonZeroU32,
 }
 
 /// GPU-backed scanout state for DMA-BUF paths.
@@ -51,8 +56,12 @@ impl GpuPassthrough {
     pub const fn new() -> Self { Self { texture: None, active: None, pending: None } }
 
     #[inline]
-    fn stage_pending(&mut self, planes: Box<[PlaneDesc]>, width: u32, height: u32, fourcc: u32, modifier: u64) {
-        self.pending = Some(DmabufState { planes, fourcc: FourCC::from(fourcc), modifier, width, height });
+    fn stage_pending(
+        &mut self, planes: impl IntoIterator<Item = PlaneDesc>, w: NonZeroU32, h: NonZeroU32, fourcc: FourCC,
+        modifier: u64,
+    ) {
+        let planes = planes.into_iter().collect();
+        self.pending = DmabufState { planes, fourcc, modifier, width: w, height: h }.into();
     }
 
     /// Stages a single-plane scanout frame into `pending`.
@@ -60,11 +69,11 @@ impl GpuPassthrough {
     /// Any previous not-yet-committed `pending` frame is replaced.
     #[inline]
     pub fn stage_single_plane(
-        &mut self, dmabuf_fd: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64,
+        &mut self, dmabuf_fd: OwnedFd, w: NonZeroU32, h: NonZeroU32, stride: NonZeroU32, fourcc: FourCC, modifier: u64,
     ) {
-        let planes: Box<_> = [PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into();
-        self.stage_pending(planes, width, height, fourcc, modifier);
-        mks_trace!("DMABUF prepared (single-plane): {width}x{height}; import deferred until UpdateDMABUF");
+        let planes = [PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }];
+        self.stage_pending(planes, w, h, fourcc, modifier);
+        mks_trace!("DMABUF prepared (single-plane): {w}x{h}; import deferred until UpdateDMABUF");
     }
 
     /// Stages a multi-plane scanout frame into `pending`.
@@ -74,20 +83,21 @@ impl GpuPassthrough {
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn stage_multi_plane(
-        &mut self, dmabuf_fds: impl IntoIterator<Item = OwnedFd>, width: u32, height: u32, plane_strides: &[u32],
-        plane_offsets: &[u32], fourcc: u32, modifier: u64,
+        &mut self, dmabuf_fds: impl IntoIterator<Item = OwnedFd>, w: NonZeroU32, h: NonZeroU32, strides: &[NonZeroU32],
+        offsets: &[u32], fourcc: FourCC, modifier: u64,
     ) {
-        let planes: Box<_> = dmabuf_fds
+        let planes = dmabuf_fds
             .into_iter()
-            .zip(plane_strides.iter().copied())
-            .zip(plane_offsets.iter().copied())
+            .take(MAX_PLANES)
+            .zip(strides.iter().copied())
+            .zip(offsets.iter().copied())
             .map(|((fd, stride), offset)| PlaneDesc { fd, stride, offset })
-            .collect();
+            .collect::<ArrayVec<_, MAX_PLANES>>();
         mks_trace!(
-            "DMABUF prepared (multi-plane): {width}x{height}, planes={}; import deferred until UpdateDMABUF",
+            "DMABUF prepared (multi-plane): {w}x{h}, planes={}; import deferred until UpdateDMABUF",
             planes.len()
         );
-        self.stage_pending(planes, width, height, fourcc, modifier);
+        self.stage_pending(planes, w, h, fourcc, modifier);
     }
 
     /// Commits a staged DMABUF update and (re)builds the presentation texture.
@@ -103,7 +113,7 @@ impl GpuPassthrough {
     /// - `Ok(false)`: no visible work was needed (e.g. invalid/empty damage rect or no active/pending state).
     /// - `Err(..)`: texture rebuild failed.
     #[inline]
-    pub fn commit_update(&mut self, x: i32, y: i32, damage_width: i32, damage_height: i32) -> Result<bool, Error> {
+    pub fn commit_update(&mut self, x: u32, y: u32, w: NonZeroU32, h: NonZeroU32) -> Result<bool, Error> {
         let is_page_flip = if let Some(pending) = self.pending.take() {
             self.active = Some(pending);
             true
@@ -114,28 +124,23 @@ impl GpuPassthrough {
             mks_trace!("UpdateDMABUF commit skipped: no active frame and no pending frame");
             return Ok(false);
         };
-        let damage = if is_page_flip {
+        let (damage, old_texture) = if is_page_flip {
             mks_trace!("DMABUF commit: page flip detected; rebuilding from pending frame");
-            None
+            (None, None)
         } else {
-            if x < 0 || y < 0 || damage_width <= 0 || damage_height <= 0 {
-                mks_trace!("UpdateDMABUF commit skipped: invalid damage rect ({x},{y} {damage_width}x{damage_height})",);
-                return Ok(false);
-            }
-            let damage = Damage { x: x as u32, y: y as u32, width: damage_width as u32, height: damage_height as u32 };
+            let damage = Damage { x, y, width: w, height: h };
             mks_trace!("DMABUF commit: in-place update (trust QEMU damage)={damage:?}");
-            Some(damage)
+            (Some(damage), self.texture())
         };
-        let gdk_planes: Box<[_]> = active
+        let gdk_planes = active
             .planes
             .iter()
-            .map(|plane| DmabufPlane { fd: plane.fd.as_raw_fd(), stride: plane.stride, offset: plane.offset })
-            .collect();
+            .map(|&PlaneDesc { ref fd, stride, offset }| DmabufPlane { fd: fd.as_raw_fd(), stride, offset })
+            .collect::<ArrayVec<_, MAX_PLANES>>();
         let sanitized = sanitize_opaque_fourcc(active.fourcc).unwrap_or_else(|raw| {
             mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
             raw
         });
-        let old_texture = if is_page_flip { None } else { self.texture.as_ref() };
         self.texture = Some(build_dmabuf_texture_planar(
             active.width,
             active.height,
@@ -159,6 +164,6 @@ impl GpuPassthrough {
     /// - `1`: height in pixels.
     #[inline]
     pub fn resolution(&self) -> (u32, u32) {
-        self.active.as_ref().map(|active| (active.width, active.height)).unwrap_or_default()
+        self.active.as_ref().map(|active| (active.width.get(), active.height.get())).unwrap_or_default()
     }
 }

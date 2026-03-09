@@ -42,7 +42,10 @@ use libmks_rs::{
 };
 use log::{error, info, warn};
 use relm4::{Controller, gtk::prelude::*, prelude::*};
-use std::path::PathBuf;
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
+};
 
 /// Must hold these connections for the lifetime of the application
 struct AppResources {
@@ -567,14 +570,11 @@ async fn connect_to_qemu(
     info!("Listener server registered at /org/qemu/Display1/Listener");
 
     // Set UI info
-    console_ctrl.set_ui_info(
-        0,
-        0,
-        0,
-        0, // width_mm, height_mm, xoff, yoff (use defaults)
-        console_width,
-        console_height,
-    )?;
+    let width_mm = NonZeroU16::new(1).unwrap();
+    let height_mm = NonZeroU16::new(1).unwrap();
+    let console_width = NonZeroU32::new(console_width.max(1)).unwrap();
+    let console_height = NonZeroU32::new(console_height.max(1)).unwrap();
+    console_ctrl.set_ui_info(width_mm, height_mm, 0, 0, console_width, console_height)?;
     info!("Set UI info: {}x{}", console_width, console_height);
 
     // Build unified input bus from discovered console interfaces.

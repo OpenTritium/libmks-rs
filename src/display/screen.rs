@@ -1,5 +1,5 @@
 //! Screen and cursor state model.
-use super::{gpu_passthrough::GpuPassthrough, pixman_4cc::Pixman};
+use super::gpu_passthrough::GpuPassthrough;
 use crate::{
     dbus::listener::Event,
     display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
@@ -11,7 +11,7 @@ use relm4::gtk::{
     glib::Bytes,
     prelude::*,
 };
-use std::{hint::unreachable_unchecked, os::fd::OwnedFd};
+use std::{hint::unreachable_unchecked, num::NonZeroU32, os::fd::OwnedFd};
 
 const LOG_TARGET: &str = "mks.display.event";
 
@@ -29,11 +29,12 @@ impl DirtyFlags {
 #[derive(Debug, Clone)]
 pub struct CursorState {
     pub texture: Option<MemoryTexture>,
+    // Stored as signed because QEMU positions the cursor by image top-left, which may be off-screen.
     pub x: i32,
     pub y: i32,
     pub visible: bool,
-    pub hot_x: i32,
-    pub hot_y: i32,
+    pub hot_x: u32,
+    pub hot_y: u32,
     pub last_data: Bytes,
 }
 
@@ -58,39 +59,39 @@ impl CursorState {
     /// rebuilding the texture when the cursor payload is effectively unchanged.
     #[inline]
     pub fn looks_same(
-        &self, width: i32, height: i32, hot_x: i32, hot_y: i32, new_data: &[u8], bytes_per_pixel: usize,
+        &self, width: NonZeroU32, height: NonZeroU32, hot_x: u32, hot_y: u32, new_data: &[u8], bytes_per_pixel: usize,
     ) -> bool {
-        if bytes_per_pixel == 0 {
+        let bpp = bytes_per_pixel;
+        if bpp == 0 {
             return false;
         }
         if self.hot_x != hot_x
             || self.hot_y != hot_y
-            || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width
-            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height
             || self.last_data.len() != new_data.len()
+            || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width.get() as i32
+            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height.get() as i32
         {
             return false;
         }
-        let w = width as usize;
-        let h = height as usize;
-        let stride = w * bytes_per_pixel;
+        let w = width.get() as usize;
+        let h = height.get() as usize;
+        let stride = w * bpp;
         if w < 3 || h < 3 {
             return self.last_data == new_data;
         }
         let points = [
             0,
-            (w - 1) * bytes_per_pixel,
+            (w - 1) * bpp,
             (h - 1) * stride,
-            (h - 1) * stride + (w - 1) * bytes_per_pixel,
-            (h / 2) * stride + (w / 2) * bytes_per_pixel,
-            (w / 2) * bytes_per_pixel,
-            (h - 1) * stride + (w / 2) * bytes_per_pixel,
+            (h - 1) * stride + (w - 1) * bpp,
+            (h / 2) * stride + (w / 2) * bpp,
+            (w / 2) * bpp,
+            (h - 1) * stride + (w / 2) * bpp,
             (h / 2) * stride,
-            (h / 2) * stride + (w - 1) * bytes_per_pixel,
+            (h / 2) * stride + (w - 1) * bpp,
         ];
         for &offset in &points {
-            if offset + bytes_per_pixel <= new_data.len()
-                && self.last_data[offset..offset + bytes_per_pixel] != new_data[offset..offset + bytes_per_pixel]
+            if offset + bpp <= new_data.len() && self.last_data[offset..offset + bpp] != new_data[offset..offset + bpp]
             {
                 return false;
             }
@@ -164,31 +165,21 @@ impl Screen {
                     "Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
                     data.len()
                 );
-                let pixman = Pixman::from(pixman_format);
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
-                swapchain.full_update_texture(width, height, stride, pixman, &data)?;
+                swapchain.full_update_texture(width, height, stride, pixman_format, &data)?;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
                 mks_trace!(
                     "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
                     data.len()
                 );
-                if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    mks_error!("Ignoring invalid QEMU Update rect: x={x}, y={y}, width={width}, height={height}");
-                    return Ok(flags);
-                }
-                let pixman = Pixman::from(pixman_format);
                 let (swapchain, new_created) = self.backend.ensure_software_rasterizer();
                 if new_created {
                     return Err(Error::State(
                         "Received partial 'Update' without preceding 'Scanout' (Software Backend uninitialized)",
                     ));
                 }
-                let x = x as u32;
-                let y = y as u32;
-                let width = width as u32;
-                let height = height as u32;
-                swapchain.partial_update_texture(x, y, width, height, stride, pixman, &data)?;
+                swapchain.partial_update_texture(x, y, width, height, stride, pixman_format, &data)?;
                 flags.frame = true;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
@@ -234,10 +225,6 @@ impl Screen {
             }
             UpdateMap { x, y, width, height } => {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
-                if x < 0 || y < 0 || width <= 0 || height <= 0 {
-                    mks_error!("Ignoring invalid QEMU UpdateMap rect: x={x}, y={y}, width={width}, height={height}");
-                    return Ok(flags);
-                }
                 let (_, new_created) = self.backend.ensure_direct_mapped();
                 if new_created {
                     return Err(Error::State(
@@ -274,8 +261,13 @@ impl Screen {
             CursorDefine { width, height, hot_x, hot_y, data } => {
                 if !self.cursor.looks_same(width, height, hot_x, hot_y, &data, 4) {
                     let data = Bytes::from_owned(data.0);
-                    let texture =
-                        MemoryTexture::new(width, height, MemoryFormat::B8g8r8a8, &data, (width as u32 * 4) as usize);
+                    let texture = MemoryTexture::new(
+                        width.get().try_into().unwrap(),
+                        height.get().try_into().unwrap(),
+                        MemoryFormat::B8g8r8a8,
+                        &data,
+                        (width.get() * 4) as usize,
+                    );
                     self.cursor.texture = Some(texture);
                     self.cursor.last_data = data;
                     self.cursor.hot_x = hot_x;
@@ -285,11 +277,10 @@ impl Screen {
                 self.cursor.visible = true;
             }
             MouseSet { x, y, on } => {
-                let visible = on != 0;
-                if self.cursor.x != x || self.cursor.y != y || self.cursor.visible != visible {
+                if self.cursor.x != x || self.cursor.y != y || self.cursor.visible != on {
                     self.cursor.x = x;
                     self.cursor.y = y;
-                    self.cursor.visible = visible;
+                    self.cursor.visible = on;
                     flags.cursor = true;
                 }
             }
@@ -320,9 +311,9 @@ impl Screen {
     /// - `height`: frame height.
     pub fn resolution(&self) -> (u32, u32) {
         match &self.backend {
-            SoftwareRasterizer(sw) => sw.resolution().unwrap_or((0, 0)),
+            SoftwareRasterizer(sw) => sw.resolution(),
             GpuPassthrough(gpu) => gpu.resolution(),
-            DirectMapped(cache) => cache.resolution().unwrap_or((0, 0)),
+            DirectMapped(cache) => cache.resolution(),
             None => (0, 0),
         }
     }
