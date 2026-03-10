@@ -189,6 +189,7 @@ impl Screen {
                 );
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
                 swapchain.full_update_texture(width, height, stride, pixman_format, &data)?;
+                flags.frame = true;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
                 mks_trace!(
