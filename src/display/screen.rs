@@ -11,7 +11,11 @@ use relm4::gtk::{
     glib::Bytes,
     prelude::*,
 };
-use std::{hint::unreachable_unchecked, num::NonZeroU32, os::fd::OwnedFd};
+use std::{
+    hint::{unlikely, unreachable_unchecked},
+    num::NonZeroU32,
+    os::fd::OwnedFd,
+};
 
 const LOG_TARGET: &str = "mks.display.event";
 
@@ -80,21 +84,21 @@ impl CursorState {
         &self, width: NonZeroU32, height: NonZeroU32, hot_x: u32, hot_y: u32, new_data: &[u8], bytes_per_pixel: usize,
     ) -> bool {
         let bpp = bytes_per_pixel;
-        if bpp == 0 {
+        if unlikely(bpp == 0) {
             return false;
         }
-        if self.hot_x != hot_x
+        let invalid_cond = self.hot_x != hot_x
             || self.hot_y != hot_y
             || self.last_data.len() != new_data.len()
             || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width.get() as i32
-            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height.get() as i32
-        {
+            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height.get() as i32;
+        if unlikely(invalid_cond) {
             return false;
         }
         let w = width.get() as usize;
         let h = height.get() as usize;
         let stride = w * bpp;
-        if w < 3 || h < 3 {
+        if unlikely(w < 3 || h < 3) {
             return self.last_data == new_data;
         }
         let points = [
@@ -169,7 +173,7 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub fn new() -> Self { Self { cursor: CursorState::default(), backend: None, y0_top: false } }
+    pub fn new() -> Self { Self::default() }
 
     /// Applies one display event and returns dirty flags for frame/cursor refresh.
     #[inline]

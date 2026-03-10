@@ -12,7 +12,7 @@ use libmks_rs::{
     },
 };
 use log::info;
-use relm4::{Controller, gtk::prelude::*, prelude::*};
+use relm4::{Controller, adw, gtk::prelude::*, prelude::*};
 use std::{num::NonZeroU32, thread, time::Duration};
 use tokio::sync::watch;
 
@@ -71,7 +71,7 @@ impl SimpleComponent for AppModel {
                 },
 
                 #[local_ref]
-                display_widget -> gtk::Overlay {
+                display_widget -> adw::ToastOverlay {
                     set_hexpand: true,
                     set_vexpand: true,
                 },

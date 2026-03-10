@@ -1,6 +1,7 @@
 use super::{
     coordinate::Coordinate,
     input_daemon::{InputCommand, WatchCommand},
+    vm_display::{CaptureEvent, GrabShortcut, Message, VmDisplayModel},
 };
 use crate::{
     dbus::{keyboard::PressAction, mouse::Button, multitouch::Kind},
@@ -8,7 +9,16 @@ use crate::{
     mks_debug, mks_error, mks_warn,
 };
 use InputCommand::*;
+use gdk4_wayland::glib::Propagation;
 use kanal::{AsyncSender, Sender};
+use relm4::{
+    ComponentSender,
+    adw::ToastOverlay,
+    gtk::{
+        DrawingArea, EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
+        GestureClick, prelude::*,
+    },
+};
 use std::collections::HashSet;
 use typed_builder::TypedBuilder;
 
@@ -295,4 +305,59 @@ impl InputHandler {
             Ok(true) => (),
         }
     }
+}
+
+/// 挂载所有与输入相关的 GTK Event Controllers 并将事件映射到 Message 转发给主模型
+pub fn attach_gtk_controllers(
+    input_overlay: &DrawingArea, root: &ToastOverlay, sender: &ComponentSender<VmDisplayModel>,
+    grab_shortcut: GrabShortcut,
+) {
+    let motion_ctrl = EventControllerMotion::new();
+    let sender_clone = sender.clone();
+    motion_ctrl.connect_motion(move |_, x, y| {
+        sender_clone.input(Message::MouseMove { x: x as f32, y: y as f32 });
+    });
+    let sender_c = sender.clone();
+    motion_ctrl.connect_leave(move |_| sender_c.input(Message::MouseLeave));
+    input_overlay.add_controller(motion_ctrl);
+
+    let click = GestureClick::new();
+    click.set_button(0);
+    let sender_clone = sender.clone();
+    let input_overlay_click = input_overlay.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        input_overlay_click.grab_focus();
+        sender_clone.input(Message::SetConfined(CaptureEvent::Capture { click_pos: Some((x as f32, y as f32)) }));
+        sender_clone.input(Message::MouseButton { button: gesture.current_button(), transition: PressAction::Press });
+    });
+    let sender_clone = sender.clone();
+    click.connect_released(move |gesture, _, _, _| {
+        sender_clone.input(Message::MouseButton { button: gesture.current_button(), transition: PressAction::Release });
+    });
+    input_overlay.add_controller(click);
+
+    let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    let sender_clone = sender.clone();
+    scroll.connect_scroll(move |_, _dx, dy| {
+        sender_clone.input(Message::Scroll { dy });
+        Propagation::Proceed
+    });
+    input_overlay.add_controller(scroll);
+
+    let key = EventControllerKey::new();
+    let sender_for_release = sender.clone();
+    let sender_for_key = sender.clone();
+    key.connect_key_pressed(move |_, keyval, keycode, modifiers| {
+        if modifiers.contains(grab_shortcut.mask) && keyval == grab_shortcut.key {
+            sender_for_release.input(Message::SetConfined(CaptureEvent::Release));
+            return Propagation::Stop;
+        }
+        sender_for_key.input(Message::Key { keycode, transition: PressAction::Press });
+        Propagation::Stop
+    });
+    let sender_clone = sender.clone();
+    key.connect_key_released(move |_, _keyval, keycode, _| {
+        sender_clone.input(Message::Key { keycode, transition: PressAction::Release });
+    });
+    root.add_controller(key);
 }

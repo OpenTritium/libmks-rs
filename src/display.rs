@@ -5,6 +5,7 @@ mod error;
 mod gpu_passthrough;
 pub mod input_daemon;
 pub mod input_handler;
+pub mod monitor_metrics;
 pub mod pixman_4cc;
 pub mod screen;
 pub mod software_rasterizer;
