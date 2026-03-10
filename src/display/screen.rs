@@ -24,6 +24,24 @@ pub struct DirtyFlags {
 impl DirtyFlags {
     #[inline]
     pub const fn any(&self) -> bool { self.frame || self.cursor }
+
+    /// Merges other into self.
+    #[inline]
+    pub fn merge(&mut self, other: DirtyFlags) {
+        self.frame |= other.frame;
+        self.cursor |= other.cursor;
+    }
+
+    /// Sets frame and cursor as dirty.
+    #[inline]
+    pub fn set_frame_and_cursor_dirty(&mut self) {
+        self.frame = true;
+        self.cursor = true;
+    }
+
+    /// Sets cursor as dirty.
+    #[inline]
+    pub fn set_cursor_dirty(&mut self) { self.cursor = true; }
 }
 
 #[derive(Debug, Clone)]

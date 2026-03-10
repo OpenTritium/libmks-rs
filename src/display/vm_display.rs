@@ -3,17 +3,16 @@ use super::{
     coordinate::Coordinate,
     input_handler::InputHandler,
     screen::{DirtyFlags, Screen},
-    wayland_confine::WaylandConfine,
+    wayland_confine::ConfineState,
 };
 use crate::{
     dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent},
-    display::input_daemon::InputCommand,
     mks_debug, mks_error, mks_info, mks_trace, mks_warn,
 };
 use gdk4_wayland::{
-    WaylandDisplay, WaylandSurface,
+    WaylandSurface,
     gdk::{Key, ModifierType, Texture},
-    glib::{ControlFlow, IOCondition, Propagation, SourceId, translate::IntoGlib, unix_fd_add_local},
+    glib::{Propagation, translate::IntoGlib},
     prelude::*,
     wayland_client::protocol::wl_surface::WlSurface,
 };
@@ -29,10 +28,8 @@ use relm4::{
 };
 use std::{
     borrow::Cow,
-    cell::RefCell,
     fmt, mem,
     num::{NonZeroU16, NonZeroU32},
-    rc::Rc,
     sync::Once,
     time::Duration,
 };
@@ -80,39 +77,6 @@ impl fmt::Display for GrabShortcut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = accelerator_get_label(self.key, self.mask);
         write!(f, "{label}")
-    }
-}
-
-pub struct ConfineState {
-    pub wayland_confine: Rc<RefCell<WaylandConfine>>,
-    pub poll_source: Option<SourceId>,
-    pub is_captured: bool,
-}
-
-impl ConfineState {
-    pub fn connect_to_wayland(input_tx: kanal::Sender<InputCommand>) -> Option<Self> {
-        let display = Display::default()?;
-        let wl_display = display.downcast::<WaylandDisplay>().ok()?;
-        mks_info!("Wayland session detected; enabling pointer-confinement support");
-        let confine = WaylandConfine::from_gdk(&wl_display, input_tx);
-        let confine = Rc::new(RefCell::new(confine));
-        let fd = confine.borrow().get_conn_raw_fd();
-        let confine_clone = confine.clone();
-        let poll_source = unix_fd_add_local(fd, IOCondition::IN, move |_fd, _condition| {
-            confine_clone.borrow_mut().dispatch_pending();
-            ControlFlow::Continue
-        });
-        mks_debug!("Attached Wayland FD monitor to GLib main context");
-        Some(Self { wayland_confine: confine, poll_source: Some(poll_source), is_captured: false })
-    }
-}
-
-impl Drop for ConfineState {
-    fn drop(&mut self) {
-        if let Some(source) = self.poll_source.take() {
-            source.remove();
-        }
-        self.wayland_confine.borrow_mut().unconfine();
     }
 }
 
@@ -259,21 +223,6 @@ impl VmDisplayModel {
     #[inline]
     fn release_hint_text(shortcut: GrabShortcut) -> String { format!("Press {shortcut} to release mouse") }
 
-    #[inline]
-    fn mark_cursor_dirty(&mut self) { self.dirty_flags.cursor = true; }
-
-    #[inline]
-    fn mark_frame_and_cursor_dirty(&mut self) {
-        self.dirty_flags.frame = true;
-        self.dirty_flags.cursor = true;
-    }
-
-    #[inline]
-    fn merge_dirty_flags(&mut self, flags: DirtyFlags) {
-        self.dirty_flags.frame |= flags.frame;
-        self.dirty_flags.cursor |= flags.cursor;
-    }
-
     /// Returns the input overlay bounds for pointer confinement.
     ///
     /// - `x`: left edge in native-surface coordinates.
@@ -392,7 +341,7 @@ impl VmDisplayModel {
     fn show_toast(&mut self, text: impl Into<Cow<'static, str>>, sender: ComponentSender<Self>) {
         self.hint_text = text.into();
         self.hint_visible = true;
-        self.mark_cursor_dirty();
+        self.dirty_flags.set_cursor_dirty();
         self.cancel_hint_timer();
         self.hint_timer = relm4::spawn(async move {
             sleep(Duration::from_secs(TOAST_DURATION_SECS)).await;
@@ -778,7 +727,7 @@ impl Component for VmDisplayModel {
                 Ok(flags) => {
                     let (w, h) = self.screen.resolution();
                     self.coord_system.set_vm_resolution(w, h);
-                    self.merge_dirty_flags(flags);
+                    self.dirty_flags.merge(flags);
                     let y_flip = self.screen.y0_top;
                     if self.last_logged_presentation_y_flip != Some(y_flip) {
                         let state = if y_flip { "enabled" } else { "disabled" };
@@ -805,7 +754,7 @@ impl Component for VmDisplayModel {
                 if let Some(_native) = self.input_overlay.native() {
                     self.coord_system.ui_scale = self.input_overlay.scale_factor() as f32;
                 }
-                self.mark_frame_and_cursor_dirty();
+                self.dirty_flags.set_frame_and_cursor_dirty();
                 if self.scaling_mode == ScalingMode::ResizeGuest
                     && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
                 {
@@ -816,11 +765,11 @@ impl Component for VmDisplayModel {
             HideCaptureHint => {
                 self.cancel_hint_timer();
                 self.hint_visible = false;
-                self.mark_frame_and_cursor_dirty();
+                self.dirty_flags.set_frame_and_cursor_dirty();
             }
 
             UpdateCaptureView => {
-                self.mark_cursor_dirty();
+                self.dirty_flags.set_cursor_dirty();
             }
 
             MouseButton { button, transition } => {

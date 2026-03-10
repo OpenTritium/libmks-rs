@@ -1,7 +1,11 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
-use crate::{display::input_daemon::InputCommand, mks_error, mks_info};
+use crate::{
+    display::input_daemon::InputCommand,
+    mks_debug, mks_error, mks_info,
+};
 use gdk4_wayland::{
     WaylandDisplay,
+    glib::{IOCondition, SourceId, ControlFlow, unix_fd_add_local},
     wayland_client::{
         Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
         protocol::{
@@ -16,8 +20,10 @@ use gdk4_wayland::{
 };
 use kanal::Sender;
 use std::{
+    cell::RefCell,
     mem,
     os::unix::io::{AsFd, RawFd},
+    rc::Rc,
 };
 use wayland_protocols::wp::{
     pointer_constraints::zv1::client::{
@@ -284,3 +290,44 @@ empty_dispatch!(
     WlCompositor,
     WlRegion,
 );
+
+// ============================================================================
+// ConfineState - manages Wayland pointer confinement lifecycle
+// ============================================================================
+
+use gdk4_wayland::prelude::*;
+use gdk4_wayland::gdk::Display;
+use kanal;
+
+pub struct ConfineState {
+    pub wayland_confine: Rc<RefCell<WaylandConfine>>,
+    pub poll_source: Option<SourceId>,
+    pub is_captured: bool,
+}
+
+impl ConfineState {
+    pub fn connect_to_wayland(input_tx: kanal::Sender<InputCommand>) -> Option<Self> {
+        let display = Display::default()?;
+        let wl_display = display.downcast::<WaylandDisplay>().ok()?;
+        mks_info!("Wayland session detected; enabling pointer-confinement support");
+        let confine = WaylandConfine::from_gdk(&wl_display, input_tx);
+        let confine = Rc::new(RefCell::new(confine));
+        let fd = confine.borrow().get_conn_raw_fd();
+        let confine_clone = confine.clone();
+        let poll_source = unix_fd_add_local(fd, IOCondition::IN, move |_fd, _condition| {
+            confine_clone.borrow_mut().dispatch_pending();
+            ControlFlow::Continue
+        });
+        mks_debug!("Attached Wayland FD monitor to GLib main context");
+        Some(Self { wayland_confine: confine, poll_source: Some(poll_source), is_captured: false })
+    }
+}
+
+impl Drop for ConfineState {
+    fn drop(&mut self) {
+        if let Some(source) = self.poll_source.take() {
+            source.remove();
+        }
+        self.wayland_confine.borrow_mut().unconfine();
+    }
+}
