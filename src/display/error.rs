@@ -10,6 +10,4 @@ pub enum Error {
     Texture(#[from] relm4::gtk::glib::Error),
     #[error("Unsupported Pixman format: {0}")]
     InvalidFormat(#[from] super::pixman_4cc::UnknownPixmanFormat),
-    #[error("Invalid state: {0}")]
-    State(&'static str),
 }

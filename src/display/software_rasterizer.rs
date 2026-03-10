@@ -284,7 +284,7 @@ impl Swapchain {
         let [dst, src] = unsafe { self.buffers.get_disjoint_unchecked_mut([shadow_idx, active_idx]) };
         let src = match src {
             Some(src) => src,
-            None => return Err(Error::State("Active buffer uninitialized")),
+            None => panic!("Active buffer uninitialized"),
         };
         if let Some(d) = self.last_damage {
             match dst {
@@ -342,10 +342,10 @@ impl Swapchain {
         &mut self, x: u32, y: u32, w: NonZeroU32, h: NonZeroU32, stride: NonZeroU32, pixman: Pixman, buf: &[u8],
     ) -> Result<Texture, Error> {
         let Some(active) = self.active_buf().as_ref() else {
-            return Err(Error::State("Swapchain uninitialized"));
+            panic!("Swapchain uninitialized");
         };
         if pixman != active.pixman {
-            return Err(Error::State("Partial update pixman format mismatch"));
+            panic!("Partial update pixman format mismatch: expected {:x}, got {:x}", active.pixman, pixman);
         }
         let aw = active.width.get();
         let ah = active.height.get();
@@ -354,7 +354,11 @@ impl Swapchain {
         if x >= aw || y >= ah {
             // Expected during resize/mode transitions when stale Update events race with new Scanout.
             mks_debug!("Ignoring off-screen partial update: rect=({x},{y} {w}x{h}), surface={aw}x{ah}",);
-            return self.active_texture().as_ref().cloned().ok_or(Error::State("Active texture missing"));
+            // Off-screen update, return previous texture
+            return Ok(self.active_texture()
+                .as_ref()
+                .cloned()
+                .expect("Active texture missing"));
         }
         let clipped_width = NonZeroU32::new(w.min(aw - x)).expect("Damage width stays non-zero after clipping");
         let clipped_height = NonZeroU32::new(h.min(ah - y)).expect("Damage height stays non-zero after clipping");
@@ -375,7 +379,8 @@ impl Swapchain {
                 "Ignoring partial update: payload too short (need={required}, got={}, rect={cw}x{ch}, stride={s})",
                 buf.len()
             );
-            return self.active_texture().as_ref().cloned().ok_or(Error::State("Active texture missing"));
+            // Payload too short, return previous texture
+            return Ok(self.active_texture().as_ref().cloned().expect("Active texture missing"));
         }
         // Bring shadow buffer up to date with the previous frame's state
         let texture_invalidated = self.sync_active_to_shadow()?;

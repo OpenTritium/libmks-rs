@@ -175,9 +175,9 @@ impl Screen {
                 );
                 let (swapchain, new_created) = self.backend.ensure_software_rasterizer();
                 if new_created {
-                    return Err(Error::State(
-                        "Received partial 'Update' without preceding 'Scanout' (Software Backend uninitialized)",
-                    ));
+                    // Ignore initial Update that arrives before Scanout (QEMU event ordering race)
+                    mks_trace!("Ignoring Update: Software backend not yet initialized");
+                    return Ok(flags);
                 }
                 swapchain.partial_update_texture(x, y, width, height, stride, pixman_format, &data)?;
                 flags.frame = true;
@@ -227,20 +227,18 @@ impl Screen {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
                 let (_, new_created) = self.backend.ensure_direct_mapped();
                 if new_created {
-                    return Err(Error::State(
-                        "Received partial 'UpdateMap' without preceding 'ScanoutMap' (DirectMapped Backend \
-                         uninitialized)",
-                    ));
+                    // Ignore initial UpdateMap that arrives before ScanoutMap (QEMU event ordering race)
+                    mks_trace!("Ignoring UpdateMap: DirectMapped backend not yet initialized");
+                    return Ok(flags);
                 }
                 flags.frame = true;
             }
             UpdateDmabuf { x, y, width, height } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
                 let GpuPassthrough(gpu) = &mut self.backend else {
-                    return Err(Error::State(
-                        "Received partial 'UpdateDmabuf' without preceding 'ScanoutDmabuf'/'ScanoutDmabuf2' \
-                         (GpuPassthrough Backend uninitialized)",
-                    ));
+                    // Ignore initial UpdateDMABUF that arrives before ScanoutDMABUF* (QEMU event ordering race)
+                    mks_trace!("Ignoring UpdateDMABUF: GpuPassthrough not yet initialized");
+                    return Ok(flags);
                 };
                 match gpu.commit_update(x, y, width, height) {
                     Ok(true) => flags.frame = true,
