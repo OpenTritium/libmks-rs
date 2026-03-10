@@ -392,7 +392,7 @@ impl Swapchain {
         if texture_invalidated {
             mks_trace!("Partial texture refresh invalidated active texture; rebuilding texture wrapper");
             let fourcc: FourCC = pixman.try_into()?;
-            let plane = DmabufPlane { fd: shadow_buf.dmabuf_fd(), stride, offset: 0 };
+            let plane = DmabufPlane { fd: shadow_buf.dmabuf_fd(), stride: shadow_buf.stride, offset: 0 };
             let texture = build_dmabuf_texture_planar(
                 shadow_buf.width,
                 shadow_buf.height,
