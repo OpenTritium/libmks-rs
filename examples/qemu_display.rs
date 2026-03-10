@@ -522,26 +522,22 @@ async fn connect_to_qemu(
         }
     }
 
-    // ================================================================
-    // FIX: Use correct timing - send FD to QEMU first, then establish D-Bus connection
-    // Key: .serve_at() must be called before .build()!
+    // Register the listener FD with QEMU before establishing the listener connection.
+    // `.serve_at()` must run before `.build()` so QEMU sees the exported objects on first handshake.
     // Reference: https://gitlab.com/marcandre.lureau/qemu-display
-    // ================================================================
 
     info!("Creating socketpair for listener...");
     let (socket_server, socket_client) = std::os::unix::net::UnixStream::pair()?;
     info!("Socketpair created");
 
-    // Send client_fd to QEMU first!
-    // This is key: QEMU needs to receive the fd before it can respond to D-Bus handshake
+    // Send `client_fd` to QEMU first so it can complete the D-Bus handshake.
     use std::os::fd::OwnedFd;
     let std_fd: OwnedFd = socket_client.into();
     let fd: zvariant::OwnedFd = std_fd.into();
     console_ctrl.register_listener(fd)?;
     info!("Listener registered with console (fd sent to QEMU)");
 
-    // Now establish D-Bus connection
-    // Key: .serve_at() must be called before .build() so the object is registered when connection is built
+    // Now establish the listener D-Bus connection.
     info!("Creating listener D-Bus connection...");
 
     // Create listener handler
@@ -550,8 +546,7 @@ async fn connect_to_qemu(
     let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(enable_map).build();
     info!("Listener mode: {:?}, DMABUF2: {}, MAP: {}", mode, enable_dmabuf2, enable_map);
 
-    // Register all interfaces on the builder before .build()
-    // so QEMU sees the full interface set on first introspection.
+    // Register all interfaces before `.build()` so first introspection sees the full surface.
     let mut builder = zbus::connection::Builder::unix_stream(socket_server).p2p();
     builder = builder
         .serve_at("/org/qemu/Display1/Listener", listener::Listener::from_opts(listener_opts, event_tx.clone()))?;

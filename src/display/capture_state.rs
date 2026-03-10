@@ -1,7 +1,7 @@
 use super::vm_display::InputMode::{self, *};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /// Current pointer capture status for display input forwarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Capture {
     #[default]
     Idle, // Not inside seamless region and not clicked in confined mode.
@@ -19,34 +19,31 @@ impl CaptureState {
 
     #[inline]
     /// Resets capture state to `Capture::Idle`.
-    pub const fn reset(&mut self) { self.0 = Capture::Idle; }
+    const fn reset(&mut self) { self.0 = Capture::Idle; }
 
     #[inline]
-    /// Handles pointer-enter event for the given input mode.
-    pub fn on_mouse_enter(&mut self, mode: InputMode) {
+    /// Enters capture for the given input mode when supported.
+    pub fn enter(&mut self, mode: InputMode) {
         if mode == Seamless {
             self.0 = Capture::Seamless;
         }
     }
 
     #[inline]
-    /// Handles pointer-leave event.
-    pub const fn on_mouse_leave(&mut self) { self.reset(); }
+    /// Leaves the current capture session.
+    pub const fn leave(&mut self) { self.reset(); }
 
     #[inline]
-    /// Handles click event for the given input mode.
-    pub fn on_click(&mut self, mode: InputMode) {
+    /// Captures input for the given input mode when supported.
+    pub fn capture(&mut self, mode: InputMode) {
         if mode == Confined {
             self.0 = Capture::Confined;
         }
     }
 
     #[inline]
-    /// Handles release event and returns the resulting state.
-    pub const fn on_release(&mut self) -> Capture {
-        self.reset();
-        self.current()
-    }
+    /// Releases the current capture session.
+    pub const fn release(&mut self) { self.reset(); }
 
     #[inline]
     /// Returns whether input events should be forwarded.
@@ -69,15 +66,15 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum ModeEvent {
         Enter(InputMode),
-        Click(InputMode),
+        Capture(InputMode),
     }
 
     fn state_in(capture: Capture) -> CaptureState {
         let mut state = CaptureState::new();
         match capture {
             Capture::Idle => {}
-            Capture::Seamless => state.on_mouse_enter(InputMode::Seamless),
-            Capture::Confined => state.on_click(InputMode::Confined),
+            Capture::Seamless => state.enter(InputMode::Seamless),
+            Capture::Confined => state.capture(InputMode::Confined),
         }
         state
     }
@@ -100,23 +97,23 @@ mod tests {
         let cases = [
             (Capture::Idle, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
             (Capture::Idle, ModeEvent::Enter(InputMode::Confined), Capture::Idle),
-            (Capture::Idle, ModeEvent::Click(InputMode::Seamless), Capture::Idle),
-            (Capture::Idle, ModeEvent::Click(InputMode::Confined), Capture::Confined),
+            (Capture::Idle, ModeEvent::Capture(InputMode::Seamless), Capture::Idle),
+            (Capture::Idle, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
             (Capture::Seamless, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
             (Capture::Seamless, ModeEvent::Enter(InputMode::Confined), Capture::Seamless),
-            (Capture::Seamless, ModeEvent::Click(InputMode::Seamless), Capture::Seamless),
-            (Capture::Seamless, ModeEvent::Click(InputMode::Confined), Capture::Confined),
+            (Capture::Seamless, ModeEvent::Capture(InputMode::Seamless), Capture::Seamless),
+            (Capture::Seamless, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
             (Capture::Confined, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
             (Capture::Confined, ModeEvent::Enter(InputMode::Confined), Capture::Confined),
-            (Capture::Confined, ModeEvent::Click(InputMode::Seamless), Capture::Confined),
-            (Capture::Confined, ModeEvent::Click(InputMode::Confined), Capture::Confined),
+            (Capture::Confined, ModeEvent::Capture(InputMode::Seamless), Capture::Confined),
+            (Capture::Confined, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
         ];
 
         for (initial, event, expected) in cases {
             let mut state = state_in(initial);
             match event {
-                ModeEvent::Enter(mode) => state.on_mouse_enter(mode),
-                ModeEvent::Click(mode) => state.on_click(mode),
+                ModeEvent::Enter(mode) => state.enter(mode),
+                ModeEvent::Capture(mode) => state.capture(mode),
             }
             assert_state(&state, expected);
         }
@@ -126,17 +123,16 @@ mod tests {
     fn mouse_leave_resets_from_any_state() {
         for initial in [Capture::Idle, Capture::Seamless, Capture::Confined] {
             let mut state = state_in(initial);
-            state.on_mouse_leave();
+            state.leave();
             assert_state(&state, Capture::Idle);
         }
     }
 
     #[test]
-    fn release_resets_and_returns_idle_from_any_state() {
+    fn release_resets_from_any_state() {
         for initial in [Capture::Idle, Capture::Seamless, Capture::Confined] {
             let mut state = state_in(initial);
-            let released = state.on_release();
-            assert_eq!(released, Capture::Idle);
+            state.release();
             assert_state(&state, Capture::Idle);
         }
     }
@@ -155,13 +151,13 @@ mod tests {
         let mut state = CaptureState::new();
         assert_state(&state, Capture::Idle);
 
-        state.on_mouse_enter(InputMode::Seamless);
+        state.enter(InputMode::Seamless);
         assert_state(&state, Capture::Seamless);
 
-        state.on_mouse_enter(InputMode::Seamless);
+        state.enter(InputMode::Seamless);
         assert_state(&state, Capture::Seamless);
 
-        state.on_mouse_leave();
+        state.leave();
         assert_state(&state, Capture::Idle);
     }
 
@@ -170,14 +166,13 @@ mod tests {
         let mut state = CaptureState::new();
         assert_state(&state, Capture::Idle);
 
-        state.on_mouse_enter(InputMode::Confined);
+        state.enter(InputMode::Confined);
         assert_state(&state, Capture::Idle);
 
-        state.on_click(InputMode::Confined);
+        state.capture(InputMode::Confined);
         assert_state(&state, Capture::Confined);
 
-        let released = state.on_release();
-        assert_eq!(released, Capture::Idle);
+        state.release();
         assert_state(&state, Capture::Idle);
     }
 }

@@ -153,10 +153,9 @@ pub struct InputBusSetup {
 impl InputBusSetup {
     /// Finalizes setup.
     ///
-    /// Returns:
-    /// `InputHandler`: command entry for input events and watcher updates.
-    /// `AsyncReceiver<InputStateEvent>`: watcher-produced input state events.
-    /// `InputDaemon`: guard that owns shutdown hooks and the worker thread.
+    /// - `InputHandler`: synchronous entry point for input commands and capability updates.
+    /// - `AsyncReceiver<InputStateEvent>`: watcher-produced input state events.
+    /// - `InputDaemon`: shutdown guard for the worker thread and property watchers.
     pub async fn dispatch(self) -> MksResult<(InputHandler, AsyncReceiver<InputStateEvent>, InputDaemon)> {
         let Self { conn, console_path, with_keyboard, with_mouse, with_multitouch } = self;
         // Initial capabilities are derived from setup flags.
@@ -217,7 +216,7 @@ fn spawn_blocking_input_thread(proxies: BlockingInputProxies, cmd_rx: Receiver<I
     spawn_blocking(f).abort_handle()
 }
 
-/// Return `true` if need shutdown
+/// Returns `true` when the worker should shut down.
 fn handle_cmd(cmd: InputCommand, proxies: &BlockingInputProxies, pending_move: &mut PendingMove) -> bool {
     use InputCommand::*;
     use PendingMove::*;

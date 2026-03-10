@@ -274,6 +274,12 @@ impl VmDisplayModel {
         self.dirty_flags.cursor |= flags.cursor;
     }
 
+    /// Returns the input overlay bounds for pointer confinement.
+    ///
+    /// - `x`: left edge in native-surface coordinates.
+    /// - `y`: top edge in native-surface coordinates.
+    /// - `width`: confined width in pixels.
+    /// - `height`: confined height in pixels.
     #[inline]
     fn confined_widget_rect(&self) -> (u32, u32, u32, u32) {
         let native = self.input_overlay.native();
@@ -618,7 +624,7 @@ impl Component for VmDisplayModel {
                 self.requested_input_mode = mode;
                 if mode == InputMode::Seamless && !self.input.is_absolute {
                     mks_warn!("Seamless capture requires absolute guest mouse mode; ignoring request");
-                    self.capture_state.reset();
+                    self.capture_state.release();
                     self.confine_state = None;
                     self.cancel_hint_timer();
                     self.hint_visible = false;
@@ -630,7 +636,7 @@ impl Component for VmDisplayModel {
                     mks_debug!("Input capture mode already set to {mode:?}; ignoring duplicate request");
                     return;
                 }
-                self.capture_state.reset();
+                self.capture_state.release();
                 if self.confine_state.take().is_some() {
                     self.cancel_hint_timer();
                     self.hint_visible = false;
@@ -656,7 +662,7 @@ impl Component for VmDisplayModel {
             }
 
             MouseLeave => {
-                self.capture_state.on_mouse_leave();
+                self.capture_state.leave();
                 sender.input(UpdateCaptureView);
             }
 
@@ -667,7 +673,7 @@ impl Component for VmDisplayModel {
                     && !self.input.is_absolute
                 {
                     let had_capture = self.capture_state.should_forward();
-                    self.capture_state.reset();
+                    self.capture_state.release();
                     if had_capture {
                         sender.input(UpdateCaptureView);
                     }
@@ -678,12 +684,12 @@ impl Component for VmDisplayModel {
                 match (mode, current_capture, is_in_viewport) {
                     // Pointer just entered VM viewport.
                     (InputMode::Seamless, Capture::Idle, true) => {
-                        self.capture_state.on_mouse_enter(mode);
+                        self.capture_state.enter(mode);
                         sender.input(UpdateCaptureView);
                     }
                     // Pointer just left VM viewport.
                     (InputMode::Seamless, Capture::Seamless, false) => {
-                        self.capture_state.on_mouse_leave();
+                        self.capture_state.leave();
                         sender.input(UpdateCaptureView);
                     }
                     // Continuous in/out movement keeps current state unchanged.
@@ -741,7 +747,7 @@ impl Component for VmDisplayModel {
                     }
 
                     self.hint_visible = true;
-                    self.capture_state.on_click(mode);
+                    self.capture_state.capture(mode);
                     self.show_toast(Self::release_hint_text(self.grab_shortcut), sender.clone());
                     if let Some(confine) = &mut self.confine_state {
                         confine.is_captured = true;
@@ -754,7 +760,7 @@ impl Component for VmDisplayModel {
                     }
                     mks_info!("Pointer confined to widget region: {widget_rect:?}");
                 } else {
-                    self.capture_state.on_release();
+                    self.capture_state.release();
                     if let Some(confine) = &mut self.confine_state {
                         confine.wayland_confine.borrow_mut().unconfine();
                         confine.is_captured = false;
@@ -892,7 +898,7 @@ impl Component for VmDisplayModel {
                         mks_error!(
                             "Failed to reconfigure confined pointer capture after mouse mode switch; releasing capture"
                         );
-                        self.capture_state.on_release();
+                        self.capture_state.release();
                         self.cancel_hint_timer();
                         self.hint_visible = false;
                         self.show_confined_capture_unavailable_toast(prefer_relative, &sender);
@@ -904,7 +910,7 @@ impl Component for VmDisplayModel {
                     && self.current_input_mode() == InputMode::Seamless
                 {
                     let had_capture = self.capture_state.should_forward();
-                    self.capture_state.reset();
+                    self.capture_state.release();
                     mks_error!(
                         "Relative guest mouse mode is incompatible with seamless capture; capture released until mode \
                          changes"

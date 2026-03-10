@@ -52,18 +52,17 @@ impl DmabufImport {
 
     /// Checks if the provided file identity and metadata match this mapping.
     #[inline]
-    pub fn matches_view(
-        &self, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32, pixman: Pixman,
+    pub fn matches(
+        &self, offset: u32, width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32, pixman: Pixman, stat: &Stat
     ) -> bool {
         self.offset == offset
             && self.width == width
             && self.height == height
             && self.stride == stride
             && self.pixman == pixman
+            && self.dev == stat.st_dev
+            && self.ino == stat.st_ino
     }
-
-    #[inline]
-    pub const fn matches_inode(&self, stat: &Stat) -> bool { self.dev == stat.st_dev && self.ino == stat.st_ino }
 
     #[inline]
     pub fn as_raw_dmabuf_fd(&self) -> RawFd { self.dmabuf_fd.as_raw_fd() }
@@ -108,12 +107,9 @@ impl ImportedTexture {
     ) -> Result<(), Error> {
         let stat = fstat(&memfd)?;
         if let Some(buf) = &self.buffer
-            && buf.matches_view(offset, width, height, stride, pixman_format)
+            && buf.matches(offset, width, height, stride, pixman_format, &stat)
         {
-            if buf.matches_inode(&stat) {
-                return Ok(());
-            }
-            return self.rebuild_texture(memfd, stat, offset, width, height, stride, pixman_format);
+            return Ok(());
         }
         self.rebuild_texture(memfd, stat, offset, width, height, stride, pixman_format)
     }
@@ -121,7 +117,10 @@ impl ImportedTexture {
     #[inline]
     pub const fn texture(&self) -> Option<&Texture> { self.texture.as_ref() }
 
-    /// Returns the resolution (width, height) of the current buffer.
+    /// Returns the current buffer resolution.
+    ///
+    /// - `width`: buffer width in pixels.
+    /// - `height`: buffer height in pixels.
     #[inline]
     pub fn resolution(&self) -> (u32, u32) {
         self.buffer.as_ref().map(|b| (b.width.get(), b.height.get())).unwrap_or_default()
@@ -170,14 +169,14 @@ mod tests {
 
         let mapping = create_mock_mapping(memfd, 0, 1920, 1080, 7680, pixman);
 
-        assert!(mapping.matches_view(
+        assert!(mapping.matches(
             0,
             NonZeroU32::new(1920).unwrap(),
             NonZeroU32::new(1080).unwrap(),
             NonZeroU32::new(7680).unwrap(),
-            pixman
+            pixman,
+            &stat
         ));
-        assert!(mapping.matches_inode(&stat));
     }
 
     /// 测试 2: 验证 matches() 在不同 inode 时返回 false
@@ -191,7 +190,7 @@ mod tests {
 
         let mapping = create_mock_mapping(memfd1, 0, 1920, 1080, 7680, pixman);
 
-        assert!(!mapping.matches_inode(&stat2));
+        assert!(!mapping.matches(0, NonZeroU32::new(1920).unwrap(), NonZeroU32::new(1080).unwrap(), NonZeroU32::new(7680).unwrap(), pixman, &stat2));
     }
 
     /// 测试 3: 验证 matches() 在不同元数据时返回 false
@@ -211,17 +210,15 @@ mod tests {
         let w2 = NonZeroU32::new(2560).unwrap();
         let h2 = NonZeroU32::new(1440).unwrap();
 
-        assert!(mapping.matches_view(0, w, h, s, pixman));
-        assert!(!mapping.matches_view(64, w, h, s, pixman));
-        assert!(!mapping.matches_view(0, w2, h, s, pixman)); // width
-        assert!(!mapping.matches_view(0, w, h2, s, pixman)); // height
-        assert!(!mapping.matches_view(0, w, h, s2, pixman)); // stride
-        assert!(!mapping.matches_view(100, w, h, s, pixman)); // offset
-
-        assert!(mapping.matches_inode(&stat));
+        assert!(mapping.matches(0, w, h, s, pixman, &stat));
+        assert!(!mapping.matches(64, w, h, s, pixman, &stat));
+        assert!(!mapping.matches(0, w2, h, s, pixman, &stat)); // width
+        assert!(!mapping.matches(0, w, h2, s, pixman, &stat)); // height
+        assert!(!mapping.matches(0, w, h, s2, pixman, &stat)); // stride
+        assert!(!mapping.matches(100, w, h, s, pixman, &stat)); // offset
 
         let different_pixman = Pixman::from(1);
-        assert!(!mapping.matches_view(0, w, h, s, different_pixman));
+        assert!(!mapping.matches(0, w, h, s, different_pixman, &stat));
     }
 
     /// 测试 4: 验证缓存命中场景 (相同底层内存)
@@ -246,8 +243,7 @@ mod tests {
             let w = NonZeroU32::new(1920).unwrap();
             let h = NonZeroU32::new(1080).unwrap();
             let s = NonZeroU32::new(7680).unwrap();
-            assert!(buf.matches_view(0, w, h, s, pixman));
-            assert!(buf.matches_inode(&stat_dup));
+            assert!(buf.matches(0, w, h, s, pixman, &stat_dup));
         }
     }
 
@@ -258,6 +254,7 @@ mod tests {
 
         // Create first memfd
         let memfd1 = memfd_create("miss_test1", MemfdFlags::CLOEXEC).unwrap();
+        let _stat1 = fstat(&memfd1).unwrap();
         let pixman = Pixman::from(0);
 
         let buffer = create_mock_mapping(memfd1, 0, 1920, 1080, 7680, pixman);
@@ -269,7 +266,10 @@ mod tests {
 
         // Verify that matches returns false for different memory
         if let Some(buf) = &cache.buffer {
-            assert!(!buf.matches_inode(&stat2));
+            let w = NonZeroU32::new(1920).unwrap();
+            let h = NonZeroU32::new(1080).unwrap();
+            let s = NonZeroU32::new(7680).unwrap();
+            assert!(!buf.matches(0, w, h, s, pixman, &stat2));
         }
     }
 

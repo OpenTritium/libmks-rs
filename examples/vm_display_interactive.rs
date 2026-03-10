@@ -171,6 +171,10 @@ impl SimpleComponent for AppModel {
     }
 }
 
+/// Creates a mock console controller pair for the demo.
+///
+/// - `ConsoleController`: sender exposed to the UI model.
+/// - `AsyncReceiver<console::Command>`: backend-side command receiver.
 fn create_mock_console_controller() -> (ConsoleController, kanal::AsyncReceiver<console::Command>) {
     let (console_tx, console_rx) = kanal::unbounded_async();
     (ConsoleController::from(console_tx), console_rx)

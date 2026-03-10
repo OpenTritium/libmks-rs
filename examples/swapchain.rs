@@ -71,7 +71,7 @@ impl SimpleComponent for AppModel {
             canvas_h,
             box_x: 0,
             box_y: 0,
-            // 设置一个较快的速度来引发撕裂
+            // Use a fast speed so tearing is easier to spot.
             velocity_x: 15,
             velocity_y: 8,
             frame_count: 0,
@@ -86,11 +86,11 @@ impl SimpleComponent for AppModel {
             model
                 .swapchain
                 .full_update_texture(nz(canvas_w), nz(canvas_h), nz(stride), format, &full_buf)
-                .expect("初始化失败！请检查 /dev/udmabuf 是否存在以及权限是否正确"),
+                .expect("Initialization failed. Check that /dev/udmabuf exists and is accessible."),
         );
 
-        // 2. 启动高频定时器
-        // 16ms ~ 60fps. 如果你想测试极致性能和撕裂，可以尝试更短的时间 (如 8ms)
+        // Drive the demo at roughly 60 FPS.
+        // Shorter intervals make tearing and bandwidth pressure easier to observe.
         glib::timeout_add_local(Duration::from_millis(16), move || {
             sender.input(AppMsg::Tick);
             glib::ControlFlow::Continue
@@ -107,15 +107,14 @@ impl SimpleComponent for AppModel {
                 let box_w = 200;
                 let box_h = 200;
 
-                // --- [修复核心]：动态修正位置，防止被困在墙外 ---
-                // 计算当前画布允许的最大坐标 (如果画布比方块还小，则最大坐标为0)
+                // [Core safeguard] Keep the box inside the current canvas bounds.
                 let max_allowed_x = self.canvas_w.saturating_sub(box_w) as i32;
                 let max_allowed_y = self.canvas_h.saturating_sub(box_h) as i32;
 
-                // 强制将坐标拉回合法范围内 (Clamp)
+                // Clamp stale coordinates before applying the next step.
                 if self.box_x > max_allowed_x {
                     self.box_x = max_allowed_x;
-                    // 可选：如果在墙外被拉回，通常意味着撞墙了，确保速度指向内部
+                    // If we had drifted out of bounds, steer back into the canvas.
                     if self.velocity_x > 0 {
                         self.velocity_x = -self.velocity_x;
                     }
@@ -126,54 +125,49 @@ impl SimpleComponent for AppModel {
                         self.velocity_y = -self.velocity_y;
                     }
                 }
-                // ---------------------------------------------
 
-                // 1. 记录旧位置 (现在的位置一定是合法的了)
+                // The old position is valid after the clamp above.
                 let old_x = self.box_x;
                 let old_y = self.box_y;
 
-                // 计算 X 轴最大允许坐标
+                // Maximum legal X position.
                 let max_x = self.canvas_w.saturating_sub(box_w) as i32;
 
                 if max_x == 0 {
-                    // 空间不足（窗口比方块窄）：强制固定在 0，不更新速度
+                    // The canvas is narrower than the box, so pin it to the origin.
                     self.box_x = 0;
                 } else {
-                    // 空间充足：正常移动
                     self.box_x += self.velocity_x;
 
-                    // X 轴反弹检测
+                    // Bounce on the horizontal bounds.
                     if self.box_x <= 0 {
                         self.box_x = 0;
-                        self.velocity_x = self.velocity_x.abs(); // 向右
+                        self.velocity_x = self.velocity_x.abs(); // Move right.
                     } else if self.box_x >= max_x {
                         self.box_x = max_x;
-                        self.velocity_x = -self.velocity_x.abs(); // 向左
+                        self.velocity_x = -self.velocity_x.abs(); // Move left.
                     }
                 }
 
-                // 计算 Y 轴最大允许坐标
+                // Maximum legal Y position.
                 let max_y = self.canvas_h.saturating_sub(box_h) as i32;
 
                 if max_y == 0 {
-                    // 空间不足：强制固定在 0
+                    // The canvas is shorter than the box, so pin it to the origin.
                     self.box_y = 0;
                 } else {
-                    // 空间充足：正常移动
                     self.box_y += self.velocity_y;
 
-                    // Y 轴反弹检测
+                    // Bounce on the vertical bounds.
                     if self.box_y <= 0 {
                         self.box_y = 0;
-                        self.velocity_y = self.velocity_y.abs(); // 向下
+                        self.velocity_y = self.velocity_y.abs(); // Move down.
                     } else if self.box_y >= max_y {
                         self.box_y = max_y;
-                        self.velocity_y = -self.velocity_y.abs(); // 向上
+                        self.velocity_y = -self.velocity_y.abs(); // Move up.
                     }
                 }
-                // 3. 计算脏矩形 (Dirty Rect)
-                // 必须覆盖 旧位置 (用于擦除) 和 新位置 (用于绘制)
-                // 这样我们可以一次性提交，保证原子性，同时测试 partial_update 对大块数据的处理
+                // Cover both the old and new box positions so erase and redraw stay atomic.
                 let min_x = min(old_x, self.box_x);
                 let min_y = min(old_y, self.box_y);
                 let max_x = max(old_x + box_w as i32, self.box_x + box_w as i32);
@@ -185,11 +179,10 @@ impl SimpleComponent for AppModel {
                 let dirty_h = (max_y - min_y) as u32;
                 let dirty_stride = dirty_w * 4;
 
-                // 4. 准备脏数据缓冲区
+                // Build the dirty-region staging buffer.
                 let mut dirty_buf = vec![0u8; (dirty_stride * dirty_h) as usize];
 
-                // 5. 在脏缓冲区内绘图
-                // 我们传递 dirty_x/y 作为偏移量，以便生成正确的背景纹理（对齐网格）
+                // Pass the dirty-region origin so the background grid stays aligned.
                 fill_dirty_area(
                     &mut dirty_buf,
                     dirty_x,
@@ -206,7 +199,7 @@ impl SimpleComponent for AppModel {
                     self.frame_count,
                 );
 
-                // 6. 提交更新
+                // Submit the partial update.
                 let format = Pixman::from(PIXMAN_FORMAT_A8R8G8B8);
                 match self.swapchain.partial_update_texture(
                     dirty_x,
@@ -225,7 +218,7 @@ impl SimpleComponent for AppModel {
     }
 }
 
-/// 核心绘图逻辑：在脏矩形内，判断像素属于“方块”还是“背景”
+/// Draws one dirty rectangle by classifying each pixel as box or background.
 #[allow(clippy::too_many_arguments)]
 fn fill_dirty_area(
     buf: &mut [u8],
@@ -233,36 +226,34 @@ fn fill_dirty_area(
     dy: u32,
     dw: u32,
     dh: u32,
-    d_stride: u32, // Dirty Rect 参数
+    d_stride: u32, // Dirty-rect stride in bytes.
     bx: u32,
     by: u32,
     bw: u32,
-    bh: u32, // Box 参数
+    bh: u32, // Box dimensions.
     _canvas_w: u32,
-    _canvas_h: u32, // 画布参数 (用于生成对齐的网格)
+    _canvas_h: u32, // Canvas dimensions for grid alignment.
     frame: u64,
 ) {
     for y in 0..dh {
         for x in 0..dw {
-            // 当前像素在全局画布的坐标
+            // Current pixel in full-canvas coordinates.
             let global_x = dx + x;
             let global_y = dy + y;
 
-            // 判断当前像素是否在 移动的方块 内部
+            // Check whether this pixel falls inside the moving box.
             let in_box = global_x >= bx && global_x < (bx + bw) && global_y >= by && global_y < (by + bh);
 
             let pixel_offset = (y * d_stride + x * 4) as usize;
 
             if in_box {
-                // === 绘制方块：动态斜线 ===
-                // 斜线最容易看出撕裂 (Tearing)
-                // 如果画面撕裂，斜线会断开或错位
+                // Animated diagonals make tearing obvious.
                 let pattern = (global_x + global_y + (frame as u32 * 8)) % 64;
 
                 let (r, g, b) = if pattern < 32 {
-                    (255, 50, 50) // 红色条纹
+                    (255, 50, 50) // Red stripe.
                 } else {
-                    (255, 255, 255) // 白色条纹
+                    (255, 255, 255) // White stripe.
                 };
 
                 buf[pixel_offset] = b;
@@ -270,23 +261,22 @@ fn fill_dirty_area(
                 buf[pixel_offset + 2] = r;
                 buf[pixel_offset + 3] = 255;
             } else {
-                // === 绘制背景：恢复网格 ===
-                // 如果 sync_active_to_shadow 有问题，这里恢复的背景会和未更新区域的背景对不上
+                // Restore the aligned grid behind the moving box.
                 let grid_size = 50;
                 let on_line = global_x.is_multiple_of(grid_size) || global_y.is_multiple_of(grid_size);
 
-                let val = if on_line { 100 } else { 30 }; // 深灰背景 + 浅灰网格
+                let val = if on_line { 100 } else { 30 }; // Dark gray fill with lighter grid lines.
 
-                buf[pixel_offset] = val; // B
-                buf[pixel_offset + 1] = val; // G
-                buf[pixel_offset + 2] = val; // R
-                buf[pixel_offset + 3] = 255; // A
+                buf[pixel_offset] = val; // B.
+                buf[pixel_offset + 1] = val; // G.
+                buf[pixel_offset + 2] = val; // R.
+                buf[pixel_offset + 3] = 255; // A.
             }
         }
     }
 }
 
-/// 辅助函数：初始化全屏背景用
+/// Fills the initial full-frame background.
 #[allow(clippy::too_many_arguments)]
 fn draw_pattern(
     buf: &mut [u8], dx: u32, dy: u32, dw: u32, dh: u32, d_stride: u32, canvas_w: u32, canvas_h: u32, frame: u64,

@@ -1,4 +1,4 @@
-use std::{cell::Cell, num::NonZeroU32};
+use std::{cell::Cell, hint::unlikely, num::NonZeroU32};
 
 /// Cached viewport transform from VM space to widget space.
 #[derive(Debug, Clone, Copy)]
@@ -17,8 +17,8 @@ pub struct Viewport {
 /// The viewport step follows CSS `object-fit: contain` semantics and is cached.
 #[derive(Debug, Clone)]
 pub struct Coordinate {
-    pub vm_resolution: (u32, u32),
-    widget_size_logical: (f32, f32),
+    vm_resolution: (u32, u32),
+    widget_size: (f32, f32),
     pub ui_scale: f32,
     cached_viewport: Cell<Option<Viewport>>,
     transform_dirty: Cell<bool>,
@@ -28,7 +28,7 @@ impl Coordinate {
     pub fn new(vm_w: u32, vm_h: u32, widget_w: f32, widget_h: f32, ui_scale: f32) -> Self {
         Self {
             vm_resolution: (vm_w, vm_h),
-            widget_size_logical: (widget_w, widget_h),
+            widget_size: (widget_w, widget_h),
             ui_scale,
             cached_viewport: None.into(),
             transform_dirty: true.into(),
@@ -43,23 +43,22 @@ impl Coordinate {
 
     #[inline]
     pub fn set_widget_size(&mut self, w: f32, h: f32) {
-        self.widget_size_logical = (w, h);
+        self.widget_size = (w, h);
         self.transform_dirty.set(true);
     }
 
-    /// Returns physical canvas size as `(physical_width, physical_height)`.
+    /// Returns the physical canvas size.
+    ///
+    /// - `physical_width`: canvas width in physical pixels.
+    /// - `physical_height`: canvas height in physical pixels.
+    ///
     /// Returns `None` if widget size or `ui_scale` is non-positive or non-finite.
     #[inline]
     pub fn physical_canvas_size(&self) -> Option<(NonZeroU32, NonZeroU32)> {
-        let (w, h) = self.widget_size_logical;
+        let (w, h) = self.widget_size;
         let scale = self.ui_scale;
-        if w <= 0. || !w.is_finite() {
-            return None;
-        }
-        if h <= 0. || !h.is_finite() {
-            return None;
-        }
-        if scale <= 0. || !scale.is_finite() {
+        let invalid_cond = w <= 0. || h <= 0. || scale <= 0. || !w.is_finite() || !h.is_finite() || !scale.is_finite();
+        if unlikely(invalid_cond) {
             return None;
         }
         let phys_w = (w * scale).max(1.) as u32;
@@ -72,14 +71,14 @@ impl Coordinate {
     #[inline]
     pub const fn calculate_contain_transform(&self) -> Option<Viewport> {
         let (vm_w, vm_h) = self.vm_resolution;
-        let (widget_w, widget_h) = self.widget_size_logical;
-        if vm_w == 0 || vm_h == 0 {
-            return None;
-        }
-        if widget_h <= 0. || !widget_h.is_finite() {
-            return None;
-        }
-        if widget_w <= 0. || !widget_w.is_finite() {
+        let (widget_w, widget_h) = self.widget_size;
+        let invalid_cond = vm_w == 0
+            || vm_h == 0
+            || widget_h <= 0.
+            || widget_w <= 0.
+            || !widget_w.is_finite()
+            || !widget_h.is_finite();
+        if unlikely(invalid_cond) {
             return None;
         }
         let vm_w = vm_w as f32;
@@ -107,12 +106,20 @@ impl Coordinate {
         self.cached_viewport.get()
     }
 
-    /// Maps a widget logical point to VM coordinates, clamped to VM bounds.
-    /// Returns `(guest_x, guest_y)`.
+    /// Maps a widget logical point to clamped VM coordinates.
+    ///
+    /// - `guest_x`: guest X coordinate in pixels.
+    /// - `guest_y`: guest Y coordinate in pixels.
     #[inline]
     pub fn widget_to_guest(&self, logical_x: f32, logical_y: f32) -> Option<(u32, u32)> {
         let (vm_w, vm_h) = self.vm_resolution;
-        if vm_w == 0 || vm_h == 0 {
+        let invalid_cond = vm_w == 0
+            || vm_h == 0
+            || logical_x < 0.
+            || !logical_x.is_finite()
+            || logical_y < 0.
+            || !logical_y.is_finite();
+        if unlikely(invalid_cond) {
             return None;
         }
         let viewport = self.get_cached_viewport()?;
@@ -121,7 +128,11 @@ impl Coordinate {
         Some((guest_x as u32, guest_y as u32))
     }
 
-    /// Returns the VM display rect in widget space as `(left, top, width, height)`.
+    /// Returns `(left, top, width, height)` in widget logical coordinates:
+    /// - `left`: left edge in widget logical coordinates.
+    /// - `top`: top edge in widget logical coordinates.
+    /// - `width`: display width in widget logical coordinates.
+    /// - `height`: display height in widget logical coordinates.
     #[inline]
     pub fn vm_display_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         let viewport = self.get_cached_viewport()?;
@@ -344,25 +355,25 @@ mod tests {
     fn test_widget_to_guest_clamps_extremes() {
         let coord = Coordinate::new(800, 600, 1600.0, 900.0, 1.0);
 
-        assert_eq!(coord.widget_to_guest(-10_000.0, -10_000.0).unwrap(), (0, 0));
+        // 负数坐标返回 None
+        assert!(coord.widget_to_guest(-10_000.0, -10_000.0).is_none());
+        assert!(coord.widget_to_guest(-1000.0, 450.0).is_none());
+        assert!(coord.widget_to_guest(800.0, -1000.0).is_none());
+        // 超大坐标返回 clamp 后的值
         assert_eq!(coord.widget_to_guest(10_000.0, 10_000.0).unwrap(), (799, 599));
-        assert_eq!(coord.widget_to_guest(-1000.0, 450.0).unwrap(), (0, 300));
-        assert_eq!(coord.widget_to_guest(800.0, -1000.0).unwrap(), (400, 0));
     }
 
     #[test]
     fn test_widget_to_guest_invalid_float_behavior_is_stable() {
         let coord = Coordinate::new(100, 100, 100.0, 100.0, 1.0);
 
-        // Current behavior lock: NaN coordinates clamp/cast to zero.
-        assert_eq!(coord.widget_to_guest(f32::NAN, 10.0).unwrap(), (0, 10));
-        assert_eq!(coord.widget_to_guest(10.0, f32::NAN).unwrap(), (10, 0));
-
-        // Current behavior lock: infinities saturate to bounds.
-        assert_eq!(coord.widget_to_guest(f32::INFINITY, 10.0).unwrap(), (99, 10));
-        assert_eq!(coord.widget_to_guest(10.0, f32::INFINITY).unwrap(), (10, 99));
-        assert_eq!(coord.widget_to_guest(f32::NEG_INFINITY, 10.0).unwrap(), (0, 10));
-        assert_eq!(coord.widget_to_guest(10.0, f32::NEG_INFINITY).unwrap(), (10, 0));
+        // NaN/Infinity 返回 None
+        assert!(coord.widget_to_guest(f32::NAN, 10.0).is_none());
+        assert!(coord.widget_to_guest(10.0, f32::NAN).is_none());
+        assert!(coord.widget_to_guest(f32::INFINITY, 10.0).is_none());
+        assert!(coord.widget_to_guest(10.0, f32::INFINITY).is_none());
+        assert!(coord.widget_to_guest(f32::NEG_INFINITY, 10.0).is_none());
+        assert!(coord.widget_to_guest(10.0, f32::NEG_INFINITY).is_none());
     }
 
     #[test]

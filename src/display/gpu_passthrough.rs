@@ -159,9 +159,8 @@ impl GpuPassthrough {
 
     /// Returns the active frame resolution.
     ///
-    /// Tuple fields:
-    /// - `0`: width in pixels.
-    /// - `1`: height in pixels.
+    /// - `width`: active frame width in pixels.
+    /// - `height`: active frame height in pixels.
     #[inline]
     pub fn resolution(&self) -> (u32, u32) {
         self.active.as_ref().map(|active| (active.width.get(), active.height.get())).unwrap_or_default()
