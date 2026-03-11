@@ -26,4 +26,9 @@ pub enum Error {
     /// Attempted to redraw() without any buffer staged via import().
     #[error("No buffer staged (call import() first)")]
     NoStagedBuffer,
+    #[error("Partial update pixman format does not match staged surface")]
+    PartialUpdatePixmanNotMatch,
+
+    #[error("Partial update coordinates are outside surface bounds")]
+    PartialUpdateOffScreen,
 }

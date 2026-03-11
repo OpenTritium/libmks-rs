@@ -1,6 +1,6 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
 use crate::{
-    display::input_daemon::InputCommand,
+    display::input_event_bus::InputCommand,
     mks_debug, mks_error, mks_info,
 };
 use gdk4_wayland::{

@@ -1,9 +1,9 @@
 use super::{
     capture_state::{Capture, CaptureState},
-    coordinate::Coordinate,
-    input_handler::{self, InputHandler},
+    viewport_transform::Coordinate,
+    input_event_controller::{InputHandler, attach_gtk_controllers},
     monitor_metrics,
-    screen::{DirtyFlags, Screen},
+    display_state::{DirtyFlags, Screen},
     wayland_confine::ConfineState,
 };
 use crate::{
@@ -387,7 +387,7 @@ impl Component for VmDisplayModel {
 
         monitor_metrics::attach_resize_handlers(&input_overlay, &sender);
 
-        input_handler::attach_gtk_controllers(&input_overlay, &root, &sender, grab_shortcut);
+        attach_gtk_controllers(&input_overlay, &root, &sender, grab_shortcut);
 
         // Set up overlays
         view_stack.set_child(Some(&input_overlay));

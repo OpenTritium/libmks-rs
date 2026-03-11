@@ -1,13 +1,13 @@
 pub mod capture_state;
-pub mod coordinate;
+pub mod viewport_transform;
 mod error;
 mod gpu_passthrough;
-pub mod input_daemon;
-pub mod input_handler;
+pub mod input_event_bus;
+pub mod input_event_controller;
 pub mod memmap;
 pub mod monitor_metrics;
 pub mod pixman_4cc;
-pub mod screen;
+pub mod display_state;
 pub mod software_rasterizer;
 pub mod udma;
 pub mod vm_display;

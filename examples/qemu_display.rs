@@ -35,8 +35,8 @@ use libmks_rs::{
         vm,
     },
     display::{
-        input_daemon::{InputBusSetup, InputDaemon, InputStateEvent},
-        input_handler::InputHandler,
+        input_event_bus::{InputBusSetup, InputDaemon, InputStateEvent},
+        input_event_controller::InputHandler,
         vm_display::{GrabShortcut, InputMode, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };

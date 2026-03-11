@@ -6,7 +6,7 @@ use libmks_rs::{
         listener::Event,
     },
     display::{
-        input_handler::{Capability, InputHandler},
+        input_event_controller::{Capability, InputHandler},
         vm_display::{GrabShortcut, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
