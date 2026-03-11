@@ -245,19 +245,59 @@ impl Screen {
                 }
                 mks_trace!("ScanoutDMABUF staged; waiting for UpdateDMABUF commit");
             }
-            ScanoutDmabuf2 { dmabuf, width, height, stride, fourcc, modifier, offset, y0_top, .. } => {
+            ScanoutDmabuf2 {
+                dmabuf,
+                x,
+                y,
+                width,
+                height,
+                stride,
+                fourcc,
+                modifier,
+                offset,
+                backing_width,
+                backing_height,
+                y0_top,
+                num_planes,
+            } => {
+                debug_assert_eq!(num_planes.get() as usize, dmabuf.len());
+                debug_assert_eq!(num_planes.get() as usize, stride.len());
                 self.y0_top = y0_top;
                 mks_trace!(
-                    "ScanoutDMABUF2: {width}x{height}, planes={}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, \
-                     y0_top={y0_top}",
+                    "ScanoutDMABUF2: backing={backing_width}x{backing_height}, crop={width}x{height} at ({x},{y}), \
+                     planes={}, fourcc=0x{fourcc:08x}, modifier=0x{modifier:016x}, y0_top={y0_top}",
                     dmabuf.len()
                 );
                 let fds: Box<_> = dmabuf.into_iter().map(OwnedFd::from).collect();
                 if let GpuPassthrough(gpu) = &mut self.backend {
-                    gpu.stage_multi_plane(fds, width, height, &stride, &offset, fourcc, modifier);
+                    gpu.stage_multi_plane(
+                        fds,
+                        x,
+                        y,
+                        width,
+                        height,
+                        backing_width,
+                        backing_height,
+                        &stride,
+                        &offset,
+                        fourcc,
+                        modifier,
+                    );
                 } else {
                     let mut gpu = GpuPassthrough::new();
-                    gpu.stage_multi_plane(fds, width, height, &stride, &offset, fourcc, modifier);
+                    gpu.stage_multi_plane(
+                        fds,
+                        x,
+                        y,
+                        width,
+                        height,
+                        backing_width,
+                        backing_height,
+                        &stride,
+                        &offset,
+                        fourcc,
+                        modifier,
+                    );
                     self.backend = GpuPassthrough(gpu);
                 }
                 mks_trace!("ScanoutDMABUF2 staged; waiting for UpdateDMABUF commit");

@@ -1,7 +1,7 @@
 pub mod capture_state;
 pub mod viewport_transform;
 mod error;
-mod gpu_passthrough;
+pub mod gpu_passthrough;
 pub mod input_event_bus;
 pub mod input_event_controller;
 pub mod memmap;
