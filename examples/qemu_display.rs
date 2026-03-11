@@ -347,33 +347,29 @@ impl SimpleComponent for AppModel {
 
 /// Listener mode - determines what capabilities we advertise to QEMU
 ///
-/// Four levels of D-Bus Display capabilities:
-/// - Scanout: Core interface only, QEMU sends framebuffer via D-Bus
-/// - ScanoutDMABUF: Core + single-plane DMA-BUF (always enabled in core)
-/// - ScanoutDMABUF2: Core + single-plane + multi-plane DMA-BUF
-/// - ScanoutMap: Core + Unix.Map shared-memory scanout
+/// Three modes:
+/// - basic: Core interface with framebuffer/DMABUF scanout
+/// - basic+map: Core + Unix.Map shared-memory scanout
+/// - basic+dmabuf2: Core + multi-plane DMA-BUF support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListenerMode {
-    /// Basic scanout mode - QEMU sends framebuffer via D-Bus (may still use single-plane DMABUF)
+    /// Basic scanout mode - QEMU sends framebuffer via D-Bus (includes single-plane DMABUF)
     #[default]
-    Scanout,
-    /// Same as Scanout (single-plane DMABUF is always in core interface)
-    ScanoutDMABUF,
-    /// Full DMABUF support - multi-plane DMA-BUF enabled
-    ScanoutDMABUF2,
+    Basic,
     /// Shared-memory map support via org.qemu.Display1.Listener.Unix.Map
-    ScanoutMap,
+    BasicMap,
+    /// Full DMABUF support - multi-plane DMA-BUF enabled
+    BasicDmabuf2,
 }
 
 impl ListenerMode {
-    const CLI_MODES: &'static str = "scanout | scanoutdmabuf | scanoutdmabuf2 | scanoutmap";
+    const CLI_MODES: &'static str = "basic | basic+map | basic+dmabuf2";
 
     fn parse_cli(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "scanout" => Some(Self::Scanout),
-            "scanoutdmabuf" | "dmabuf" => Some(Self::ScanoutDMABUF),
-            "scanoutdmabuf2" | "dmabuf2" | "gl" => Some(Self::ScanoutDMABUF2),
-            "scanoutmap" | "scnoutmap" | "map" => Some(Self::ScanoutMap),
+            "basic" => Some(Self::Basic),
+            "basic+map" | "map" => Some(Self::BasicMap),
+            "basic+dmabuf2" | "dmabuf2" => Some(Self::BasicDmabuf2),
             _ => None,
         }
     }
@@ -384,13 +380,17 @@ fn print_usage(bin: &str) {
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
-    eprintln!("  mode                   Listener mode: {} (default: scanout)", ListenerMode::CLI_MODES);
+    eprintln!("  mode                   Listener mode: {} (default: basic)", ListenerMode::CLI_MODES);
+    eprintln!();
+    eprintln!("Modes:");
+    eprintln!("  basic        Core interface with framebuffer/DMABUF scanout");
+    eprintln!("  basic+map    Core + Unix.Map shared-memory scanout");
+    eprintln!("  basic+dmabuf2 Core + multi-plane DMA-BUF support");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutmap", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 basic+map", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 basic+dmabuf2", bin);
 }
 
 /// Connect to QEMU and return the event receiver for display updates.
@@ -541,8 +541,8 @@ async fn connect_to_qemu(
     info!("Creating listener D-Bus connection...");
 
     // Create listener handler
-    let enable_dmabuf2 = mode == ListenerMode::ScanoutDMABUF2;
-    let enable_map = mode == ListenerMode::ScanoutMap;
+    let enable_dmabuf2 = mode == ListenerMode::BasicDmabuf2;
+    let enable_map = mode == ListenerMode::BasicMap;
     let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(enable_map).build();
     info!("Listener mode: {:?}, DMABUF2: {}, MAP: {}", mode, enable_dmabuf2, enable_map);
 
@@ -602,7 +602,7 @@ async fn main() {
     let bin = args.first().map_or("qemu_display", String::as_str);
 
     let (socket_path, mode) = match args.len() {
-        2 => (PathBuf::from(&args[1]), ListenerMode::Scanout),
+        2 => (PathBuf::from(&args[1]), ListenerMode::Basic),
         3 => {
             let path = PathBuf::from(&args[1]);
             let mode = match ListenerMode::parse_cli(args[2].as_str()) {

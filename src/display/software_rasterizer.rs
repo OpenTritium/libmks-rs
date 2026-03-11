@@ -355,10 +355,7 @@ impl Swapchain {
             // Expected during resize/mode transitions when stale Update events race with new Scanout.
             mks_debug!("Ignoring off-screen partial update: rect=({x},{y} {w}x{h}), surface={aw}x{ah}",);
             // Off-screen update, return previous texture
-            return Ok(self.active_texture()
-                .as_ref()
-                .cloned()
-                .expect("Active texture missing"));
+            return Ok(self.active_texture().as_ref().cloned().expect("Active texture missing"));
         }
         let clipped_width = NonZeroU32::new(w.min(aw - x)).expect("Damage width stays non-zero after clipping");
         let clipped_height = NonZeroU32::new(h.min(ah - y)).expect("Damage height stays non-zero after clipping");

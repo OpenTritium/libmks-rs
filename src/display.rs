@@ -1,10 +1,10 @@
 pub mod capture_state;
 pub mod coordinate;
-pub mod direct_map;
 mod error;
 mod gpu_passthrough;
 pub mod input_daemon;
 pub mod input_handler;
+pub mod memmap;
 pub mod monitor_metrics;
 pub mod pixman_4cc;
 pub mod screen;

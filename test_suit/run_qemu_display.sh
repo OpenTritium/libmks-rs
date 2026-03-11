@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-ISO_PATH="livecd.iso"
+ISO_PATH="livecd.fedora.iso"
 RAM_SIZE="8G"
 CPU_CORES="8"
 
