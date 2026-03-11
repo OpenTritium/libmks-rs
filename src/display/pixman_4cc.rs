@@ -260,8 +260,13 @@ pub mod pixman {
 use derive_more::{Display, Error};
 pub use drm_4cc::FourCC;
 pub use pixman::Pixman;
+use relm4::gtk::gdk::MemoryFormat;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Display)]
 pub struct UnknownPixmanFormat;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Display)]
+pub struct UnknownFourccFormat;
 
 /// Maps alpha-bearing RGB formats to their opaque "X" counterparts when compatible.
 ///
@@ -330,6 +335,28 @@ impl TryFrom<Pixman> for drm_4cc::FourCC {
             pixman::YV12 => Ok(drm_4cc::YVU420),
             pixman::C8 => Ok(drm_4cc::C8),
             _ => Err(UnknownPixmanFormat),
+        }
+    }
+}
+
+impl TryFrom<FourCC> for MemoryFormat {
+    type Error = UnknownFourccFormat;
+
+    #[inline]
+    fn try_from(fourcc: FourCC) -> Result<Self, Self::Error> {
+        use drm_4cc::*;
+        match fourcc {
+            ARGB8888 => Ok(MemoryFormat::B8g8r8a8),
+            ABGR8888 => Ok(MemoryFormat::R8g8b8a8),
+            RGBA8888 => Ok(MemoryFormat::A8b8g8r8),
+            BGRA8888 => Ok(MemoryFormat::A8r8g8b8),
+            XRGB8888 => Ok(MemoryFormat::B8g8r8x8),
+            XBGR8888 => Ok(MemoryFormat::R8g8b8x8),
+            RGBX8888 => Ok(MemoryFormat::X8b8g8r8),
+            BGRX8888 => Ok(MemoryFormat::X8r8g8b8),
+            RGB888 => Ok(MemoryFormat::R8g8b8),
+            BGR888 => Ok(MemoryFormat::B8g8r8),
+            _ => Err(UnknownFourccFormat),
         }
     }
 }
@@ -433,5 +460,56 @@ mod tests {
         assert_eq!(sanitize_opaque_fourcc(drm_4cc::XBGR2101010), Err(drm_4cc::XBGR2101010));
         assert_eq!(sanitize_opaque_fourcc(drm_4cc::YUYV), Err(drm_4cc::YUYV));
         assert_eq!(sanitize_opaque_fourcc(drm_4cc::RGB565), Err(drm_4cc::RGB565));
+    }
+
+    /// 测试 6: 验证 FourCC 到 MemoryFormat 的映射
+    #[test]
+    fn test_fourcc_to_memory_format_alpha() {
+        use relm4::gtk::gdk::MemoryFormat as M;
+        // Alpha formats - 修正字节序映射
+        // DRM ARGB8888 (LE: [B,G,R,A]) -> GDK B8g8r8a8
+        assert_eq!(M::try_from(drm_4cc::ARGB8888), Ok(M::B8g8r8a8));
+        // DRM ABGR8888 (LE: [R,G,B,A]) -> GDK R8g8b8a8
+        assert_eq!(M::try_from(drm_4cc::ABGR8888), Ok(M::R8g8b8a8));
+        // DRM RGBA8888 (LE: [A,B,G,R]) -> GDK A8b8g8r8
+        assert_eq!(M::try_from(drm_4cc::RGBA8888), Ok(M::A8b8g8r8));
+        // DRM BGRA8888 (LE: [A,R,G,B]) -> GDK A8r8g8b8
+        assert_eq!(M::try_from(drm_4cc::BGRA8888), Ok(M::A8r8g8b8));
+    }
+
+    #[test]
+    fn test_fourcc_to_memory_format_x() {
+        use relm4::gtk::gdk::MemoryFormat as M;
+        // X formats (opaque) - 使用 GTK 4.14+ 的 _x8 变体
+        assert_eq!(M::try_from(drm_4cc::XRGB8888), Ok(M::B8g8r8x8));
+        assert_eq!(M::try_from(drm_4cc::XBGR8888), Ok(M::R8g8b8x8));
+        assert_eq!(M::try_from(drm_4cc::RGBX8888), Ok(M::X8b8g8r8));
+        assert_eq!(M::try_from(drm_4cc::BGRX8888), Ok(M::X8r8g8b8));
+    }
+
+    #[test]
+    fn test_fourcc_to_memory_format_24bit() {
+        use relm4::gtk::gdk::MemoryFormat as M;
+        assert_eq!(M::try_from(drm_4cc::RGB888), Ok(M::R8g8b8));
+        assert_eq!(M::try_from(drm_4cc::BGR888), Ok(M::B8g8r8));
+    }
+
+    #[test]
+    fn test_fourcc_to_memory_format_16bit() {
+        use relm4::gtk::gdk::MemoryFormat as M;
+        // GDK 没有直接的 RGB565 内存格式，映射到 G16 会导致色彩错误
+        // 所以现在返回错误
+        assert!(M::try_from(drm_4cc::RGB565).is_err());
+        assert!(M::try_from(drm_4cc::BGR565).is_err());
+    }
+
+    #[test]
+    fn test_fourcc_to_memory_format_unsupported() {
+        use relm4::gtk::gdk::MemoryFormat as M;
+        // Formats without MemoryFormat mapping should error
+        assert!(M::try_from(drm_4cc::ARGB4444).is_err());
+        assert!(M::try_from(drm_4cc::XRGB4444).is_err());
+        assert!(M::try_from(drm_4cc::ARGB2101010).is_err());
+        assert!(M::try_from(drm_4cc::YUYV).is_err());
     }
 }

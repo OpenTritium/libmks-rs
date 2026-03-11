@@ -53,7 +53,7 @@ pub struct GpuPassthrough {
 
 impl GpuPassthrough {
     #[inline]
-    pub const fn new() -> Self { Self { texture: None, active: None, pending: None } }
+    pub fn new() -> Self { Self::default() }
 
     #[inline]
     fn stage_pending(
@@ -137,6 +137,7 @@ impl GpuPassthrough {
             .iter()
             .map(|&PlaneDesc { ref fd, stride, offset }| DmabufPlane { fd: fd.as_raw_fd(), stride, offset })
             .collect::<ArrayVec<_, MAX_PLANES>>();
+        // Convert ARGB -> XRGB to avoid compositing with transparent guest content.
         let sanitized = sanitize_opaque_fourcc(active.fourcc).unwrap_or_else(|raw| {
             mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
             raw

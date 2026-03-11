@@ -2,7 +2,7 @@
 use super::gpu_passthrough::GpuPassthrough;
 use crate::{
     dbus::listener::Event,
-    display::{Error, direct_map::ImportedTexture, software_rasterizer::Swapchain},
+    display::{Error, memmap::ImportedTexture, software_rasterizer::Swapchain},
     mks_error, mks_trace,
 };
 use RenderBackend::*;
@@ -12,7 +12,7 @@ use relm4::gtk::{
     prelude::*,
 };
 use std::{
-    hint::{unlikely, unreachable_unchecked},
+    hint::{likely, unlikely, unreachable_unchecked},
     num::NonZeroU32,
     os::fd::OwnedFd,
 };
@@ -140,7 +140,8 @@ impl RenderBackend {
     #[inline]
     pub fn ensure_software_rasterizer(&mut self) -> (&mut Swapchain, bool) {
         let mut created = false;
-        if !matches!(self, SoftwareRasterizer(_)) {
+        let not_matched = !matches!(self, SoftwareRasterizer(_));
+        if unlikely(not_matched) {
             *self = SoftwareRasterizer(Swapchain::new());
             created = true;
         }
@@ -156,12 +157,35 @@ impl RenderBackend {
     #[inline]
     pub fn ensure_direct_mapped(&mut self) -> (&mut ImportedTexture, bool) {
         let mut created = false;
-        if !matches!(self, DirectMapped(_)) {
+        let not_matched = !matches!(self, DirectMapped(_));
+        if not_matched {
             *self = DirectMapped(ImportedTexture::new());
             created = true;
         }
         let DirectMapped(cache) = self else { unsafe { unreachable_unchecked() } };
         (cache, created)
+    }
+
+    /// Returns the current presentation texture, if any.
+    #[inline]
+    pub fn texture(&self) -> Option<&Texture> {
+        match self {
+            Self::SoftwareRasterizer(sw) => sw.active_texture().as_ref(),
+            Self::GpuPassthrough(gpu) => gpu.texture(),
+            Self::DirectMapped(map) => map.texture(),
+            Self::None => Option::None,
+        }
+    }
+
+    /// Returns current resolution as `(width, height)`.
+    #[inline]
+    pub fn resolution(&self) -> (u32, u32) {
+        match self {
+            Self::SoftwareRasterizer(sw) => sw.resolution(),
+            Self::GpuPassthrough(gpu) => gpu.resolution(),
+            Self::DirectMapped(cache) => cache.resolution(),
+            Self::None => (0, 0),
+        }
     }
 }
 
@@ -197,7 +221,7 @@ impl Screen {
                     data.len()
                 );
                 let (swapchain, new_created) = self.backend.ensure_software_rasterizer();
-                if new_created {
+                if unlikely(new_created) {
                     // Ignore initial Update that arrives before Scanout (QEMU event ordering race)
                     mks_trace!("Ignoring Update: Software backend not yet initialized");
                     return Ok(flags);
@@ -244,16 +268,18 @@ impl Screen {
                     "ScanoutMap: {width}x{height}, stride={stride}, offset={offset}, pixman=0x{pixman_format:08x}"
                 );
                 let (cache, _) = self.backend.ensure_direct_mapped();
-                cache.update_texture(memfd.into(), offset, width, height, stride, pixman_format)?;
+                cache.import(memfd.into(), offset, width, height, stride, pixman_format)?;
             }
             UpdateMap { x, y, width, height } => {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
-                let (_, new_created) = self.backend.ensure_direct_mapped();
-                if new_created {
+                let (cache, new_created) = self.backend.ensure_direct_mapped();
+                if unlikely(new_created) {
                     // Ignore initial UpdateMap that arrives before ScanoutMap (QEMU event ordering race)
                     mks_trace!("Ignoring UpdateMap: DirectMapped backend not yet initialized");
                     return Ok(flags);
                 }
+                // Redraw the texture from the imported buffer
+                cache.redraw()?;
                 flags.frame = true;
             }
             UpdateDmabuf { x, y, width, height } => {
@@ -280,6 +306,7 @@ impl Screen {
                 }
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
+                // todo remove looks_same
                 if !self.cursor.looks_same(width, height, hot_x, hot_y, &data, 4) {
                     let data = Bytes::from_owned(data.0);
                     let texture = MemoryTexture::new(
@@ -298,7 +325,8 @@ impl Screen {
                 self.cursor.visible = true;
             }
             MouseSet { x, y, on } => {
-                if self.cursor.x != x || self.cursor.y != y || self.cursor.visible != on {
+                let was_moved = self.cursor.x != x || self.cursor.y != y || self.cursor.visible != on;
+                if likely(was_moved) {
                     self.cursor.x = x;
                     self.cursor.y = y;
                     self.cursor.visible = on;
@@ -317,25 +345,10 @@ impl Screen {
         Ok(flags)
     }
 
-    pub fn get_background_texture(&self) -> Option<&Texture> {
-        match &self.backend {
-            SoftwareRasterizer(sw) => sw.active_texture().as_ref(),
-            GpuPassthrough(gpu) => gpu.texture(),
-            DirectMapped(cache) => cache.texture(),
-            None => Option::None,
-        }
-    }
+    #[inline]
+    pub fn get_background_texture(&self) -> Option<&Texture> { self.backend.texture() }
 
-    /// Returns `(width, height)` in pixels for the current backend.
-    ///
-    /// - `width`: frame width.
-    /// - `height`: frame height.
-    pub fn resolution(&self) -> (u32, u32) {
-        match &self.backend {
-            SoftwareRasterizer(sw) => sw.resolution(),
-            GpuPassthrough(gpu) => gpu.resolution(),
-            DirectMapped(cache) => cache.resolution(),
-            None => (0, 0),
-        }
-    }
+    /// Returns current resolution as `(width, height)`.
+    #[inline]
+    pub fn resolution(&self) -> (u32, u32) { self.backend.resolution() }
 }
