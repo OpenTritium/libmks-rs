@@ -231,9 +231,7 @@ impl GpuPassthrough {
 
     /// Guest visible resolution: (width, height). Alias for crop_info dimensions.
     #[inline]
-    pub fn visible_resolution(&self) -> (u32, u32) { self.crop_info().map(|c| (c.width as u32, c.height as u32)).unwrap_or_default() }
-
-    /// Alias for [`visible_resolution()`].
-    #[inline]
-    pub fn resolution(&self) -> (u32, u32) { self.visible_resolution() }
+    pub fn visible_resolution(&self) -> Option<(NonZeroU32, NonZeroU32)> {
+        self.active.as_ref().map(|a| (a.crop_width, a.crop_height))
+    }
 }

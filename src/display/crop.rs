@@ -1,5 +1,5 @@
 /// Viewport crop information for UI rendering layer.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CropInfo {
     /// Horizontal offset of visible viewport within the backing buffer
     pub x: f32,

@@ -1,9 +1,9 @@
 use super::{
     capture_state::{Capture, CaptureState},
-    viewport_transform::Coordinate,
+    display_state::{DirtyFlags, Screen},
     input_event_controller::{InputHandler, attach_gtk_controllers},
     monitor_metrics,
-    display_state::{DirtyFlags, Screen},
+    viewport_transform::Coordinate,
     wayland_confine::ConfineState,
 };
 use crate::{
@@ -264,11 +264,23 @@ impl VmDisplayModel {
                 if widgets.vm_picture.width_request() != req_w || widgets.vm_picture.height_request() != req_h {
                     widgets.vm_picture.set_size_request(req_w, req_h);
                 }
-                let matrix = if self.screen.y0_top {
+
+                // Get crop info to handle GPU-backed buffers with visible viewport offset
+                let crop = self.screen.crop_info();
+                let scale = viewport_w / crop.map(|c| c.width).unwrap_or(viewport_w);
+
+                // Build transform: translate to viewport position, then offset by crop
+                let mut matrix = if self.screen.y0_top {
                     Transform::new().translate(&Point::new(offset_x, offset_y + viewport_h)).scale(1., -1.)
                 } else {
                     Transform::new().translate(&Point::new(offset_x, offset_y))
                 };
+                // If crop has offset, translate to show only visible region
+                if let Some(c) = crop
+                    && (c.x != 0. || c.y != 0.)
+                {
+                    matrix = matrix.translate(&Point::new(-c.x * scale, -c.y * scale));
+                }
                 widgets.vm_fixed.set_child_transform(&widgets.vm_picture, Some(&matrix));
             } else {
                 widgets.vm_fixed.set_child_transform(&widgets.vm_picture, None);
@@ -564,7 +576,13 @@ impl Component for VmDisplayModel {
 
             Qemu(event) => match self.screen.handle_event(event) {
                 Ok(flags) => {
-                    let (w, h) = self.screen.logical_resolution();
+                    let (w, h) = self.screen.resolution().map(|(w, h)| (w.get(), h.get())).unwrap_or_default();
+                    #[cfg(debug_assertions)]
+                    {
+                        if w == 0 || h == 0 {
+                            mks_warn!("zero width/heigh:{w}x{h}")
+                        }
+                    }
                     self.coord_system.set_vm_resolution(w, h);
                     self.dirty_flags.merge(flags);
                 }

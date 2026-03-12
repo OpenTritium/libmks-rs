@@ -89,9 +89,7 @@ impl SoftwareRasterizer {
 
     /// Returns the current resolution as `(width, height)`.
     #[inline]
-    pub fn resolution(&self) -> (u32, u32) {
-        self.surface.as_ref().map(|s| (s.width.get(), s.height.get())).unwrap_or_default()
-    }
+    pub fn resolution(&self) -> Option<(NonZeroU32, NonZeroU32)> { self.surface.as_ref().map(|s| (s.width, s.height)) }
 
     /// Handles a full-frame update (Scanout).
     #[inline]

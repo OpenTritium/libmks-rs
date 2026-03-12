@@ -114,7 +114,7 @@ impl SharedMemory {
 
     /// Returns framebuffer resolution as `(width, height)`.
     #[inline]
-    pub fn resolution(&self) -> (u32, u32) { (self.width.get(), self.height.get()) }
+    pub fn resolution(&self) -> (NonZeroU32, NonZeroU32) { (self.width, self.height) }
 }
 
 // SAFETY: mmap'd memory in read-only mode is safe to share across threads.
@@ -172,7 +172,7 @@ impl ImportedTexture {
 
     /// Returns current resolution as `(width, height)`.
     #[inline]
-    pub fn resolution(&self) -> (u32, u32) { self.buf.as_ref().map(|b| b.resolution()).unwrap_or_default() }
+    pub fn resolution(&self) -> Option<(NonZeroU32, NonZeroU32)> { self.buf.as_ref().map(|b| b.resolution()) }
 
     /// Clears both buffer and texture.
     #[inline]
