@@ -133,6 +133,10 @@ impl Coordinate {
     /// - `top`: top edge in widget logical coordinates.
     /// - `width`: display width in widget logical coordinates.
     /// - `height`: display height in widget logical coordinates.
+    ///
+    /// Returns `None` when VM resolution is unknown (`vm_w == 0 || vm_h == 0`) or
+    /// widget dimensions are invalid (`widget_w <= 0 || widget_h <= 0`), such as during
+    /// initial setup or when the display is disabled.
     #[inline]
     pub fn vm_display_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         let viewport = self.get_cached_viewport()?;

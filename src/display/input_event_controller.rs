@@ -1,12 +1,12 @@
 use super::{
-    viewport_transform::Coordinate,
     input_event_bus::{InputCommand, WatchCommand},
-    vm_display::{CaptureEvent, GrabShortcut, Message, VmDisplayModel},
+    viewport_transform::Coordinate,
+    vm_display::{GrabShortcut, Message, PointerCaptureEvent, VmDisplayModel},
 };
 use crate::{
     dbus::{keyboard::PressAction, mouse::Button, multitouch::Kind},
     keymaps::Qnum,
-    mks_debug, mks_error, mks_warn,
+    mks_debug, mks_error, mks_trace, mks_warn,
 };
 use InputCommand::*;
 use gdk4_wayland::glib::Propagation;
@@ -118,7 +118,7 @@ impl InputHandler {
             mks_error!("Mouse capability disabled; ignoring pointer move request");
             return;
         }
-        mks_debug!(
+        mks_trace!(
             "Pointer move request: widget=({:.1}, {:.1}), absolute_mode={}",
             widget_x,
             widget_y,
@@ -327,7 +327,7 @@ pub fn attach_gtk_controllers(
     let input_overlay_click = input_overlay.clone();
     click.connect_pressed(move |gesture, _, x, y| {
         input_overlay_click.grab_focus();
-        sender_clone.input(Message::SetConfined(CaptureEvent::Capture { click_pos: Some((x as f32, y as f32)) }));
+        sender_clone.input(Message::SetConfined(PointerCaptureEvent::Start { click_pos: Some((x as f32, y as f32)) }));
         sender_clone.input(Message::MouseButton { button: gesture.current_button(), transition: PressAction::Press });
     });
     let sender_clone = sender.clone();
@@ -349,7 +349,7 @@ pub fn attach_gtk_controllers(
     let sender_for_key = sender.clone();
     key.connect_key_pressed(move |_, keyval, keycode, modifiers| {
         if modifiers.contains(grab_shortcut.mask) && keyval == grab_shortcut.key {
-            sender_for_release.input(Message::SetConfined(CaptureEvent::Release));
+            sender_for_release.input(Message::SetConfined(PointerCaptureEvent::Stop));
             return Propagation::Stop;
         }
         sender_for_key.input(Message::Key { keycode, transition: PressAction::Press });

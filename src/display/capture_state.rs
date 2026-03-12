@@ -1,31 +1,34 @@
-use super::vm_display::InputMode::{self, *};
+use super::vm_display::PointerPolicy::{self, *};
 
 /// Current pointer capture status for display input forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Capture {
+pub enum PointerState {
     #[default]
-    Idle, // Not inside seamless region and not clicked in confined mode.
-    Seamless, // Seamless mode while cursor is inside the frame.
-    Confined, // Confined mode after a capture click.
+    /// Not in auto-tracking region and not in locked mode.
+    Inactive,
+    /// Auto mode while cursor is inside the viewport.
+    Tracking,
+    /// Locked mode after a capture click.
+    Captured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /// Mutable state machine for pointer capture transitions.
-pub struct CaptureState(Capture);
+pub struct CaptureState(PointerState);
 
 impl CaptureState {
-    /// Creates a new capture state in `Capture::Idle`.
+    /// Creates a new capture state in `PointerState::Inactive`.
     pub fn new() -> Self { Self::default() }
 
     #[inline]
-    /// Resets capture state to `Capture::Idle`.
-    const fn reset(&mut self) { self.0 = Capture::Idle; }
+    /// Resets capture state to `PointerState::Inactive`.
+    const fn reset(&mut self) { self.0 = PointerState::Inactive; }
 
     #[inline]
-    /// Enters capture for the given input mode when supported.
-    pub fn enter(&mut self, mode: InputMode) {
-        if mode == Seamless {
-            self.0 = Capture::Seamless;
+    /// Enters capture for the given input policy when supported.
+    pub fn enter(&mut self, policy: PointerPolicy) {
+        if policy == Auto {
+            self.0 = PointerState::Tracking;
         }
     }
 
@@ -34,10 +37,10 @@ impl CaptureState {
     pub const fn leave(&mut self) { self.reset(); }
 
     #[inline]
-    /// Captures input for the given input mode when supported.
-    pub fn capture(&mut self, mode: InputMode) {
-        if mode == Confined {
-            self.0 = Capture::Confined;
+    /// Captures input for the given input policy when supported.
+    pub fn capture(&mut self, policy: PointerPolicy) {
+        if policy == Locked {
+            self.0 = PointerState::Captured;
         }
     }
 
@@ -49,14 +52,14 @@ impl CaptureState {
     /// Returns whether input events should be forwarded.
     pub fn should_forward(&self) -> bool {
         match self.0 {
-            Capture::Idle => false,
-            Capture::Seamless | Capture::Confined => true,
+            PointerState::Inactive => false,
+            PointerState::Tracking | PointerState::Captured => true,
         }
     }
 
     #[inline]
-    /// Returns current capture state.
-    pub const fn current(&self) -> Capture { self.0 }
+    /// Returns current pointer state.
+    pub const fn current(&self) -> PointerState { self.0 }
 }
 
 #[cfg(test)]
@@ -64,56 +67,56 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Clone, Copy)]
-    enum ModeEvent {
-        Enter(InputMode),
-        Capture(InputMode),
+    enum PolicyEvent {
+        Enter(PointerPolicy),
+        Capture(PointerPolicy),
     }
 
-    fn state_in(capture: Capture) -> CaptureState {
-        let mut state = CaptureState::new();
-        match capture {
-            Capture::Idle => {}
-            Capture::Seamless => state.enter(InputMode::Seamless),
-            Capture::Confined => state.capture(InputMode::Confined),
+    fn state_in(state: PointerState) -> CaptureState {
+        let mut capture_state = CaptureState::new();
+        match state {
+            PointerState::Inactive => {}
+            PointerState::Tracking => capture_state.enter(PointerPolicy::Auto),
+            PointerState::Captured => capture_state.capture(PointerPolicy::Locked),
         }
-        state
+        capture_state
     }
 
-    fn assert_state(state: &CaptureState, expected: Capture) {
+    fn assert_state(state: &CaptureState, expected: PointerState) {
         assert_eq!(state.current(), expected);
-        assert_eq!(state.should_forward(), expected != Capture::Idle);
+        assert_eq!(state.should_forward(), expected != PointerState::Inactive);
     }
 
     #[test]
-    fn starts_in_idle() {
+    fn starts_in_inactive() {
         let from_default = CaptureState::default();
         let from_new = CaptureState::new();
-        assert_state(&from_default, Capture::Idle);
-        assert_state(&from_new, Capture::Idle);
+        assert_state(&from_default, PointerState::Inactive);
+        assert_state(&from_new, PointerState::Inactive);
     }
 
     #[test]
     fn mode_sensitive_events_follow_transition_matrix() {
         let cases = [
-            (Capture::Idle, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
-            (Capture::Idle, ModeEvent::Enter(InputMode::Confined), Capture::Idle),
-            (Capture::Idle, ModeEvent::Capture(InputMode::Seamless), Capture::Idle),
-            (Capture::Idle, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
-            (Capture::Seamless, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
-            (Capture::Seamless, ModeEvent::Enter(InputMode::Confined), Capture::Seamless),
-            (Capture::Seamless, ModeEvent::Capture(InputMode::Seamless), Capture::Seamless),
-            (Capture::Seamless, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
-            (Capture::Confined, ModeEvent::Enter(InputMode::Seamless), Capture::Seamless),
-            (Capture::Confined, ModeEvent::Enter(InputMode::Confined), Capture::Confined),
-            (Capture::Confined, ModeEvent::Capture(InputMode::Seamless), Capture::Confined),
-            (Capture::Confined, ModeEvent::Capture(InputMode::Confined), Capture::Confined),
+            (PointerState::Inactive, PolicyEvent::Enter(PointerPolicy::Auto), PointerState::Tracking),
+            (PointerState::Inactive, PolicyEvent::Enter(PointerPolicy::Locked), PointerState::Inactive),
+            (PointerState::Inactive, PolicyEvent::Capture(PointerPolicy::Auto), PointerState::Inactive),
+            (PointerState::Inactive, PolicyEvent::Capture(PointerPolicy::Locked), PointerState::Captured),
+            (PointerState::Tracking, PolicyEvent::Enter(PointerPolicy::Auto), PointerState::Tracking),
+            (PointerState::Tracking, PolicyEvent::Enter(PointerPolicy::Locked), PointerState::Tracking),
+            (PointerState::Tracking, PolicyEvent::Capture(PointerPolicy::Auto), PointerState::Tracking),
+            (PointerState::Tracking, PolicyEvent::Capture(PointerPolicy::Locked), PointerState::Captured),
+            (PointerState::Captured, PolicyEvent::Enter(PointerPolicy::Auto), PointerState::Tracking),
+            (PointerState::Captured, PolicyEvent::Enter(PointerPolicy::Locked), PointerState::Captured),
+            (PointerState::Captured, PolicyEvent::Capture(PointerPolicy::Auto), PointerState::Captured),
+            (PointerState::Captured, PolicyEvent::Capture(PointerPolicy::Locked), PointerState::Captured),
         ];
 
         for (initial, event, expected) in cases {
             let mut state = state_in(initial);
             match event {
-                ModeEvent::Enter(mode) => state.enter(mode),
-                ModeEvent::Capture(mode) => state.capture(mode),
+                PolicyEvent::Enter(policy) => state.enter(policy),
+                PolicyEvent::Capture(policy) => state.capture(policy),
             }
             assert_state(&state, expected);
         }
@@ -121,58 +124,58 @@ mod tests {
 
     #[test]
     fn mouse_leave_resets_from_any_state() {
-        for initial in [Capture::Idle, Capture::Seamless, Capture::Confined] {
+        for initial in [PointerState::Inactive, PointerState::Tracking, PointerState::Captured] {
             let mut state = state_in(initial);
             state.leave();
-            assert_state(&state, Capture::Idle);
+            assert_state(&state, PointerState::Inactive);
         }
     }
 
     #[test]
     fn release_resets_from_any_state() {
-        for initial in [Capture::Idle, Capture::Seamless, Capture::Confined] {
+        for initial in [PointerState::Inactive, PointerState::Tracking, PointerState::Captured] {
             let mut state = state_in(initial);
             state.release();
-            assert_state(&state, Capture::Idle);
+            assert_state(&state, PointerState::Inactive);
         }
     }
 
     #[test]
     fn reset_is_idempotent() {
-        let mut state = state_in(Capture::Confined);
+        let mut state = state_in(PointerState::Captured);
         state.reset();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
         state.reset();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
     }
 
     #[test]
-    fn typical_seamless_flow() {
+    fn typical_auto_flow() {
         let mut state = CaptureState::new();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
 
-        state.enter(InputMode::Seamless);
-        assert_state(&state, Capture::Seamless);
+        state.enter(PointerPolicy::Auto);
+        assert_state(&state, PointerState::Tracking);
 
-        state.enter(InputMode::Seamless);
-        assert_state(&state, Capture::Seamless);
+        state.enter(PointerPolicy::Auto);
+        assert_state(&state, PointerState::Tracking);
 
         state.leave();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
     }
 
     #[test]
-    fn typical_confined_flow() {
+    fn typical_locked_flow() {
         let mut state = CaptureState::new();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
 
-        state.enter(InputMode::Confined);
-        assert_state(&state, Capture::Idle);
+        state.enter(PointerPolicy::Locked);
+        assert_state(&state, PointerState::Inactive);
 
-        state.capture(InputMode::Confined);
-        assert_state(&state, Capture::Confined);
+        state.capture(PointerPolicy::Locked);
+        assert_state(&state, PointerState::Captured);
 
         state.release();
-        assert_state(&state, Capture::Idle);
+        assert_state(&state, PointerState::Inactive);
     }
 }

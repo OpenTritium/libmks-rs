@@ -37,7 +37,7 @@ use libmks_rs::{
     display::{
         input_event_bus::{InputBusSetup, InputDaemon, InputStateEvent},
         input_event_controller::InputHandler,
-        vm_display::{GrabShortcut, InputMode, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
+        vm_display::{GrabShortcut, PointerPolicy, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::{error, info, warn};
@@ -64,14 +64,14 @@ struct AppModel {
     resources: Option<AppResources>,
     main_container: gtk::Overlay,
     scaling_mode: ScalingMode,
-    input_mode: InputMode,
+    input_mode: PointerPolicy,
     guest_mouse_is_absolute: Option<bool>,
 }
 
 enum AppMsg {
     Ignore,
     SetScalingMode(ScalingMode),
-    SetInputMode(InputMode),
+    SetInputMode(PointerPolicy),
     GuestMouseModeChanged {
         is_absolute: bool,
     },
@@ -151,8 +151,8 @@ impl SimpleComponent for AppModel {
                         ])),
                         #[watch]
                         set_selected: match model.input_mode {
-                            InputMode::Seamless => 0,
-                            InputMode::Confined => 1,
+                            PointerPolicy::Auto => 0,
+                            PointerPolicy::Locked => 1,
                         },
 
                         #[watch]
@@ -227,7 +227,7 @@ impl SimpleComponent for AppModel {
             resources: None,
             main_container: main_container.clone(),
             scaling_mode: ScalingMode::ResizeGuest,
-            input_mode: InputMode::Seamless,
+            input_mode: PointerPolicy::Auto,
             guest_mouse_is_absolute: None,
         };
         let widgets = view_output!();
@@ -245,8 +245,8 @@ impl SimpleComponent for AppModel {
         let sender_clone = sender.clone();
         widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
-                0 => InputMode::Seamless,
-                1 => InputMode::Confined,
+                0 => PointerPolicy::Auto,
+                1 => PointerPolicy::Locked,
                 _ => return,
             };
             sender_clone.input(AppMsg::SetInputMode(mode));
@@ -268,9 +268,9 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::SetInputMode(mode) => {
-                let effective_mode = if self.guest_mouse_is_absolute == Some(false) && mode == InputMode::Seamless {
-                    warn!("Guest mouse is relative; forcing InputMode::Confined");
-                    InputMode::Confined
+                let effective_mode = if self.guest_mouse_is_absolute == Some(false) && mode == PointerPolicy::Auto {
+                    warn!("Guest mouse is relative; forcing PointerPolicy::Locked");
+                    PointerPolicy::Locked
                 } else {
                     mode
                 };
@@ -284,10 +284,10 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::GuestMouseModeChanged { is_absolute } => {
                 self.guest_mouse_is_absolute = Some(is_absolute);
-                if !is_absolute && self.input_mode != InputMode::Confined {
-                    self.input_mode = InputMode::Confined;
+                if !is_absolute && self.input_mode != PointerPolicy::Locked {
+                    self.input_mode = PointerPolicy::Locked;
                     if let Some(display) = &self.display {
-                        display.emit(VmDisplayMsg::SetInputCaptureMode(InputMode::Confined));
+                        display.emit(VmDisplayMsg::SetInputCaptureMode(PointerPolicy::Locked));
                     }
                 }
                 if let Some(display) = &self.display {

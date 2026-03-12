@@ -8,7 +8,7 @@ use libmks_rs::{
     display::{
         input_event_bus::InputCommand,
         input_event_controller::{Capability, InputHandler},
-        vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
+        vm_display::{GrabShortcut, PointerPolicy, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::info;
@@ -23,7 +23,7 @@ struct AppModel {
 #[derive(Debug)]
 enum AppMsg {
     SetScalingMode(ScalingMode),
-    SetInputMode(InputMode),
+    SetInputMode(PointerPolicy),
     Ignore,
 }
 
@@ -148,8 +148,8 @@ impl SimpleComponent for AppModel {
 
         widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
-                0 => InputMode::Seamless,
-                1 => InputMode::Confined,
+                0 => PointerPolicy::Auto,
+                1 => PointerPolicy::Locked,
                 _ => return,
             };
             sender.input(AppMsg::SetInputMode(mode));
