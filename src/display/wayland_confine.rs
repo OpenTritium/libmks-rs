@@ -1,11 +1,10 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
-use crate::{
-    display::input_event_bus::InputCommand,
-    mks_debug, mks_error, mks_info,
-};
+use crate::{display::input_event_bus::InputCommand, mks_debug, mks_error, mks_info, mks_warn};
 use gdk4_wayland::{
     WaylandDisplay,
-    glib::{IOCondition, SourceId, ControlFlow, unix_fd_add_local},
+    gdk::Display,
+    glib::{ControlFlow, IOCondition, SourceId, unix_fd_add_local},
+    prelude::*,
     wayland_client::{
         Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
         protocol::{
@@ -110,7 +109,7 @@ impl WaylandConfine {
         &mut self, surface: &WlSurface, (x, y, w, h): (u32, u32, u32, u32), prefer_relative: bool,
     ) -> bool {
         if self.state.pointer_capture != PointerCapture::None {
-            mks_error!("Pointer capture already active; ignoring duplicate confine request");
+            mks_warn!("Pointer capture already active; ignoring duplicate confine request");
             return false;
         }
         // Start each capture session from a clean relative-motion residue state.
@@ -291,18 +290,9 @@ empty_dispatch!(
     WlRegion,
 );
 
-// ============================================================================
-// ConfineState - manages Wayland pointer confinement lifecycle
-// ============================================================================
-
-use gdk4_wayland::prelude::*;
-use gdk4_wayland::gdk::Display;
-use kanal;
-
 pub struct ConfineState {
     pub wayland_confine: Rc<RefCell<WaylandConfine>>,
     pub poll_source: Option<SourceId>,
-    pub is_captured: bool,
 }
 
 impl ConfineState {
@@ -319,7 +309,7 @@ impl ConfineState {
             ControlFlow::Continue
         });
         mks_debug!("Attached Wayland FD monitor to GLib main context");
-        Some(Self { wayland_confine: confine, poll_source: Some(poll_source), is_captured: false })
+        Some(Self { wayland_confine: confine, poll_source: Some(poll_source) })
     }
 }
 

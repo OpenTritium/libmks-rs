@@ -578,21 +578,16 @@ impl Component for VmDisplayModel {
                         return;
                     };
                     confine.wayland_confine.borrow_mut().unconfine();
-                    confine.is_captured = false;
                     mks_info!("Pointer confinement released");
                     sender.input(UpdateCaptureView);
                     return;
                 }
-
-                // ==========================================
-                // 修复点：如果当前已经处于捕获状态，直接忽略重复的捕获请求
+                // 如果当前已经处于捕获状态，直接忽略重复的捕获请求
                 // 防止每次在虚拟机内点击鼠标时都向 Wayland 发送重复的 confine 请求
-                // ==========================================
                 if self.capture_state.current() == PointerState::Captured {
                     mks_trace!("Pointer is already captured; ignoring duplicate capture request");
                     return;
                 }
-
                 // 到这里我们进入了 confine 分支
                 let widget_rect = self.confined_widget_rect();
                 let click_pos = event.click_pos();
@@ -609,17 +604,11 @@ impl Component for VmDisplayModel {
                 if !confine_ok {
                     mks_error!("Failed to establish Wayland pointer confinement");
                     self.show_confined_capture_unavailable_toast(prefer_relative, &sender);
-                    if let Some(confine) = &mut self.confine_state {
-                        confine.is_captured = false;
-                    }
                     sender.input(UpdateCaptureView);
                     return;
                 }
                 self.capture_state.capture(mode);
                 self.show_toast(format!("Press {} to release mouse", self.grab_shortcut), sender.clone());
-                if let Some(confine) = &mut self.confine_state {
-                    confine.is_captured = true;
-                }
                 if self.input.is_absolute
                     && let Some((x, y)) = vm_coords
                 {
@@ -719,10 +708,7 @@ impl Component for VmDisplayModel {
                     let prefer_relative = !is_absolute;
                     let recapture_ok = self.confine_state.as_mut().is_some_and(|confine| {
                         confine.wayland_confine.borrow_mut().unconfine();
-                        let ok =
-                            confine.wayland_confine.borrow_mut().confine_pointer(&proxy, widget_rect, prefer_relative);
-                        confine.is_captured = ok;
-                        ok
+                        confine.wayland_confine.borrow_mut().confine_pointer(&proxy, widget_rect, prefer_relative)
                     });
                     if recapture_ok {
                         mks_info!(
