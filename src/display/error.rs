@@ -26,9 +26,24 @@ pub enum Error {
     /// Attempted to redraw() without any buffer staged via import().
     #[error("No buffer staged (call import() first)")]
     NoStagedBuffer,
+
     #[error("Partial update pixman format does not match staged surface")]
     PartialUpdatePixmanNotMatch,
 
     #[error("Partial update coordinates are outside surface bounds")]
     PartialUpdateOffScreen,
+
+    /// Event arrived before backend was initialized (race condition from QEMU event ordering).
+    #[error("Backend not ready: {0}")]
+    BackendNotReady(#[from] BackendNotReady),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BackendNotReady {
+    #[error("Software")]
+    Software,
+    #[error("DirectMapped")]
+    DirectMapped,
+    #[error("GpuPassthrough")]
+    GpuPassthrough,
 }

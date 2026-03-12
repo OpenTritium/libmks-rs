@@ -15,10 +15,10 @@
 //! <https://www.qemu.org/docs/master/interop/dbus-display.html#org-qemu-display1-listener-section>
 use super::{
     Error,
+    dmabuf::{Damage, DmabufPlane, build_dmabuf_texture_planar},
     pixman_4cc::{FourCC, sanitize_opaque_fourcc},
-    udma::{Damage, DmabufPlane, build_dmabuf_texture_planar},
 };
-use crate::{mks_debug, mks_trace};
+use crate::{display::crop::CropInfo, mks_debug, mks_trace, mks_warn};
 use arrayvec::ArrayVec;
 use relm4::gtk::gdk::Texture;
 use std::{
@@ -29,43 +29,35 @@ use std::{
 const LOG_TARGET: &str = "mks.display.gpu_passthrough";
 const MAX_PLANES: usize = 4;
 
+/// Plane descriptor for DMA-BUF file descriptor + layout metadata.
 #[derive(Debug)]
 struct PlaneDesc {
     fd: OwnedFd,
+    /// DMA-BUF file descriptor (transferred to GDK/EGL)
     stride: NonZeroU32,
-    offset: u32,
+    /// Row stride in bytes
+    offset: u32, // Byte offset to plane data
 }
 
-/// Unified DMA-BUF state model (normalizes V1 and V2).
-///
-/// - `backing_width/height`: physical buffer dimensions (used for GDK/EGL Texture creation)
-/// - `crop_x/y/w/h`: visible viewport region (used for UI裁剪和局部刷新对齐)
+/// Normalized DMA-BUF state (V1/V2 -> internal model).
 #[derive(Debug)]
 struct DmabufState {
     planes: ArrayVec<PlaneDesc, MAX_PLANES>,
-    fourcc: FourCC,
+    sanitized_fourcc: FourCC,
+    /// ARGB->XRGB pre-sanitized; cached
     modifier: u64,
-    /// Physical buffer dimensions (for Texture creation stride validation)
+    /// DRM modifier (linear, tiled, etc.)
     backing_width: NonZeroU32,
+    /// Physical buffer width (for Texture creation)
     backing_height: NonZeroU32,
-    /// Visible viewport region (Scanout's x, y, width, height)
+    /// Physical buffer height
     crop_x: u32,
+    /// Viewport offset X within backing
     crop_y: u32,
+    /// Viewport offset Y within backing
     crop_width: NonZeroU32,
-    crop_height: NonZeroU32,
-}
-
-/// Viewport crop information for UI rendering layer.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CropInfo {
-    /// Horizontal offset of visible viewport within the backing buffer
-    pub x: f32,
-    /// Vertical offset of visible viewport within the backing buffer
-    pub y: f32,
-    /// Width of visible viewport
-    pub width: f32,
-    /// Height of visible viewport
-    pub height: f32,
+    /// Viewport width
+    crop_height: NonZeroU32, // Viewport height
 }
 
 /// GPU-backed scanout state for DMA-BUF paths.
@@ -83,17 +75,20 @@ impl GpuPassthrough {
     #[inline]
     pub fn new() -> Self { Self::default() }
 
-    /// Normalizes V1 protocol (single-plane, no backing concept) to internal model.
-    ///
-    /// Physical buffer dimensions equal visible viewport dimensions.
+    /// Stage V1 single-plane DMA-BUF (backing = crop).
     #[inline]
     pub fn stage_single_plane(
         &mut self, dmabuf_fd: OwnedFd, w: NonZeroU32, h: NonZeroU32, stride: NonZeroU32, fourcc: FourCC, modifier: u64,
     ) {
         let planes = [PlaneDesc { fd: dmabuf_fd, stride, offset: 0 }].into_iter().collect();
+        // Pre-sanitize FourCC to avoid repeated conversion on every commit.
+        let sanitized_fourcc = sanitize_opaque_fourcc(fourcc).unwrap_or_else(|raw| {
+            mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
+            raw
+        });
         self.pending = Some(DmabufState {
             planes,
-            fourcc,
+            sanitized_fourcc,
             modifier,
             backing_width: w,
             backing_height: h,
@@ -105,11 +100,7 @@ impl GpuPassthrough {
         mks_trace!("DMABUF prepared (V1 single-plane): {w}x{h}");
     }
 
-    /// Normalizes V2 protocol (multi-plane, separate backing and crop) to internal model.
-    ///
-    /// - `crop_x/y`: offset of visible viewport within the backing buffer
-    /// - `crop_w/h`: visible viewport dimensions
-    /// - `backing_w/h`: physical buffer dimensions (may be larger due to GPU alignment)
+    /// Stage V2 multi-plane DMA-BUF (separate backing and crop).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn stage_multi_plane(
@@ -117,6 +108,15 @@ impl GpuPassthrough {
         crop_h: NonZeroU32, backing_w: NonZeroU32, backing_h: NonZeroU32, strides: &[NonZeroU32], offsets: &[u32],
         fourcc: FourCC, modifier: u64,
     ) {
+        // Validate crop coordinates are within backing buffer bounds.
+        debug_assert!(
+            crop_x.saturating_add(crop_w.get()) <= backing_w.get(),
+            "crop_x({crop_x}) + crop_w({crop_w}) exceeds backing_w({backing_w})"
+        );
+        debug_assert!(
+            crop_y.saturating_add(crop_h.get()) <= backing_h.get(),
+            "crop_y({crop_y}) + crop_h({crop_h}) exceeds backing_h({backing_h})"
+        );
         let planes = dmabuf_fds
             .into_iter()
             .take(MAX_PLANES)
@@ -124,9 +124,14 @@ impl GpuPassthrough {
             .zip(offsets.iter().copied())
             .map(|((fd, stride), offset)| PlaneDesc { fd, stride, offset })
             .collect::<ArrayVec<_, MAX_PLANES>>();
+        // Pre-sanitize FourCC to avoid repeated conversion on every commit.
+        let sanitized_fourcc = sanitize_opaque_fourcc(fourcc).unwrap_or_else(|raw| {
+            mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
+            raw
+        });
         self.pending = Some(DmabufState {
             planes,
-            fourcc,
+            sanitized_fourcc,
             modifier,
             backing_width: backing_w,
             backing_height: backing_h,
@@ -141,21 +146,11 @@ impl GpuPassthrough {
         );
     }
 
-    /// Commits a staged DMABUF update and (re)builds the presentation texture.
+    /// Commit staged DMABUF: page flip if `pending` exists, otherwise in-place update with damage.
     ///
-    /// Behavior:
-    /// - If `pending` exists: treat this as a page flip, promote `pending` to `active`, and rebuild from the new buffer
-    ///   (`old_texture = None`).
-    /// - If `pending` does not exist: treat this as an in-place update on the current `active` buffer and forward
-    ///   incoming `damage` for partial reuse.
+    /// Damage (x,y) from QEMU is relative to viewport; we map to backing coords by adding crop offsets.
     ///
-    /// Note: QEMU's damage coordinates `(x, y)` are relative to the visible viewport (crop).
-    /// We map them to backing buffer coordinates by adding `crop_x` and `crop_y` offsets.
-    ///
-    /// Returns:
-    /// - `Ok(true)`: texture is ready to present.
-    /// - `Ok(false)`: no visible work was needed (e.g. invalid/empty damage rect or no active/pending state).
-    /// - `Err(..)`: texture rebuild failed.
+    /// Returns: `Ok(true)` = texture ready, `Ok(false)` = no work needed, `Err(..)` = rebuild failed.
     #[inline]
     pub fn commit_update(&mut self, x: u32, y: u32, w: NonZeroU32, h: NonZeroU32) -> Result<bool, Error> {
         let is_page_flip = if let Some(pending) = self.pending.take() {
@@ -174,8 +169,28 @@ impl GpuPassthrough {
         } else {
             // QEMU's damage coordinates are relative to the visible viewport (crop).
             // We must map them to backing buffer coordinates.
-            let damage = Damage { x: x + active.crop_x, y: y + active.crop_y, width: w, height: h };
-            mks_trace!("DMABUF commit: in-place update. Mapped damage to backing rect={damage:?}");
+            let damage_x = x.saturating_add(active.crop_x);
+            let damage_y = y.saturating_add(active.crop_y);
+            let damage_w = w.get();
+            let damage_h = h.get();
+
+            // Defensive: verify mapped damage is within backing buffer bounds.
+            if damage_x.saturating_add(damage_w) > active.backing_width.get()
+                || damage_y.saturating_add(damage_h) > active.backing_height.get()
+            {
+                mks_warn!(
+                    "DMABUF commit: mapped damage rect ({damage_x},{damage_y} {damage_w}x{damage_h}) exceeds backing \
+                     buffer ({}x{})",
+                    active.backing_width.get(),
+                    active.backing_height.get()
+                );
+                return Ok(false);
+            }
+            // Position mapped to backing coords; dimensions unchanged (same in both spaces).
+            let damage = Damage { x: damage_x, y: damage_y, width: w, height: h };
+            mks_trace!(
+                "DMABUF commit: in-place update. Damage rect (backing)={damage_x},{damage_y} {damage_w}x{damage_h}"
+            );
             (Some(damage), self.texture())
         };
         let gdk_planes = active
@@ -184,17 +199,12 @@ impl GpuPassthrough {
             .map(|&PlaneDesc { ref fd, stride, offset }| DmabufPlane { fd: fd.as_raw_fd(), stride, offset })
             .collect::<ArrayVec<_, MAX_PLANES>>();
 
-        // Convert ARGB -> XRGB to avoid compositing with transparent guest content.
-        let sanitized = sanitize_opaque_fourcc(active.fourcc).unwrap_or_else(|raw| {
-            mks_debug!("FourCC not in opaque-sanitization allowlist; keeping original format");
-            raw
-        });
-
         // Build Texture using backing dimensions (not crop dimensions) to satisfy EGL stride checks.
+        // Uses pre-sanitized FourCC from staging (cached to avoid repeated ARGB->XRGB conversion).
         self.texture = Some(build_dmabuf_texture_planar(
             active.backing_width,
             active.backing_height,
-            sanitized,
+            active.sanitized_fourcc,
             active.modifier,
             &gdk_planes,
             old_texture,
@@ -204,16 +214,11 @@ impl GpuPassthrough {
         Ok(true)
     }
 
-    /// Returns the current presentation texture, if available.
-    ///
-    /// Note: The texture dimensions match the backing buffer, not the visible viewport.
-    /// Use `crop_info()` to get the viewport region for proper UI rendering.
+    /// Presentation texture (backing buffer dimensions). Use [`crop_info()`] for viewport.
     #[inline]
     pub const fn texture(&self) -> Option<&Texture> { self.texture.as_ref() }
 
-    /// Returns the visible viewport (crop) information for UI rendering.
-    ///
-    /// UI must use this to clip and translate the backing texture when drawing.
+    /// Viewport (crop) info for UI clipping/translation.
     #[inline]
     pub fn crop_info(&self) -> Option<CropInfo> {
         self.active.as_ref().map(|a| CropInfo {
@@ -224,17 +229,11 @@ impl GpuPassthrough {
         })
     }
 
-    /// Returns the guest visible resolution (i.e., the crop dimensions).
+    /// Returns guest visible resolution: (width, height).
     ///
-    /// Use this for window/canvas size calculations.
+    /// Used for window/canvas size calculations.
     #[inline]
-    pub fn visible_resolution(&self) -> (u32, u32) {
+    pub fn resolution(&self) -> (u32, u32) {
         self.active.as_ref().map(|a| (a.crop_width.get(), a.crop_height.get())).unwrap_or_default()
     }
-
-    /// Returns the active frame resolution (visible viewport dimensions).
-    ///
-    /// This is an alias for `visible_resolution()` for backward compatibility.
-    #[inline]
-    pub fn resolution(&self) -> (u32, u32) { self.visible_resolution() }
 }

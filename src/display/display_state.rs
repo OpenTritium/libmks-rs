@@ -2,7 +2,7 @@
 use super::gpu_passthrough::GpuPassthrough;
 use crate::{
     dbus::listener::Event,
-    display::{Error, memmap::ImportedTexture, software_rasterizer::SoftwareRasterizer},
+    display::{BackendNotReady, Error, memmap::ImportedTexture, software_rasterizer::SoftwareRasterizer},
     mks_error, mks_trace,
 };
 use RenderBackend::*;
@@ -75,50 +75,19 @@ impl Default for CursorState {
 }
 
 impl CursorState {
-    /// Fast-path check for cursor image reuse.
-    ///
-    /// Compares metadata first, then validates a few key sample points to avoid
-    /// rebuilding the texture when the cursor payload is effectively unchanged.
     #[inline]
-    pub fn looks_same(
-        &self, width: NonZeroU32, height: NonZeroU32, hot_x: u32, hot_y: u32, new_data: &[u8], bytes_per_pixel: usize,
-    ) -> bool {
-        let bpp = bytes_per_pixel;
-        if unlikely(bpp == 0) {
-            return false;
-        }
-        let invalid_cond = self.hot_x != hot_x
+    pub fn looks_same(&self, width: NonZeroU32, height: NonZeroU32, hot_x: u32, hot_y: u32, new_data: &[u8]) -> bool {
+        if self.hot_x != hot_x
             || self.hot_y != hot_y
             || self.last_data.len() != new_data.len()
-            || self.texture.as_ref().map(|t| t.width()).unwrap_or(-1) != width.get() as i32
-            || self.texture.as_ref().map(|t| t.height()).unwrap_or(-1) != height.get() as i32;
-        if unlikely(invalid_cond) {
+            || self
+                .texture
+                .as_ref()
+                .is_none_or(|t| t.width() != width.get() as i32 || t.height() != height.get() as i32)
+        {
             return false;
         }
-        let w = width.get() as usize;
-        let h = height.get() as usize;
-        let stride = w * bpp;
-        if unlikely(w < 3 || h < 3) {
-            return self.last_data == new_data;
-        }
-        let points = [
-            0,
-            (w - 1) * bpp,
-            (h - 1) * stride,
-            (h - 1) * stride + (w - 1) * bpp,
-            (h / 2) * stride + (w / 2) * bpp,
-            (w / 2) * bpp,
-            (h - 1) * stride + (w / 2) * bpp,
-            (h / 2) * stride,
-            (h / 2) * stride + (w - 1) * bpp,
-        ];
-        for &offset in &points {
-            if offset + bpp <= new_data.len() && self.last_data[offset..offset + bpp] != new_data[offset..offset + bpp]
-            {
-                return false;
-            }
-        }
-        true
+        self.last_data == new_data
     }
 }
 
@@ -207,24 +176,19 @@ impl Screen {
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
                 self.y0_top = false;
-                mks_trace!(
-                    "Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
-                    data.len()
-                );
+                mks_trace!("Scanout: {width}x{height}, stride={stride}, pixman=0x{pixman_format:08x}, bytes={data:?}");
                 let (swapchain, _) = self.backend.ensure_software_rasterizer();
                 swapchain.full_update_texture(width, height, stride, pixman_format, data)?;
                 flags.frame = true;
             }
             Update { x, y, width, height, stride, pixman_format, data } => {
                 mks_trace!(
-                    "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, bytes={}",
-                    data.len()
+                    "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, \
+                     bytes={data:?}"
                 );
                 let (swapchain, new_created) = self.backend.ensure_software_rasterizer();
                 if unlikely(new_created) {
-                    // Ignore initial Update that arrives before Scanout (QEMU event ordering race)
-                    mks_trace!("Ignoring Update: Software backend not yet initialized");
-                    return Ok(flags);
+                    return Err(BackendNotReady::Software.into());
                 }
                 swapchain.partial_update_texture(x, y, width, height, stride, pixman_format, data)?;
                 flags.frame = true;
@@ -314,9 +278,7 @@ impl Screen {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
                 let (cache, new_created) = self.backend.ensure_direct_mapped();
                 if unlikely(new_created) {
-                    // Ignore initial UpdateMap that arrives before ScanoutMap (QEMU event ordering race)
-                    mks_trace!("Ignoring UpdateMap: DirectMapped backend not yet initialized");
-                    return Ok(flags);
+                    return Err(BackendNotReady::DirectMapped.into());
                 }
                 // Redraw the texture from the imported buffer
                 cache.redraw()?;
@@ -325,9 +287,7 @@ impl Screen {
             UpdateDmabuf { x, y, width, height } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
                 let GpuPassthrough(gpu) = &mut self.backend else {
-                    // Ignore initial UpdateDMABUF that arrives before ScanoutDMABUF* (QEMU event ordering race)
-                    mks_trace!("Ignoring UpdateDMABUF: GpuPassthrough not yet initialized");
-                    return Ok(flags);
+                    return Err(BackendNotReady::GpuPassthrough.into());
                 };
                 match gpu.commit_update(x, y, width, height) {
                     Ok(true) => flags.frame = true,
@@ -346,8 +306,7 @@ impl Screen {
                 }
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
-                // todo remove looks_same
-                if !self.cursor.looks_same(width, height, hot_x, hot_y, &data, 4) {
+                if !self.cursor.looks_same(width, height, hot_x, hot_y, &data) {
                     let data = Bytes::from_owned(data.0);
                     let texture = MemoryTexture::new(
                         width.get().try_into().unwrap(),

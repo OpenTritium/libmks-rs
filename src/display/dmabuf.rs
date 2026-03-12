@@ -2,22 +2,16 @@
 //!
 //! This module provides common functions used across different display backends
 //! for creating DMA-BUF file descriptors and building textures.
-use crate::display::{pixman_4cc::FourCC, udma::UdmabufCreate};
+use crate::display::pixman_4cc::FourCC;
 use relm4::gtk::{
     cairo::{RectangleInt, Region},
     gdk::{DmabufTextureBuilder, Texture},
     glib,
 };
-use rustix::{
-    fd::{AsFd, AsRawFd, OwnedFd, RawFd},
-    fs::{Mode, OFlags, open},
-    ioctl::ioctl,
-    param::page_size,
-};
+use rustix::{fd::RawFd, param::page_size};
 use std::{
     hint::unlikely,
-    io,
-    num::{NonZeroU32, NonZeroU64},
+    num::NonZeroU32,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -57,31 +51,6 @@ pub struct DmabufPlane {
     pub fd: RawFd,
     pub stride: NonZeroU32,
     pub offset: u32,
-}
-
-/// Creates a DMA-BUF file descriptor from a memfd region via `/dev/udmabuf`.
-///
-/// # Arguments
-/// * `memfd`: The source memory file descriptor (must implement `AsFd`).
-/// * `offset`: Start offset in bytes (must be page-aligned).
-/// * `size`: Size in bytes (must be page-aligned).
-///
-/// # Errors
-/// Returns `InvalidInput` if offset or size are not page-aligned.
-/// Returns OS errors if `/dev/udmabuf` cannot be opened or ioctl fails.
-#[inline]
-pub fn create_udmabuf_fd(memfd: &impl AsFd, offset: u64, size: NonZeroU64) -> io::Result<OwnedFd> {
-    let page_size = fetch_page_size() as u64;
-    let size_not_aligned = !offset.is_multiple_of(page_size) || !size.get().is_multiple_of(page_size);
-    if unlikely(size_not_aligned) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("udmabuf: offset and size must be page-aligned {page_size}"),
-        ));
-    }
-    let udmabuf_dev = open("/dev/udmabuf", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?;
-    let create_req = UdmabufCreate::new(memfd.as_fd().as_raw_fd(), offset, size);
-    unsafe { ioctl(&udmabuf_dev, create_req) }.map_err(io::Error::from)
 }
 
 /// Builds a `GdkTexture` from multi-plane DMA-BUF data.
@@ -127,11 +96,11 @@ mod tests {
 
     use super::*;
     use relm4::gtk::prelude::TextureExt;
-    use rustix::{
-        fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
-        io::Errno,
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
+    use std::{
+        os::fd::{AsRawFd, OwnedFd},
+        sync::Once,
     };
-    use std::sync::Once;
 
     // 静态初始化 GTK，确保在测试进程中只初始化一次
     static GTK_INIT: Once = Once::new();
@@ -162,39 +131,39 @@ mod tests {
         fd
     }
 
-    #[test]
-    fn test_create_udmabuf_fd_alignment_check() {
-        let size = NonZeroU64::new(4096).unwrap();
-        let memfd = create_valid_memfd(size.get());
+    // #[test]
+    // fn test_create_udmabuf_fd_alignment_check() {
+    //     let size = NonZeroU64::new(4096).unwrap();
+    //     let memfd = create_valid_memfd(size.get());
 
-        match create_udmabuf_fd(&memfd, 123, size) {
-            Ok(_) => panic!("Should fail due to misalignment"),
-            Err(e) => {
-                assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "Should catch alignment error in userspace");
-            }
-        }
-    }
+    //     match create_udmabuf_fd(&memfd, 123, size) {
+    //         Ok(_) => panic!("Should fail due to misalignment"),
+    //         Err(e) => {
+    //             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "Should catch alignment error in userspace");
+    //         }
+    //     }
+    // }
 
-    #[test]
-    fn test_create_udmabuf_fd_driver_integration() {
-        let size = NonZeroU64::new(4096).unwrap();
-        let memfd = create_valid_memfd(size.get());
+    // #[test]
+    // fn test_create_udmabuf_fd_driver_integration() {
+    //     let size = NonZeroU64::new(4096).unwrap();
+    //     let memfd = create_valid_memfd(size.get());
 
-        match create_udmabuf_fd(&memfd, 0, size) {
-            Ok(fd) => assert!(fd.as_raw_fd() > 0),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::InvalidInput {
-                    panic!("Valid arguments were rejected: {:?}", e);
-                }
-                match e.raw_os_error().map(Errno::from_raw_os_error) {
-                    Some(Errno::NOENT) | Some(Errno::ACCESS) | Some(Errno::PERM) => {
-                        println!("Skipping integration test: /dev/udmabuf not available/accessible");
-                    }
-                    _ => panic!("Unexpected kernel error: {:?}", e),
-                }
-            }
-        }
-    }
+    //     match create_udmabuf_fd(&memfd, 0, size) {
+    //         Ok(fd) => assert!(fd.as_raw_fd() > 0),
+    //         Err(e) => {
+    //             if e.kind() == io::ErrorKind::InvalidInput {
+    //                 panic!("Valid arguments were rejected: {:?}", e);
+    //             }
+    //             match e.raw_os_error().map(Errno::from_raw_os_error) {
+    //                 Some(Errno::NOENT) | Some(Errno::ACCESS) | Some(Errno::PERM) => {
+    //                     println!("Skipping integration test: /dev/udmabuf not available/accessible");
+    //                 }
+    //                 _ => panic!("Unexpected kernel error: {:?}", e),
+    //             }
+    //         }
+    //     }
+    // }
 
     #[test]
     fn test_build_dmabuf_texture_planar_logic() {
