@@ -1,5 +1,5 @@
 //! Screen and cursor state model.
-use super::gpu_passthrough::GpuPassthrough;
+use super::{crop::CropInfo, gpu_passthrough::GpuPassthrough};
 use crate::{
     dbus::listener::Event,
     display::{BackendNotReady, Error, memmap::ImportedTexture, software_rasterizer::SoftwareRasterizer},
@@ -146,12 +146,33 @@ impl RenderBackend {
         }
     }
 
+    /// Viewport geometry: (x, y) offset within backing buffer, (width, height) visible area.
+    ///
+    /// - GPU: returns crop info with potential x/y offset.
+    /// - Software/DirectMapped: returns (0, 0, width, height).
+    #[inline]
+    pub fn crop_info(&self) -> Option<CropInfo> {
+        let result: Option<CropInfo> = match self {
+            Self::GpuPassthrough(gpu) => gpu.crop_info(),
+            Self::SoftwareRasterizer(sw) => {
+                let (w, h) = sw.resolution();
+                (w > 0 && h > 0).then(|| CropInfo { x: 0., y: 0., width: w as f32, height: h as f32 })
+            }
+            Self::DirectMapped(map) => {
+                let (w, h) = map.resolution();
+                (w > 0 && h > 0).then(|| CropInfo { x: 0., y: 0., width: w as f32, height: h as f32 })
+            }
+            Self::None => Option::None,
+        };
+        result
+    }
+
     /// Returns current resolution as `(width, height)`.
     #[inline]
     pub fn resolution(&self) -> (u32, u32) {
         match self {
             Self::SoftwareRasterizer(sw) => sw.resolution(),
-            Self::GpuPassthrough(gpu) => gpu.resolution(),
+            Self::GpuPassthrough(gpu) => gpu.visible_resolution(),
             Self::DirectMapped(cache) => cache.resolution(),
             Self::None => (0, 0),
         }
@@ -350,4 +371,14 @@ impl Screen {
     /// Returns current resolution as `(width, height)`.
     #[inline]
     pub fn resolution(&self) -> (u32, u32) { self.backend.resolution() }
+
+    /// Viewport geometry: (x, y) offset within backing, (width, height) visible area.
+    #[inline]
+    pub fn crop_info(&self) -> Option<CropInfo> { self.backend.crop_info() }
+
+    /// Guest logical resolution: (width, height).
+    #[inline]
+    pub fn logical_resolution(&self) -> (u32, u32) {
+        self.crop_info().map(|c| (c.width as u32, c.height as u32)).unwrap_or_default()
+    }
 }

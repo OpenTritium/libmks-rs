@@ -10,3 +10,8 @@ pub struct CropInfo {
     /// Height of visible viewport
     pub height: f32,
 }
+
+impl CropInfo {
+    #[inline]
+    pub const fn from_width_height(w: f32, h: f32) -> Self { Self { x: 0., y: 0., width: w, height: h } }
+}

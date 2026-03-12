@@ -229,11 +229,11 @@ impl GpuPassthrough {
         })
     }
 
-    /// Returns guest visible resolution: (width, height).
-    ///
-    /// Used for window/canvas size calculations.
+    /// Guest visible resolution: (width, height). Alias for crop_info dimensions.
     #[inline]
-    pub fn resolution(&self) -> (u32, u32) {
-        self.active.as_ref().map(|a| (a.crop_width.get(), a.crop_height.get())).unwrap_or_default()
-    }
+    pub fn visible_resolution(&self) -> (u32, u32) { self.crop_info().map(|c| (c.width as u32, c.height as u32)).unwrap_or_default() }
+
+    /// Alias for [`visible_resolution()`].
+    #[inline]
+    pub fn resolution(&self) -> (u32, u32) { self.visible_resolution() }
 }

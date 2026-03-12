@@ -564,7 +564,7 @@ impl Component for VmDisplayModel {
 
             Qemu(event) => match self.screen.handle_event(event) {
                 Ok(flags) => {
-                    let (w, h) = self.screen.resolution();
+                    let (w, h) = self.screen.logical_resolution();
                     self.coord_system.set_vm_resolution(w, h);
                     self.dirty_flags.merge(flags);
                 }
