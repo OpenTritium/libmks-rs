@@ -838,6 +838,7 @@ impl Component for VmDisplayModel {
         self.update(message, sender, root);
         if was_forwarding_input && !self.capture_state.should_forward() {
             self.input.release_all_keys();
+            self.input.release_all_mouse_buttons();
         }
         let dirty_flags = mem::take(&mut self.dirty_flags);
         self.render_view(widgets, dirty_flags);

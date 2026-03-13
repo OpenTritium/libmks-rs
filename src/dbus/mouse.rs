@@ -24,7 +24,7 @@ pub trait Mouse {
 }
 
 /// QEMU D-Bus mouse button identifiers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Type)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize_repr, Type)]
 #[repr(u32)]
 pub enum Button {
     Left = 0,

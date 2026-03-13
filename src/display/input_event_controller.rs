@@ -49,6 +49,8 @@ pub struct InputHandler {
     pub is_absolute: bool,
     #[builder(default = HashSet::with_capacity(8))]
     held_keys: HashSet<Qnum>,
+    #[builder(default = HashSet::with_capacity(2))]
+    held_buttons: HashSet<Button>,
 }
 
 impl InputHandler {
@@ -252,7 +254,33 @@ impl InputHandler {
         }
     }
 
-    pub fn press_mouse_button(&self, button: u32, transition: PressAction) {
+    /// Releases all tracked mouse buttons to prevent stuck buttons when capture is dropped.
+    pub fn release_all_mouse_buttons(&mut self) {
+        if !self.capability.mouse {
+            self.held_buttons.clear();
+            mks_debug!("Mouse capability disabled; clearing tracked buttons");
+            return;
+        }
+        let Some(tx) = &self.input_cmd_tx else {
+            mks_error!("Input command channel unavailable; cannot release tracked buttons");
+            return;
+        };
+        for btn in self.held_buttons.drain() {
+            let result = tx.try_send(MouseRelease(btn));
+            match result {
+                Err(e) => mks_error!(error:? = e; "Failed to release tracked button {btn:?} during capture reset"),
+                Ok(false) => {
+                    mks_warn!(
+                        "Dropped tracked button release for {btn:?} during capture reset because input command \
+                         channel was full"
+                    )
+                }
+                Ok(true) => (),
+            }
+        }
+    }
+
+    pub fn press_mouse_button(&mut self, button: u32, transition: PressAction) {
         if !self.capability.mouse {
             mks_error!("Mouse capability disabled; ignoring mouse button event");
             return;
@@ -261,6 +289,15 @@ impl InputHandler {
             mks_error!("Ignoring unmapped mouse button {button}");
             return;
         };
+        // Track pressed buttons for release-on-leave
+        match transition {
+            PressAction::Press => {
+                self.held_buttons.insert(btn);
+            }
+            PressAction::Release => {
+                self.held_buttons.remove(&btn);
+            }
+        }
         let Some(tx) = &self.input_cmd_tx else {
             mks_error!("Input command channel unavailable; dropping mouse button event");
             return;
