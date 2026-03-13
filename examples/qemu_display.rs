@@ -75,14 +75,18 @@ enum AppMsg {
     GuestMouseModeChanged {
         is_absolute: bool,
     },
-    Connected {
-        resources: AppResources,
-        console_ctrl: ConsoleController,
-        input_handler: InputHandler,
-        input_state_rx: kanal::AsyncReceiver<InputStateEvent>,
-        event_rx: kanal::AsyncReceiver<QemuEvent>,
-    },
+    Connected(Box<ConnectedData>),
     ConnectFailed(String),
+}
+
+/// Data passed when successfully connected to QEMU.
+/// Wrapped in Box to avoid large enum size warning.
+struct ConnectedData {
+    resources: AppResources,
+    console_ctrl: ConsoleController,
+    input_handler: InputHandler,
+    input_state_rx: kanal::AsyncReceiver<InputStateEvent>,
+    event_rx: kanal::AsyncReceiver<QemuEvent>,
 }
 
 impl std::fmt::Debug for AppMsg {
@@ -94,7 +98,7 @@ impl std::fmt::Debug for AppMsg {
             Self::GuestMouseModeChanged { is_absolute } => {
                 f.debug_struct("GuestMouseModeChanged").field("is_absolute", is_absolute).finish()
             }
-            Self::Connected { .. } => write!(f, "Connected {{ ... }}"),
+            Self::Connected(_) => write!(f, "Connected(...)"),
             Self::ConnectFailed(arg0) => f.debug_tuple("ConnectFailed").field(arg0).finish(),
         }
     }
@@ -206,13 +210,13 @@ impl SimpleComponent for AppModel {
                 Ok((resources, console_ctrl, input_handler, input_state_rx, event_rx)) => {
                     info!("[BACKGROUND] Connection successful, sending message to UI...");
                     // Note: resources now contains console_session to keep background tasks alive
-                    sender_clone.input(AppMsg::Connected {
+                    sender_clone.input(AppMsg::Connected(Box::new(ConnectedData {
                         resources,
                         console_ctrl,
                         input_handler,
                         input_state_rx,
                         event_rx,
-                    });
+                    })));
                 }
                 Err(e) => {
                     error!("[BACKGROUND] Connection failed: {}", e);
@@ -294,18 +298,18 @@ impl SimpleComponent for AppModel {
                     display.emit(VmDisplayMsg::MouseModeChanged { is_absolute });
                 }
             }
-            AppMsg::Connected { resources, console_ctrl, input_handler, input_state_rx, event_rx } => {
+            AppMsg::Connected(data) => {
                 info!("[UPDATE] Connected message received, setting up display...");
 
                 // 1. Store resources to keep D-Bus connections alive
-                self.resources = Some(resources);
+                self.resources = Some(data.resources);
 
                 // 2. Launch VmDisplayModel
                 let display_controller = VmDisplayModel::builder()
                     .launch(VmDisplayInit {
-                        rx: event_rx,
-                        console_ctrl,
-                        input_handler,
+                        rx: data.event_rx,
+                        console_ctrl: data.console_ctrl,
+                        input_handler: data.input_handler,
                         grab_shortcut: GrabShortcut::default(),
                     })
                     .forward(sender.input_sender(), |_| AppMsg::Ignore);
@@ -313,6 +317,7 @@ impl SimpleComponent for AppModel {
                 // 3. Listen to input state events and forward to UI
                 {
                     let app_sender = sender.input_sender().clone();
+                    let input_state_rx = data.input_state_rx;
                     relm4::spawn_local(async move {
                         while let Ok(event) = input_state_rx.recv().await {
                             if let InputStateEvent::MouseIsAbsolute(is_abs) = event {
