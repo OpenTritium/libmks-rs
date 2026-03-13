@@ -1,3 +1,4 @@
+#![feature(likely_unlikely)]
 pub mod dbus;
 pub mod display;
 pub mod error;

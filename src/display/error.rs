@@ -4,12 +4,46 @@ use thiserror::Error;
 pub enum Error {
     #[error("System call failed: {0}")]
     System(#[from] rustix::io::Errno),
-    #[error("I/O operation failed: {0}")]
+
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("Failed to create GDK texture: {0}")]
     Texture(#[from] relm4::gtk::glib::Error),
-    #[error("Unsupported Pixman format: {0}")]
-    InvalidFormat(#[from] super::pixman_4cc::UnknownPixmanFormat),
-    #[error("Invalid state: {0}")]
-    State(&'static str),
+
+    /// Returned when the guest sends a DRM FourCC format that has no GDK MemoryFormat mapping.
+    #[error("Unsupported DRM FourCC format (no GDK MemoryFormat mapping): {0}")]
+    InvalidFormat(#[from] super::pixman_4cc::UnknownFourccFormat),
+
+    /// Returned when converting from Pixman format to DRM FourCC fails.
+    #[error("Unsupported Pixman format (no DRM FourCC mapping): {0}")]
+    UnknownPixman(#[from] super::pixman_4cc::UnknownPixmanFormat),
+
+    /// mmap() returned null or the mapping was otherwise invalid.
+    #[error("Invalid memory mapping (mmap failed or returned null)")]
+    InvalidMapping,
+
+    /// Attempted to redraw() without any buffer staged via import().
+    #[error("No buffer staged (call import() first)")]
+    NoStagedBuffer,
+
+    #[error("Partial update pixman format does not match staged surface")]
+    PartialUpdatePixmanNotMatch,
+
+    #[error("Partial update coordinates are outside surface bounds")]
+    PartialUpdateOffScreen,
+
+    /// Event arrived before backend was initialized (race condition from QEMU event ordering).
+    #[error("Backend not ready: {0}")]
+    BackendNotReady(#[from] BackendNotReady),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BackendNotReady {
+    #[error("Software")]
+    Software,
+    #[error("DirectMapped")]
+    DirectMapped,
+    #[error("GpuPassthrough")]
+    GpuPassthrough,
 }

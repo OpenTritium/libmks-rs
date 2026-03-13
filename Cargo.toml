@@ -8,6 +8,7 @@ license = "LGPL-2.1-or-later"
 
 [dependencies]
 anyhow = "1"
+arrayvec = "0.7"
 bitflags = { version = "2", features = ["serde"] }
 derive_more = { version = "2", features = ["full"] }
 env_logger = "0.11"
@@ -15,7 +16,7 @@ fastrace = { version = "0.7", features = ["enable"] }
 futures-util = "0.3"
 kanal = "0.1.1"
 log = { version = "0.4", features = ["kv_unstable"] }
-relm4 = { version = "0.10.1", features = ["gnome_48"] }
+relm4 = { version = "0.10.1", features = ["gnome_48","libadwaita"] }
 rustix = { version = "1.1", features = [
   "fs",
   "io_uring",

@@ -1,14 +1,16 @@
 //! <https://wayland.app/protocols/pointer-constraints-unstable-v1>
-use crate::{display::input_daemon::InputCommand, mks_debug, mks_error, mks_info};
+use crate::{display::input_event_bus::InputCommand, mks_debug, mks_error, mks_info, mks_warn};
 use gdk4_wayland::{
     WaylandDisplay,
-    gdk::Rectangle,
+    gdk::Display,
+    glib::{ControlFlow, IOCondition, SourceId, unix_fd_add_local},
+    prelude::*,
     wayland_client::{
         Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
         protocol::{
-            wl_compositor::{self, WlCompositor},
-            wl_pointer::{self, WlPointer},
-            wl_region::{self, WlRegion},
+            wl_compositor::WlCompositor,
+            wl_pointer::WlPointer,
+            wl_region::WlRegion,
             wl_registry::{self, WlRegistry},
             wl_seat::{self, Capability, WlSeat},
             wl_surface::WlSurface,
@@ -19,47 +21,50 @@ use kanal::Sender;
 use std::{
     cell::RefCell,
     mem,
-    ops::DerefMut,
     os::unix::io::{AsFd, RawFd},
     rc::Rc,
 };
-// use wayland_client::{
-//     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
-//     protocol::{
-//         wl_compositor::{self, WlCompositor},
-//         wl_pointer::{self, WlPointer},
-//         wl_region::{self, WlRegion},
-//         wl_registry::{self, WlRegistry},
-//         wl_seat::{self, Capability, WlSeat},
-//         wl_surface::WlSurface,
-//     },
-// };
 use wayland_protocols::wp::{
     pointer_constraints::zv1::client::{
-        zwp_confined_pointer_v1::{self, ZwpConfinedPointerV1},
-        zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
-        zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
+        zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
     },
     relative_pointer::zv1::client::{
-        zwp_relative_pointer_manager_v1::{self, ZwpRelativePointerManagerV1},
+        zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
     },
 };
 
 const LOG_TARGET: &str = "mks.display.wayland";
 
-#[derive(Default)]
 pub struct WaylandState {
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
     compositor: Option<WlCompositor>,
-    seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     pointer_capture: PointerCapture,
-    input_tx: Option<Sender<InputCommand>>,
+    input_tx: Sender<InputCommand>,
+    rel_x_residue: f64,
+    rel_y_residue: f64,
 }
 
-#[derive(Default)]
+impl WaylandState {
+    fn new(input_tx: Sender<InputCommand>) -> Self {
+        Self {
+            pointer_constraints: None,
+            relative_pointer_manager: None,
+            compositor: None,
+            pointer: None,
+            pointer_capture: PointerCapture::None,
+            input_tx,
+            rel_x_residue: 0.,
+            rel_y_residue: 0.,
+        }
+    }
+}
+
+#[derive(Default, PartialEq)]
 enum PointerCapture {
     #[default]
     None,
@@ -72,9 +77,9 @@ enum PointerCapture {
 
 pub struct WaylandConfine {
     conn: Connection,
-    event_queue: RefCell<EventQueue<WaylandState>>,
-    qh: QueueHandle<WaylandState>,
-    state: Rc<RefCell<WaylandState>>,
+    queue: EventQueue<WaylandState>,
+    handle: QueueHandle<WaylandState>,
+    state: WaylandState,
 }
 
 impl WaylandConfine {
@@ -83,21 +88,15 @@ impl WaylandConfine {
         let wl_display = gdk_display.wl_display().expect("Failed to get WlDisplay");
         let backend = wl_display.backend().upgrade().expect("Wayland connection is dead");
         let conn = Connection::from_backend(backend);
-        let mut event_queue = conn.new_event_queue();
-        let qh = event_queue.handle();
-        let state = Rc::new(RefCell::new(WaylandState::default()));
-        state.borrow_mut().input_tx = Some(input_tx);
+        let mut queue = conn.new_event_queue();
+        let handle = queue.handle();
+        let mut state = WaylandState::new(input_tx);
         let display_proxy = conn.display();
-        let _registry = display_proxy.get_registry(&qh, ());
-        // Wait for globals so we can bind seat and pointer-constraints interfaces.
-        if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
+        let _registry = display_proxy.get_registry(&handle, ());
+        if let Err(e) = queue.roundtrip(&mut state) {
             mks_error!(error:? = e; "Wayland registry roundtrip failed");
         }
-        // Wait for seat capabilities so we can request wl_pointer.
-        if let Err(e) = event_queue.roundtrip(&mut *state.borrow_mut()) {
-            mks_error!(error:? = e; "Wayland seat capability roundtrip failed");
-        }
-        Self { conn, event_queue: RefCell::new(event_queue), qh, state }
+        Self { conn, queue, handle, state }
     }
 
     /// Constrains the pointer to `rect` on the target surface.
@@ -106,82 +105,82 @@ impl WaylandConfine {
     ///
     /// When `prefer_relative` is true, this requires native relative-pointer protocol.
     /// Otherwise use region confinement for absolute guest mouse mode.
-    pub fn confine_pointer(&self, surface: &WlSurface, rect: &Rectangle, prefer_relative: bool) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(constraints) = state.pointer_constraints.as_ref() else {
+    pub fn confine_pointer(
+        &mut self, surface: &WlSurface, (x, y, w, h): (u32, u32, u32, u32), prefer_relative: bool,
+    ) -> bool {
+        if self.state.pointer_capture != PointerCapture::None {
+            mks_warn!("Pointer capture already active; ignoring duplicate confine request");
+            return false;
+        }
+        // Start each capture session from a clean relative-motion residue state.
+        self.state.rel_x_residue = 0.;
+        self.state.rel_y_residue = 0.;
+        let Some(constraints) = self.state.pointer_constraints.as_ref() else {
             mks_error!("Wayland pointer-constraints protocol unavailable; cannot confine pointer");
             return false;
         };
-        let Some(pointer) = state.pointer.as_ref() else {
+        let Some(pointer) = self.state.pointer.as_ref() else {
             mks_error!("Wayland pointer unavailable; cannot confine pointer");
             return false;
         };
-        if !matches!(state.pointer_capture, PointerCapture::None) {
-            mks_error!("Pointer capture already active; ignoring duplicate confine request");
-            return false;
-        }
-
         if prefer_relative {
-            let Some(relative_manager) = state.relative_pointer_manager.as_ref() else {
+            let Some(relative_manager) = self.state.relative_pointer_manager.as_ref() else {
                 mks_error!("Relative pointer protocol unavailable; cannot enable relative capture");
                 return false;
             };
-            let relative = relative_manager.get_relative_pointer(pointer, &self.qh, ());
-            let locked = constraints.lock_pointer(surface, pointer, None, Lifetime::Persistent, &self.qh, ());
-            state.pointer_capture = PointerCapture::LockedRelative { locked, relative };
+            let relative = relative_manager.get_relative_pointer(pointer, &self.handle, ());
+            let locked = constraints.lock_pointer(surface, pointer, None, Lifetime::Persistent, &self.handle, ());
+            self.state.pointer_capture = PointerCapture::LockedRelative { locked, relative };
             mks_info!("Pointer locked with native relative motion enabled");
         } else {
             // Absolute guest mode path.
-            let Some(compositor) = state.compositor.as_ref() else {
+            let Some(compositor) = self.state.compositor.as_ref() else {
                 mks_error!("Wayland compositor unavailable; cannot confine pointer in absolute mode");
                 return false;
             };
-            let region = compositor.create_region(&self.qh, ());
-            region.add(rect.x(), rect.y(), rect.width(), rect.height());
+            let region = compositor.create_region(&self.handle, ());
+            region.add(x.try_into().unwrap(), y.try_into().unwrap(), w.try_into().unwrap(), h.try_into().unwrap());
             let confined =
-                constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.qh, ());
+                constraints.confine_pointer(surface, pointer, Some(&region), Lifetime::Persistent, &self.handle, ());
             region.destroy();
-            state.pointer_capture = PointerCapture::Confined(confined);
+            self.state.pointer_capture = PointerCapture::Confined(confined);
             mks_info!("Pointer confined to region for absolute guest mouse mode");
         }
-        drop(state);
         if let Err(e) = self.conn.flush() {
             mks_error!(error:? = e; "Failed to flush Wayland connection");
         }
         true
     }
 
-    pub fn unconfine(&self) {
-        let mut state = self.state.borrow_mut();
+    pub fn unconfine(&mut self) {
+        use PointerCapture::*;
         let mut released = false;
-        match mem::take(&mut state.pointer_capture) {
-            PointerCapture::LockedRelative { locked, relative } => {
+        match mem::take(&mut self.state.pointer_capture) {
+            LockedRelative { locked, relative } => {
                 relative.destroy();
                 locked.destroy();
                 mks_info!("Released pointer lock");
                 released = true;
             }
-            PointerCapture::Confined(confined) => {
+            Confined(confined) => {
                 confined.destroy();
                 mks_info!("Released pointer confinement");
                 released = true;
             }
-            PointerCapture::None => {}
+            None => {}
         }
-
-        if released {
-            if let Err(e) = self.conn.flush() {
-                mks_error!(error:? = e; "Failed to flush Wayland connection");
-            }
-        } else {
+        if !released {
             mks_error!("Pointer capture is not active; nothing to release");
+            return;
+        }
+        if let Err(e) = self.conn.flush() {
+            mks_error!(error:? = e; "Failed to flush Wayland connection");
         }
     }
 
     #[inline]
-    pub fn dispatch_pending(&self) {
-        let mut state = self.state.borrow_mut();
-        if let Err(e) = self.event_queue.borrow_mut().dispatch_pending(state.deref_mut()) {
+    pub fn dispatch_pending(&mut self) {
+        if let Err(e) = self.queue.dispatch_pending(&mut self.state) {
             mks_error!(error:? = e; "Failed to dispatch pending Wayland events");
         }
         if let Err(e) = self.conn.flush() {
@@ -211,7 +210,7 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                     state.relative_pointer_manager = Some(registry.bind(name, 1, qh, ()));
                 }
                 "wl_seat" => {
-                    state.seat = Some(registry.bind(name, 1, qh, ()));
+                    let _seat: WlSeat = registry.bind(name, 1, qh, ());
                 }
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind(name, 1, qh, ()));
@@ -237,40 +236,12 @@ impl Dispatch<WlSeat, ()> for WaylandState {
     }
 }
 
-impl Dispatch<ZwpConfinedPointerV1, ()> for WaylandState {
-    fn event(
-        _: &mut Self, _: &ZwpConfinedPointerV1, event: zwp_confined_pointer_v1::Event, _: &(), _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_confined_pointer_v1::Event::Confined => mks_debug!("Received pointer confined event"),
-            zwp_confined_pointer_v1::Event::Unconfined => {
-                mks_debug!("Received pointer unconfined event")
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Dispatch<ZwpLockedPointerV1, ()> for WaylandState {
-    fn event(
-        _: &mut Self, _: &ZwpLockedPointerV1, event: zwp_locked_pointer_v1::Event, _: &(), _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwp_locked_pointer_v1::Event::Locked => mks_debug!("Received pointer locked event"),
-            zwp_locked_pointer_v1::Event::Unlocked => mks_debug!("Received pointer unlocked event"),
-            _ => {}
-        }
-    }
-}
-
 impl Dispatch<ZwpRelativePointerV1, ()> for WaylandState {
     fn event(
         state: &mut Self, _: &ZwpRelativePointerV1, event: zwp_relative_pointer_v1::Event, _: &(), _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion {
+        let zwp_relative_pointer_v1::Event::RelativeMotion {
             utime_hi: _,
             utime_lo: _,
             dx,
@@ -278,57 +249,75 @@ impl Dispatch<ZwpRelativePointerV1, ()> for WaylandState {
             dx_unaccel: _,
             dy_unaccel: _,
         } = event
+        else {
+            return;
+        };
+        state.rel_x_residue += dx;
+        state.rel_y_residue += dy;
+        let step_x = state.rel_x_residue.trunc() as i32;
+        let step_y = state.rel_y_residue.trunc() as i32;
+        state.rel_x_residue -= step_x as f64;
+        state.rel_y_residue -= step_y as f64;
+        if (step_x != 0 || step_y != 0)
+            && let Err(e) = state.input_tx.try_send(InputCommand::MouseRel(step_x, step_y))
         {
-            #[inline]
-            fn quantize_realtime_delta(delta: f64) -> i32 {
-                if !delta.is_finite() || delta == 0.0 {
-                    return 0;
-                }
-                let rounded = delta.round();
-                if rounded == 0.0 {
-                    // Preserve tiny non-zero deltas instead of accumulating/skipping them.
-                    delta.signum() as i32
-                } else {
-                    rounded as i32
-                }
-            }
-            let step_x = quantize_realtime_delta(dx);
-            let step_y = quantize_realtime_delta(dy);
-
-            if (step_x != 0 || step_y != 0)
-                && let Some(tx) = state.input_tx.as_ref()
-                && let Err(e) = tx.send(InputCommand::MouseRel(step_x, step_y))
-            {
-                mks_error!(error:? = e; "Failed to forward native relative motion; dropping event");
-            }
+            mks_error!(error:? = e; "Failed to forward native relative motion; dropping event");
         }
     }
 }
 
-impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for WaylandState {
-    fn event(
-        _: &mut Self, _: &ZwpPointerConstraintsV1, _: zwp_pointer_constraints_v1::Event, _: &(), _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
+macro_rules! empty_dispatch {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl Dispatch<$ty, ()> for WaylandState {
+                #[inline]
+                fn event(
+                    _: &mut Self, _: &$ty, _: <$ty as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>,
+                ) {
+                }
+            }
+        )*
+    };
+}
+
+empty_dispatch!(
+    ZwpPointerConstraintsV1,
+    ZwpRelativePointerManagerV1,
+    ZwpConfinedPointerV1,
+    ZwpLockedPointerV1,
+    WlPointer,
+    WlCompositor,
+    WlRegion,
+);
+
+pub struct ConfineState {
+    pub wayland_confine: Rc<RefCell<WaylandConfine>>,
+    pub poll_source: Option<SourceId>,
+}
+
+impl ConfineState {
+    pub fn connect_to_wayland(input_tx: kanal::Sender<InputCommand>) -> Option<Self> {
+        let display = Display::default()?;
+        let wl_display = display.downcast::<WaylandDisplay>().ok()?;
+        mks_info!("Wayland session detected; enabling pointer-confinement support");
+        let confine = WaylandConfine::from_gdk(&wl_display, input_tx);
+        let confine = Rc::new(RefCell::new(confine));
+        let fd = confine.borrow().get_conn_raw_fd();
+        let confine_clone = confine.clone();
+        let poll_source = unix_fd_add_local(fd, IOCondition::IN, move |_fd, _condition| {
+            confine_clone.borrow_mut().dispatch_pending();
+            ControlFlow::Continue
+        });
+        mks_debug!("Attached Wayland FD monitor to GLib main context");
+        Some(Self { wayland_confine: confine, poll_source: Some(poll_source) })
     }
 }
 
-impl Dispatch<ZwpRelativePointerManagerV1, ()> for WaylandState {
-    fn event(
-        _: &mut Self, _: &ZwpRelativePointerManagerV1, _: zwp_relative_pointer_manager_v1::Event, _: &(),
-        _: &Connection, _: &QueueHandle<Self>,
-    ) {
+impl Drop for ConfineState {
+    fn drop(&mut self) {
+        if let Some(source) = self.poll_source.take() {
+            source.remove();
+        }
+        self.wayland_confine.borrow_mut().unconfine();
     }
-}
-
-impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
-    fn event(_: &mut Self, _: &WlPointer, _: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-
-impl Dispatch<WlCompositor, ()> for WaylandState {
-    fn event(_: &mut Self, _: &WlCompositor, _: wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-
-impl Dispatch<WlRegion, ()> for WaylandState {
-    fn event(_: &mut Self, _: &WlRegion, _: wl_region::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }

@@ -5,34 +5,49 @@ use thiserror::Error;
 pub enum MksError {
     #[error("D-Bus error: {0}")]
     Dbus(#[from] zbus::Error),
+
     #[error("D-Bus method call failed: {0}")]
     DbusMethod(Cow<'static, str>),
-    #[error("D-Bus connection error: {0}")]
+
+    #[error("D-Bus connection failed: {0}")]
     DbusConnection(Cow<'static, str>),
+
     #[error("Serialization error: {0}")]
     Zvariant(#[from] zvariant::Error),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Display error: {0}")]
+
+    #[error("Display server error: {0}")]
     Display(Cow<'static, str>),
-    #[error("Input error: {0}")]
+
+    #[error("Input subsystem error: {0}")]
     Input(Cow<'static, str>),
+
     #[error("Keyboard error: {0}")]
     KeyboardError(Cow<'static, str>),
-    #[error("Mouse error: {0}")]
+
+    #[error("Mouse/pointer error: {0}")]
     MouseError(Cow<'static, str>),
-    #[error("Screen error: {0}")]
+
+    #[error("Screen management error: {0}")]
     ScreenError(Cow<'static, str>),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(Cow<'static, str>),
-    #[error("Protocol error: {0}")]
+
+    #[error("Protocol violation: {0}")]
     Protocol(Cow<'static, str>),
-    #[error("Device not found")]
+
+    #[error("Required device not found")]
     DeviceNotFound,
-    #[error("Device was disabled")]
+
+    #[error("Device was disabled by the guest")]
     DeviceWasDisabled,
-    #[error("No screen available")]
+
+    #[error("No display screen available (QEMU display not initialized)")]
     NoScreenAvailable,
-    #[error("Channel communication error: {0}")]
+
+    #[error("Async channel send failed: {0}")]
     KanalSend(#[from] kanal::SendError),
 }

@@ -35,14 +35,19 @@ use libmks_rs::{
         vm,
     },
     display::{
-        input_daemon::{InputBusSetup, InputDaemon, InputStateEvent},
-        input_handler::InputHandler,
-        vm_display::{GrabShortcut, InputMode, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
+        input_event_bus::{InputBusSetup, InputDaemon, InputStateEvent},
+        input_event_controller::InputHandler,
+        vm_display::{
+            GrabShortcut, Message as VmDisplayMsg, PointerPolicy, ScalingMode, VmDisplayInit, VmDisplayModel,
+        },
     },
 };
 use log::{error, info, warn};
 use relm4::{Controller, gtk::prelude::*, prelude::*};
-use std::path::PathBuf;
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
+};
 
 /// Must hold these connections for the lifetime of the application
 struct AppResources {
@@ -61,25 +66,27 @@ struct AppModel {
     resources: Option<AppResources>,
     main_container: gtk::Overlay,
     scaling_mode: ScalingMode,
-    input_mode: InputMode,
+    input_mode: PointerPolicy,
     guest_mouse_is_absolute: Option<bool>,
 }
 
 enum AppMsg {
     Ignore,
     SetScalingMode(ScalingMode),
-    SetInputMode(InputMode),
-    GuestMouseModeChanged {
-        is_absolute: bool,
-    },
-    Connected {
-        resources: AppResources,
-        console_ctrl: ConsoleController,
-        input_handler: InputHandler,
-        input_state_rx: kanal::AsyncReceiver<InputStateEvent>,
-        event_rx: kanal::AsyncReceiver<QemuEvent>,
-    },
+    SetInputMode(PointerPolicy),
+    GuestMouseModeChanged { is_absolute: bool },
+    Connected(Box<ConnectedData>),
     ConnectFailed(String),
+}
+
+/// Data passed when successfully connected to QEMU.
+/// Wrapped in Box to avoid large enum size warning.
+struct ConnectedData {
+    resources: AppResources,
+    console_ctrl: ConsoleController,
+    input_handler: InputHandler,
+    input_state_rx: kanal::AsyncReceiver<InputStateEvent>,
+    event_rx: kanal::AsyncReceiver<QemuEvent>,
 }
 
 impl std::fmt::Debug for AppMsg {
@@ -91,7 +98,7 @@ impl std::fmt::Debug for AppMsg {
             Self::GuestMouseModeChanged { is_absolute } => {
                 f.debug_struct("GuestMouseModeChanged").field("is_absolute", is_absolute).finish()
             }
-            Self::Connected { .. } => write!(f, "Connected {{ ... }}"),
+            Self::Connected(_) => write!(f, "Connected(...)"),
             Self::ConnectFailed(arg0) => f.debug_tuple("ConnectFailed").field(arg0).finish(),
         }
     }
@@ -148,8 +155,8 @@ impl SimpleComponent for AppModel {
                         ])),
                         #[watch]
                         set_selected: match model.input_mode {
-                            InputMode::Seamless => 0,
-                            InputMode::Confined => 1,
+                            PointerPolicy::Auto => 0,
+                            PointerPolicy::Locked => 1,
                         },
 
                         #[watch]
@@ -203,13 +210,13 @@ impl SimpleComponent for AppModel {
                 Ok((resources, console_ctrl, input_handler, input_state_rx, event_rx)) => {
                     info!("[BACKGROUND] Connection successful, sending message to UI...");
                     // Note: resources now contains console_session to keep background tasks alive
-                    sender_clone.input(AppMsg::Connected {
+                    sender_clone.input(AppMsg::Connected(Box::new(ConnectedData {
                         resources,
                         console_ctrl,
                         input_handler,
                         input_state_rx,
                         event_rx,
-                    });
+                    })));
                 }
                 Err(e) => {
                     error!("[BACKGROUND] Connection failed: {}", e);
@@ -224,7 +231,7 @@ impl SimpleComponent for AppModel {
             resources: None,
             main_container: main_container.clone(),
             scaling_mode: ScalingMode::ResizeGuest,
-            input_mode: InputMode::Seamless,
+            input_mode: PointerPolicy::Auto,
             guest_mouse_is_absolute: None,
         };
         let widgets = view_output!();
@@ -242,8 +249,8 @@ impl SimpleComponent for AppModel {
         let sender_clone = sender.clone();
         widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
-                0 => InputMode::Seamless,
-                1 => InputMode::Confined,
+                0 => PointerPolicy::Auto,
+                1 => PointerPolicy::Locked,
                 _ => return,
             };
             sender_clone.input(AppMsg::SetInputMode(mode));
@@ -265,9 +272,9 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::SetInputMode(mode) => {
-                let effective_mode = if self.guest_mouse_is_absolute == Some(false) && mode == InputMode::Seamless {
-                    warn!("Guest mouse is relative; forcing InputMode::Confined");
-                    InputMode::Confined
+                let effective_mode = if self.guest_mouse_is_absolute == Some(false) && mode == PointerPolicy::Auto {
+                    warn!("Guest mouse is relative; forcing PointerPolicy::Locked");
+                    PointerPolicy::Locked
                 } else {
                     mode
                 };
@@ -281,28 +288,28 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::GuestMouseModeChanged { is_absolute } => {
                 self.guest_mouse_is_absolute = Some(is_absolute);
-                if !is_absolute && self.input_mode != InputMode::Confined {
-                    self.input_mode = InputMode::Confined;
+                if !is_absolute && self.input_mode != PointerPolicy::Locked {
+                    self.input_mode = PointerPolicy::Locked;
                     if let Some(display) = &self.display {
-                        display.emit(VmDisplayMsg::SetInputCaptureMode(InputMode::Confined));
+                        display.emit(VmDisplayMsg::SetInputCaptureMode(PointerPolicy::Locked));
                     }
                 }
                 if let Some(display) = &self.display {
                     display.emit(VmDisplayMsg::MouseModeChanged { is_absolute });
                 }
             }
-            AppMsg::Connected { resources, console_ctrl, input_handler, input_state_rx, event_rx } => {
+            AppMsg::Connected(data) => {
                 info!("[UPDATE] Connected message received, setting up display...");
 
                 // 1. Store resources to keep D-Bus connections alive
-                self.resources = Some(resources);
+                self.resources = Some(data.resources);
 
                 // 2. Launch VmDisplayModel
                 let display_controller = VmDisplayModel::builder()
                     .launch(VmDisplayInit {
-                        rx: event_rx,
-                        console_ctrl,
-                        input_handler,
+                        rx: data.event_rx,
+                        console_ctrl: data.console_ctrl,
+                        input_handler: data.input_handler,
                         grab_shortcut: GrabShortcut::default(),
                     })
                     .forward(sender.input_sender(), |_| AppMsg::Ignore);
@@ -310,6 +317,7 @@ impl SimpleComponent for AppModel {
                 // 3. Listen to input state events and forward to UI
                 {
                     let app_sender = sender.input_sender().clone();
+                    let input_state_rx = data.input_state_rx;
                     relm4::spawn_local(async move {
                         while let Ok(event) = input_state_rx.recv().await {
                             if let InputStateEvent::MouseIsAbsolute(is_abs) = event {
@@ -344,33 +352,29 @@ impl SimpleComponent for AppModel {
 
 /// Listener mode - determines what capabilities we advertise to QEMU
 ///
-/// Four levels of D-Bus Display capabilities:
-/// - Scanout: Core interface only, QEMU sends framebuffer via D-Bus
-/// - ScanoutDMABUF: Core + single-plane DMA-BUF (always enabled in core)
-/// - ScanoutDMABUF2: Core + single-plane + multi-plane DMA-BUF
-/// - ScanoutMap: Core + Unix.Map shared-memory scanout
+/// Three modes:
+/// - basic: Core interface with framebuffer/DMABUF scanout
+/// - basic+map: Core + Unix.Map shared-memory scanout
+/// - basic+dmabuf2: Core + multi-plane DMA-BUF support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListenerMode {
-    /// Basic scanout mode - QEMU sends framebuffer via D-Bus (may still use single-plane DMABUF)
+    /// Basic scanout mode - QEMU sends framebuffer via D-Bus (includes single-plane DMABUF)
     #[default]
-    Scanout,
-    /// Same as Scanout (single-plane DMABUF is always in core interface)
-    ScanoutDMABUF,
-    /// Full DMABUF support - multi-plane DMA-BUF enabled
-    ScanoutDMABUF2,
+    Basic,
     /// Shared-memory map support via org.qemu.Display1.Listener.Unix.Map
-    ScanoutMap,
+    BasicMap,
+    /// Full DMABUF support - multi-plane DMA-BUF enabled
+    BasicDmabuf2,
 }
 
 impl ListenerMode {
-    const CLI_MODES: &'static str = "scanout | scanoutdmabuf | scanoutdmabuf2 | scanoutmap";
+    const CLI_MODES: &'static str = "basic | basic+map | basic+dmabuf2";
 
     fn parse_cli(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "scanout" => Some(Self::Scanout),
-            "scanoutdmabuf" | "dmabuf" => Some(Self::ScanoutDMABUF),
-            "scanoutdmabuf2" | "dmabuf2" | "gl" => Some(Self::ScanoutDMABUF2),
-            "scanoutmap" | "scnoutmap" | "map" => Some(Self::ScanoutMap),
+            "basic" => Some(Self::Basic),
+            "basic+map" | "map" => Some(Self::BasicMap),
+            "basic+dmabuf2" | "dmabuf2" => Some(Self::BasicDmabuf2),
             _ => None,
         }
     }
@@ -381,13 +385,17 @@ fn print_usage(bin: &str) {
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  qemu-dbus-socket-path  Path to QEMU D-Bus socket");
-    eprintln!("  mode                   Listener mode: {} (default: scanout)", ListenerMode::CLI_MODES);
+    eprintln!("  mode                   Listener mode: {} (default: basic)", ListenerMode::CLI_MODES);
+    eprintln!();
+    eprintln!("Modes:");
+    eprintln!("  basic        Core interface with framebuffer/DMABUF scanout");
+    eprintln!("  basic+map    Core + Unix.Map shared-memory scanout");
+    eprintln!("  basic+dmabuf2 Core + multi-plane DMA-BUF support");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutdmabuf2", bin);
-    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 scanoutmap", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 basic+map", bin);
+    eprintln!("  {} /run/user/1000/qemu-dbus-p2p.0 basic+dmabuf2", bin);
 }
 
 /// Connect to QEMU and return the event receiver for display updates.
@@ -519,41 +527,34 @@ async fn connect_to_qemu(
         }
     }
 
-    // ================================================================
-    // FIX: Use correct timing - send FD to QEMU first, then establish D-Bus connection
-    // Key: .serve_at() must be called before .build()!
+    // Register the listener FD with QEMU before establishing the listener connection.
+    // `.serve_at()` must run before `.build()` so QEMU sees the exported objects on first handshake.
     // Reference: https://gitlab.com/marcandre.lureau/qemu-display
-    // ================================================================
 
     info!("Creating socketpair for listener...");
     let (socket_server, socket_client) = std::os::unix::net::UnixStream::pair()?;
     info!("Socketpair created");
 
-    // Send client_fd to QEMU first!
-    // This is key: QEMU needs to receive the fd before it can respond to D-Bus handshake
+    // Send `client_fd` to QEMU first so it can complete the D-Bus handshake.
     use std::os::fd::OwnedFd;
     let std_fd: OwnedFd = socket_client.into();
     let fd: zvariant::OwnedFd = std_fd.into();
     console_ctrl.register_listener(fd)?;
     info!("Listener registered with console (fd sent to QEMU)");
 
-    // Now establish D-Bus connection
-    // Key: .serve_at() must be called before .build() so the object is registered when connection is built
+    // Now establish the listener D-Bus connection.
     info!("Creating listener D-Bus connection...");
 
     // Create listener handler
-    let enable_dmabuf2 = mode == ListenerMode::ScanoutDMABUF2;
-    let enable_map = mode == ListenerMode::ScanoutMap;
+    let enable_dmabuf2 = mode == ListenerMode::BasicDmabuf2;
+    let enable_map = mode == ListenerMode::BasicMap;
     let listener_opts = listener::Options::builder().with_dmabuf2(enable_dmabuf2).with_map(enable_map).build();
     info!("Listener mode: {:?}, DMABUF2: {}, MAP: {}", mode, enable_dmabuf2, enable_map);
 
-    // Register all interfaces on the builder before .build()
-    // so QEMU sees the full interface set on first introspection.
+    // Register all interfaces before `.build()` so first introspection sees the full surface.
     let mut builder = zbus::connection::Builder::unix_stream(socket_server).p2p();
-    builder = builder.serve_at(
-        "/org/qemu/Display1/Listener",
-        listener::Listener::from_opts(listener_opts, event_tx.clone()),
-    )?;
+    builder = builder
+        .serve_at("/org/qemu/Display1/Listener", listener::Listener::from_opts(listener_opts, event_tx.clone()))?;
     if enable_dmabuf2 {
         let dmabuf2_handler = listener::Dmabuf2Handler(event_tx.clone());
         builder = builder.serve_at("/org/qemu/Display1/Listener", dmabuf2_handler)?;
@@ -569,14 +570,11 @@ async fn connect_to_qemu(
     info!("Listener server registered at /org/qemu/Display1/Listener");
 
     // Set UI info
-    console_ctrl.set_ui_info(
-        0,
-        0,
-        0,
-        0, // width_mm, height_mm, xoff, yoff (use defaults)
-        console_width,
-        console_height,
-    )?;
+    let width_mm = NonZeroU16::new(1).unwrap();
+    let height_mm = NonZeroU16::new(1).unwrap();
+    let console_width = NonZeroU32::new(console_width.max(1)).unwrap();
+    let console_height = NonZeroU32::new(console_height.max(1)).unwrap();
+    console_ctrl.set_ui_info(width_mm, height_mm, 0, 0, console_width, console_height)?;
     info!("Set UI info: {}x{}", console_width, console_height);
 
     // Build unified input bus from discovered console interfaces.
@@ -609,7 +607,7 @@ async fn main() {
     let bin = args.first().map_or("qemu_display", String::as_str);
 
     let (socket_path, mode) = match args.len() {
-        2 => (PathBuf::from(&args[1]), ListenerMode::Scanout),
+        2 => (PathBuf::from(&args[1]), ListenerMode::Basic),
         3 => {
             let path = PathBuf::from(&args[1]);
             let mode = match ListenerMode::parse_cli(args[2].as_str()) {

@@ -200,15 +200,6 @@ pub mod macros {
     /// - `Drop` impl that aborts tasks and closes channels
     ///
     /// Bounded channel if `$backpressure > 0`, otherwise unbounded.
-    ///
-    /// # Example
-    /// ```ignore
-    /// impl_session_connect!(
-    ///     ConsoleSession, ConsoleProxy<'static>, ConsoleController,
-    ///     Command, Event, watch_proxy_changes, handle_commands, 32
-    /// );
-    /// let session = ConsoleSession::connect(&conn, "/org/qemu/Display1/Console_0").await?;
-    /// ```
     #[macro_export]
     macro_rules! impl_session_connect {
         (

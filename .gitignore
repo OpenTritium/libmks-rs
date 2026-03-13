@@ -1,3 +1,5 @@
 /target
 /test_suit/*.iso
+/test_suit/*.iso.bak
 /test_suit/**/*.iso
+/test_suit/**/*.iso.bak

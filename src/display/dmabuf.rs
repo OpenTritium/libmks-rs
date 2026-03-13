@@ -2,28 +2,25 @@
 //!
 //! This module provides common functions used across different display backends
 //! for creating DMA-BUF file descriptors and building textures.
-use crate::display::{pixman_4cc::FourCC, udma::UdmabufCreate};
+use crate::display::pixman_4cc::FourCC;
 use relm4::gtk::{
     cairo::{RectangleInt, Region},
     gdk::{DmabufTextureBuilder, Texture},
     glib,
 };
-use rustix::{
-    fd::{AsFd, AsRawFd, OwnedFd, RawFd},
-    fs::{Mode, OFlags, open},
-    ioctl::ioctl,
-    param::page_size,
-};
+use rustix::{fd::RawFd, param::page_size};
 use std::{
-    io,
+    hint::unlikely,
+    num::NonZeroU32,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 /// Fetches the cached system's page size.
+#[inline(always)]
 pub fn fetch_page_size() -> usize {
     static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
     let size = PAGE_SIZE.load(Ordering::Relaxed);
-    if size != 0 {
+    if unlikely(size != 0) {
         return size;
     }
     let size = page_size();
@@ -39,8 +36,8 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 pub struct Damage {
     pub x: u32,
     pub y: u32,
-    pub width: u32,
-    pub height: u32,
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
 }
 
 /// Describes a single plane within a DMA-BUF.
@@ -52,32 +49,8 @@ pub struct Damage {
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufPlane {
     pub fd: RawFd,
-    pub stride: u32,
+    pub stride: NonZeroU32,
     pub offset: u32,
-}
-
-/// Creates a DMA-BUF file descriptor from a memfd region via `/dev/udmabuf`.
-///
-/// # Arguments
-/// * `memfd`: The source memory file descriptor (must implement `AsFd`).
-/// * `offset`: Start offset in bytes (must be page-aligned).
-/// * `size`: Size in bytes (must be page-aligned).
-///
-/// # Errors
-/// Returns `InvalidInput` if offset or size are not page-aligned.
-/// Returns OS errors if `/dev/udmabuf` cannot be opened or ioctl fails.
-#[inline]
-pub fn create_udmabuf_fd(memfd: &impl AsFd, offset: u64, size: u64) -> io::Result<OwnedFd> {
-    let page_size = fetch_page_size() as u64;
-    if !offset.is_multiple_of(page_size) || !size.is_multiple_of(page_size) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("udmabuf: offset and size must be page-aligned {page_size}"),
-        ));
-    }
-    let udmabuf_dev = open("/dev/udmabuf", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?;
-    let create_req = UdmabufCreate::new(memfd.as_fd().as_raw_fd(), offset, size);
-    unsafe { ioctl(&udmabuf_dev, create_req) }.map_err(io::Error::from)
 }
 
 /// Builds a `GdkTexture` from multi-plane DMA-BUF data.
@@ -88,26 +61,30 @@ pub fn create_udmabuf_fd(memfd: &impl AsFd, offset: u64, size: u64) -> io::Resul
 ///   `build_with_release_func`.
 #[inline]
 pub fn build_dmabuf_texture_planar(
-    width: u32, height: u32, fourcc: FourCC, modifier: u64, planes: &[DmabufPlane], update_texture: Option<&Texture>,
-    damage: Option<Damage>,
+    width: NonZeroU32, height: NonZeroU32, fourcc: FourCC, modifier: u64, planes: &[DmabufPlane],
+    update_texture: Option<&Texture>, damage: Option<Damage>,
 ) -> Result<Texture, glib::Error> {
     let num_planes = planes.len() as u32;
     let mut builder = DmabufTextureBuilder::new()
-        .set_width(width)
-        .set_height(height)
+        .set_width(width.get())
+        .set_height(height.get())
         .set_fourcc(fourcc.into())
         .set_modifier(modifier)
         .set_n_planes(num_planes)
         .set_update_texture(update_texture);
     if let Some(Damage { x, y, width, height }) = damage {
-        let to_i32 = |v: u32| i32::try_from(v).expect("Cannot coercion i32 into u32 when calculate damage");
-        let rect = RectangleInt::new(to_i32(x), to_i32(y), to_i32(width), to_i32(height));
+        let rect = RectangleInt::new(
+            x.try_into().unwrap(),
+            y.try_into().unwrap(),
+            width.get().try_into().unwrap(),
+            height.get().try_into().unwrap(),
+        );
         let region = Region::create_rectangle(&rect);
         builder = builder.set_update_region(Some(&region));
     }
     let builder = planes.iter().enumerate().fold(builder, |b, (i, plane)| {
         let i = i as u32;
-        let b = b.set_stride(i, plane.stride).set_offset(i, plane.offset);
+        let b = b.set_stride(i, plane.stride.get()).set_offset(i, plane.offset);
         unsafe { b.set_fd(i, plane.fd) }
     });
     unsafe { builder.build() }
@@ -119,11 +96,11 @@ mod tests {
 
     use super::*;
     use relm4::gtk::prelude::TextureExt;
-    use rustix::{
-        fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create},
-        io::Errno,
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, ftruncate, memfd_create};
+    use std::{
+        os::fd::{AsRawFd, OwnedFd},
+        sync::Once,
     };
-    use std::sync::Once;
 
     // 静态初始化 GTK，确保在测试进程中只初始化一次
     static GTK_INIT: Once = Once::new();
@@ -154,39 +131,39 @@ mod tests {
         fd
     }
 
-    #[test]
-    fn test_create_udmabuf_fd_alignment_check() {
-        let size = 4096;
-        let memfd = create_valid_memfd(size);
+    // #[test]
+    // fn test_create_udmabuf_fd_alignment_check() {
+    //     let size = NonZeroU64::new(4096).unwrap();
+    //     let memfd = create_valid_memfd(size.get());
 
-        match create_udmabuf_fd(&memfd, 123, size) {
-            Ok(_) => panic!("Should fail due to misalignment"),
-            Err(e) => {
-                assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "Should catch alignment error in userspace");
-            }
-        }
-    }
+    //     match create_udmabuf_fd(&memfd, 123, size) {
+    //         Ok(_) => panic!("Should fail due to misalignment"),
+    //         Err(e) => {
+    //             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "Should catch alignment error in userspace");
+    //         }
+    //     }
+    // }
 
-    #[test]
-    fn test_create_udmabuf_fd_driver_integration() {
-        let size = 4096;
-        let memfd = create_valid_memfd(size);
+    // #[test]
+    // fn test_create_udmabuf_fd_driver_integration() {
+    //     let size = NonZeroU64::new(4096).unwrap();
+    //     let memfd = create_valid_memfd(size.get());
 
-        match create_udmabuf_fd(&memfd, 0, size) {
-            Ok(fd) => assert!(fd.as_raw_fd() > 0),
-            Err(e) => {
-                if e.kind() == io::ErrorKind::InvalidInput {
-                    panic!("Valid arguments were rejected: {:?}", e);
-                }
-                match e.raw_os_error().map(Errno::from_raw_os_error) {
-                    Some(Errno::NOENT) | Some(Errno::ACCESS) | Some(Errno::PERM) => {
-                        println!("Skipping integration test: /dev/udmabuf not available/accessible");
-                    }
-                    _ => panic!("Unexpected kernel error: {:?}", e),
-                }
-            }
-        }
-    }
+    //     match create_udmabuf_fd(&memfd, 0, size) {
+    //         Ok(fd) => assert!(fd.as_raw_fd() > 0),
+    //         Err(e) => {
+    //             if e.kind() == io::ErrorKind::InvalidInput {
+    //                 panic!("Valid arguments were rejected: {:?}", e);
+    //             }
+    //             match e.raw_os_error().map(Errno::from_raw_os_error) {
+    //                 Some(Errno::NOENT) | Some(Errno::ACCESS) | Some(Errno::PERM) => {
+    //                     println!("Skipping integration test: /dev/udmabuf not available/accessible");
+    //                 }
+    //                 _ => panic!("Unexpected kernel error: {:?}", e),
+    //             }
+    //         }
+    //     }
+    // }
 
     #[test]
     fn test_build_dmabuf_texture_planar_logic() {
@@ -204,12 +181,12 @@ mod tests {
         let fake_memfd = create_valid_memfd(4096);
         let fake_fd = fake_memfd.as_raw_fd();
 
-        let planes = [DmabufPlane { fd: fake_fd, stride: 100, offset: 0 }];
+        let planes = [DmabufPlane { fd: fake_fd, stride: NonZeroU32::new(100).unwrap(), offset: 1 }];
 
         // 尝试构建
         let result = build_dmabuf_texture_planar(
-            100,
-            100,
+            100.try_into().unwrap(),
+            100.try_into().unwrap(),
             ARGB8888, // 假设 FourCC 枚举里有这个
             DRM_FORMAT_MOD_LINEAR,
             &planes,

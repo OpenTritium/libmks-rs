@@ -9,11 +9,15 @@
 //! * `org.qemu.Display1.Listener.Unix.Map` — Shared memory (memfd)
 //!
 //! Reference: <https://www.qemu.org/docs/master/interop/dbus-display.html#org.qemu.Display1.Listener-section>
-use crate::MksResult;
+use crate::{
+    MksResult,
+    display::pixman_4cc::{FourCC, Pixman},
+};
 use Event::*;
 use derive_more::{AsRef, Deref, From, Into};
 use kanal::{AsyncReceiver, AsyncSender};
-use std::{borrow::Borrow, fmt};
+use std::{borrow::Borrow, fmt, num::NonZeroU32};
+use tokio::sync::oneshot;
 use typed_builder::TypedBuilder;
 use zbus::{Connection, DBusError, interface};
 use zvariant::{OwnedFd, Type};
@@ -24,6 +28,32 @@ use zvariant::{OwnedFd, Type};
 pub enum EmitError {
     /// Event channel closed before the event could be forwarded.
     ChannelClosed(String),
+}
+
+/// RAII guard that ensures ACK is sent on drop (even on error).
+#[derive(Debug, Default)]
+pub struct AckGuard(Option<oneshot::Sender<()>>);
+
+impl AckGuard {
+    #[inline]
+    pub fn none() -> Self { Self::default() }
+
+    /// Creates a new AckGuard wrapping the given sender.
+    #[inline]
+    pub fn new(tx: oneshot::Sender<()>) -> Self { Self(tx.into()) }
+
+    /// Sends the ACK immediately.
+    #[inline]
+    pub fn ack(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for AckGuard {
+    #[inline]
+    fn drop(&mut self) { self.ack(); }
 }
 
 /// Byte payload wrapper used in listener events.
@@ -40,42 +70,67 @@ impl Borrow<[u8]> for Blob {
 }
 
 /// Unified event stream for all listener interfaces.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Event {
     /// Full framebuffer image.
-    Scanout { width: u32, height: u32, stride: u32, pixman_format: u32, data: Blob },
+    Scanout { width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32, pixman_format: Pixman, data: Blob },
     /// Partial framebuffer rectangle update.
-    Update { x: i32, y: i32, width: i32, height: i32, stride: u32, pixman_format: u32, data: Blob },
+    Update {
+        x: u32,
+        y: u32,
+        width: NonZeroU32,
+        height: NonZeroU32,
+        stride: NonZeroU32,
+        pixman_format: Pixman,
+        data: Blob,
+        ack: AckGuard,
+    },
     /// Framebuffer export through a single DMABUF fd.
-    ScanoutDmabuf { dmabuf: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64, y0_top: bool },
+    ScanoutDmabuf {
+        dmabuf: OwnedFd,
+        width: NonZeroU32,
+        height: NonZeroU32,
+        stride: NonZeroU32,
+        fourcc: FourCC,
+        modifier: u64,
+        y0_top: bool,
+    },
     /// Partial update for the current DMABUF scanout.
-    UpdateDmabuf { x: i32, y: i32, width: i32, height: i32 },
+    UpdateDmabuf { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: AckGuard },
     /// Disable display output.
     Disable,
     /// Update host cursor position/visibility.
-    MouseSet { x: i32, y: i32, on: i32 },
+    /// QEMU reports cursor image top-left, so edge-adjacent cursors can legitimately go negative.
+    MouseSet { x: i32, y: i32, on: bool },
     /// Define a cursor image and hotspot.
-    CursorDefine { width: i32, height: i32, hot_x: i32, hot_y: i32, data: Blob },
+    CursorDefine { width: NonZeroU32, height: NonZeroU32, hot_x: u32, hot_y: u32, data: Blob },
     /// Multi-plane DMABUF scanout payload.
     ScanoutDmabuf2 {
         dmabuf: Vec<OwnedFd>,
         x: u32,
         y: u32,
-        width: u32,
-        height: u32,
+        width: NonZeroU32,
+        height: NonZeroU32,
         offset: Vec<u32>,
-        stride: Vec<u32>,
-        num_planes: u32,
-        fourcc: u32,
-        backing_width: u32,
-        backing_height: u32,
+        stride: Vec<NonZeroU32>,
+        num_planes: NonZeroU32,
+        fourcc: FourCC,
+        backing_width: NonZeroU32,
+        backing_height: NonZeroU32,
         modifier: u64,
         y0_top: bool,
     },
     /// Framebuffer export through shared memory mapping.
-    ScanoutMap { memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32 },
+    ScanoutMap {
+        memfd: OwnedFd,
+        offset: u32,
+        width: NonZeroU32,
+        height: NonZeroU32,
+        stride: NonZeroU32,
+        pixman_format: Pixman,
+    },
     /// Partial update for the current mapped scanout.
-    UpdateMap { x: i32, y: i32, width: i32, height: i32 },
+    UpdateMap { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: AckGuard },
 }
 
 trait EventEmitter {
@@ -83,6 +138,25 @@ trait EventEmitter {
 
     async fn emit(&self, event: Event) -> Result<(), EmitError> {
         self.sender().send(event).await.map_err(|e| EmitError::ChannelClosed(e.to_string()))
+    }
+
+    /// Emits an event with VSync-backed ACK mechanism.
+    ///
+    /// Creates a oneshot channel, embeds the AckGuard in the event, and waits for the receiver
+    /// to be signaled (typically from GTK FrameClock tick). The 100ms timeout decision
+    /// is delegated to the UI thread to avoid reactor conflicts in the zbus thread.
+    async fn emit_with_ack<F>(&self, make_event: F) -> Result<(), EmitError>
+    where
+        F: FnOnce(AckGuard) -> Event,
+    {
+        let (tx, rx) = oneshot::channel();
+        let guard = AckGuard::new(tx);
+        // Move guard into event (the receiver will get it)
+        self.emit(make_event(guard)).await?;
+        // Wait for UI thread to signal via the ACK channel.
+        // Timeout handling is now done in the UI thread to avoid reactor conflicts.
+        let _ = rx.await;
+        Ok(())
     }
 }
 
@@ -104,14 +178,27 @@ impl Listener {
     async fn scanout(
         &self, width: u32, height: u32, stride: u32, pixman_format: u32, data: Vec<u8>,
     ) -> Result<(), EmitError> {
-        self.emit(Scanout { width, height, stride, pixman_format, data: data.into() }).await
+        let width = width.try_into().unwrap();
+        let height = height.try_into().unwrap();
+        let stride = stride.try_into().unwrap();
+        let pixman_format = pixman_format.into();
+        let data = data.into();
+        self.emit(Scanout { width, height, stride, pixman_format, data }).await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn update(
         &self, x: i32, y: i32, width: i32, height: i32, stride: u32, pixman_format: u32, data: Vec<u8>,
     ) -> Result<(), EmitError> {
-        self.emit(Update { x, y, width, height, stride, pixman_format, data: data.into() }).await
+        let x = x.try_into().unwrap();
+        let y = y.try_into().unwrap();
+        let width: u32 = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
+        let height: u32 = height.try_into().unwrap();
+        let height: NonZeroU32 = height.try_into().unwrap();
+        let stride = stride.try_into().unwrap();
+        let pixman_format = pixman_format.into();
+        self.emit_with_ack(|ack| Update { x, y, width, height, stride, pixman_format, data: data.into(), ack }).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -119,23 +206,40 @@ impl Listener {
     async fn scanout_dmabuf(
         &self, dmabuf: OwnedFd, width: u32, height: u32, stride: u32, fourcc: u32, modifier: u64, y0_top: bool,
     ) -> Result<(), EmitError> {
+        let width = width.try_into().unwrap();
+        let height = height.try_into().unwrap();
+        let stride = stride.try_into().unwrap();
+        let fourcc = fourcc.into();
         self.emit(ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top }).await
     }
 
     #[zbus(name = "UpdateDMABUF")]
     async fn update_dmabuf(&self, x: i32, y: i32, width: i32, height: i32) -> Result<(), EmitError> {
-        self.emit(UpdateDmabuf { x, y, width, height }).await
+        let x = x.try_into().unwrap();
+        let y = y.try_into().unwrap();
+        let width: u32 = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
+        let height: u32 = height.try_into().unwrap();
+        let height: NonZeroU32 = height.try_into().unwrap();
+        self.emit_with_ack(|ack| UpdateDmabuf { x, y, width, height, ack }).await
     }
 
     async fn disable(&self) -> Result<(), EmitError> { self.emit(Event::Disable).await }
 
     async fn mouse_set(&self, x: i32, y: i32, on: i32) -> Result<(), EmitError> {
+        let on = on != 0;
         self.emit(MouseSet { x, y, on }).await
     }
 
     async fn cursor_define(
         &self, width: i32, height: i32, hot_x: i32, hot_y: i32, data: Vec<u8>,
     ) -> Result<(), EmitError> {
+        let height: u32 = height.try_into().unwrap();
+        let height = height.try_into().unwrap();
+        let width: u32 = width.try_into().unwrap();
+        let width = width.try_into().unwrap();
+        let hot_x = hot_x.try_into().unwrap();
+        let hot_y = hot_y.try_into().unwrap();
         self.emit(CursorDefine { width, height, hot_x, hot_y, data: data.into() }).await
     }
 
@@ -196,6 +300,13 @@ impl Dmabuf2Handler {
         &self, dmabuf: Vec<OwnedFd>, x: u32, y: u32, width: u32, height: u32, offset: Vec<u32>, stride: Vec<u32>,
         num_planes: u32, fourcc: u32, backing_width: u32, backing_height: u32, modifier: u64, y0_top: bool,
     ) -> Result<(), EmitError> {
+        let width = width.try_into().unwrap();
+        let height = height.try_into().unwrap();
+        let stride = stride.into_iter().map(|s| s.try_into().unwrap()).collect();
+        let num_planes = num_planes.try_into().unwrap();
+        let fourcc = fourcc.into();
+        let backing_width = backing_width.try_into().unwrap();
+        let backing_height = backing_height.try_into().unwrap();
         self.emit(ScanoutDmabuf2 {
             dmabuf,
             x,
@@ -230,11 +341,21 @@ impl MapHandler {
     async fn scanout_map(
         &self, memfd: OwnedFd, offset: u32, width: u32, height: u32, stride: u32, pixman_format: u32,
     ) -> Result<(), EmitError> {
+        let width = width.try_into().unwrap();
+        let height = height.try_into().unwrap();
+        let stride = stride.try_into().unwrap();
+        let pixman_format = pixman_format.into();
         self.emit(ScanoutMap { memfd, offset, width, height, stride, pixman_format }).await
     }
 
     async fn update_map(&self, x: i32, y: i32, width: i32, height: i32) -> Result<(), EmitError> {
-        self.emit(UpdateMap { x, y, width, height }).await
+        let x = x.try_into().unwrap();
+        let y = y.try_into().unwrap();
+        let width: u32 = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
+        let height: u32 = height.try_into().unwrap();
+        let height: NonZeroU32 = height.try_into().unwrap();
+        self.emit_with_ack(|ack| UpdateMap { x, y, width, height, ack }).await
     }
 }
 
@@ -390,12 +511,25 @@ mod tests {
 
         let event = rx.recv().await.expect("Should receive event");
         if let Event::Scanout { width: w, height: h, data: d, .. } = event {
-            assert_eq!(w, 100);
-            assert_eq!(h, 100);
+            assert_eq!(w.get(), 100);
+            assert_eq!(h.get(), 100);
             assert_eq!(d.len(), 4);
         } else {
             panic!("Expected Scanout event, got {:?}", event);
         }
+    }
+
+    #[tokio::test]
+    async fn test_zero_sized_scanout_panics_before_forwarding() {
+        let (tx, rx) = kanal::bounded_async::<Event>(1);
+        let listener = Listener::from_opts(Options::builder().with_dmabuf2(false).with_map(false).build(), tx);
+
+        let join_result = tokio::spawn(async move { listener.scanout(0, 100, 400, 1, vec![0u8; 4]).await }).await;
+        let join_err = join_result.expect_err("Zero-sized scanout should currently panic during validation");
+        assert!(join_err.is_panic(), "Expected validation panic, got {join_err:?}");
+
+        let recv_result = tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv()).await;
+        assert!(matches!(recv_result, Err(_) | Ok(Err(_))), "Invalid scanout should not be forwarded as an event");
     }
 
     #[tokio::test]
@@ -447,14 +581,14 @@ mod tests {
         {
             assert_eq!(x, 0);
             assert_eq!(y, 0);
-            assert_eq!(width, 1920);
-            assert_eq!(height, 1080);
+            assert_eq!(width.get(), 1920);
+            assert_eq!(height.get(), 1080);
             assert_eq!(offset, vec![0u32]);
-            assert_eq!(stride, vec![7680u32]);
-            assert_eq!(num_planes, 1);
-            assert_eq!(fourcc, 0x34325258);
-            assert_eq!(backing_width, 1920);
-            assert_eq!(backing_height, 1080);
+            assert_eq!(stride, vec![NonZeroU32::new(7680).unwrap()]);
+            assert_eq!(num_planes.get(), 1);
+            assert_eq!(Into::<u32>::into(fourcc), 0x34325258);
+            assert_eq!(backing_width.get(), 1920);
+            assert_eq!(backing_height.get(), 1080);
             assert_eq!(modifier, 0);
             assert!(!y0_top);
         } else {
@@ -467,6 +601,31 @@ mod tests {
         let (tx, _rx) = kanal::bounded_async::<Event>(1);
         let listener = Listener::from_opts(Options::builder().with_dmabuf2(true).with_map(false).build(), tx);
         assert!(listener.ifaces.contains(&IFACE_SCANOUT_DMABUF2));
+    }
+
+    #[tokio::test]
+    async fn test_mouse_set_preserves_negative_coordinates() {
+        let (_server_conn, rx, client_conn) = setup_mock_env().await;
+
+        client_conn
+            .call_method(
+                Some("org.qemu.Display1.Listener"),
+                "/org/qemu/Display1/Listener",
+                Some("org.qemu.Display1.Listener"),
+                "MouseSet",
+                &(-5i32, -9i32, 1i32),
+            )
+            .await
+            .expect("Failed to call MouseSet");
+
+        let event = rx.recv().await.expect("Should receive event");
+        if let Event::MouseSet { x, y, on } = event {
+            assert_eq!(x, -5);
+            assert_eq!(y, -9);
+            assert!(on);
+        } else {
+            panic!("Expected MouseSet event, got {:?}", event);
+        }
     }
 
     #[tokio::test]
@@ -487,8 +646,8 @@ mod tests {
 
         let event = rx.recv().await.expect("Should receive event");
         if let Event::Scanout { width, height, .. } = event {
-            assert_eq!(width, 100);
-            assert_eq!(height, 100);
+            assert_eq!(width.get(), 100);
+            assert_eq!(height.get(), 100);
         } else {
             panic!("Expected Scanout event, got {:?}", event);
         }
@@ -509,8 +668,8 @@ mod tests {
         if let Event::Update { x, y, width, height, .. } = event {
             assert_eq!(x, 10);
             assert_eq!(y, 10);
-            assert_eq!(width, 50);
-            assert_eq!(height, 50);
+            assert_eq!(width.get(), 50);
+            assert_eq!(height.get(), 50);
         } else {
             panic!("Expected Update event, got {:?}", event);
         }
@@ -530,9 +689,9 @@ mod tests {
 
         let event = rx.recv().await.expect("Should receive event");
         if let Event::ScanoutDmabuf { width, height, fourcc, .. } = event {
-            assert_eq!(width, 1920);
-            assert_eq!(height, 1080);
-            assert_eq!(fourcc, 0x34325258);
+            assert_eq!(width.get(), 1920);
+            assert_eq!(height.get(), 1080);
+            assert_eq!(Into::<u32>::into(fourcc), 0x34325258);
         } else {
             panic!("Expected ScanoutDmabuf event, got {:?}", event);
         }
@@ -553,7 +712,7 @@ mod tests {
         if let Event::MouseSet { x, y, on } = event {
             assert_eq!(x, 50);
             assert_eq!(y, 50);
-            assert_eq!(on, 1);
+            assert!(on);
         } else {
             panic!("Expected MouseSet event, got {:?}", event);
         }
@@ -572,8 +731,8 @@ mod tests {
 
         let event = rx.recv().await.expect("Should receive event");
         if let Event::CursorDefine { width, height, data, .. } = event {
-            assert_eq!(width, 32);
-            assert_eq!(height, 32);
+            assert_eq!(width.get(), 32);
+            assert_eq!(height.get(), 32);
             assert_eq!(data.len(), 32 * 32 * 4);
         } else {
             panic!("Expected CursorDefine event, got {:?}", event);
@@ -591,13 +750,14 @@ mod tests {
 
         // 发送大量 Scanout 消息
         for i in 0..msg_count {
+            let dim = (i + 1) * 10;
             client_conn
                 .call_method(
                     Some("org.qemu.Display1.Listener"),
                     "/org/qemu/Display1/Listener",
                     Some("org.qemu.Display1.Listener"),
                     "Scanout",
-                    &(i * 10, i * 10, 400u32, 1u32, vec![0u8; 400]),
+                    &(dim, dim, 400u32, 1u32, vec![0u8; 400]),
                 )
                 .await
                 .expect("Failed to call Scanout");
@@ -605,10 +765,11 @@ mod tests {
 
         // 接收并验证所有消息
         for i in 0..msg_count {
+            let dim = (i + 1) * 10;
             let event = rx.recv().await.expect("Should receive event");
             if let Event::Scanout { width, height, .. } = event {
-                assert_eq!(width, i * 10);
-                assert_eq!(height, i * 10);
+                assert_eq!(width.get(), dim);
+                assert_eq!(height.get(), dim);
             } else {
                 panic!("Expected Scanout event, got {:?}", event);
             }

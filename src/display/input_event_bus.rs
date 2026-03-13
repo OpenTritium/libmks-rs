@@ -1,4 +1,4 @@
-use super::input_handler::{Capability, InputHandler};
+use super::input_event_controller::{Capability, InputHandler};
 use crate::{
     MksResult,
     dbus::{
@@ -13,8 +13,8 @@ use crate::{
 use InputStateEvent::*;
 use futures_util::{StreamExt, stream::BoxStream};
 use kanal::{AsyncReceiver, AsyncSender, Receiver};
-use std::{io, mem, thread};
-use tokio::task::AbortHandle;
+use std::mem;
+use tokio::task::{AbortHandle, spawn_blocking};
 use typed_builder::TypedBuilder;
 use zbus::Connection;
 
@@ -49,7 +49,7 @@ pub enum InputStateEvent {
 
 /// Background input worker and watcher task handles.
 pub struct InputDaemon {
-    thread: thread::JoinHandle<()>,
+    abort: AbortHandle,
     shutdown: Option<Box<dyn FnOnce()>>, // Triggers the blocking I/O thread shutdown.
     shutdown_prop: Option<Box<dyn FnOnce()>>, // Gracefully stops property watchers.
 }
@@ -62,9 +62,7 @@ impl Drop for InputDaemon {
         if let Some(shutdown) = self.shutdown_prop.take() {
             shutdown();
         }
-        if !self.thread.is_finished() {
-            mks_error!("Input daemon dropped while I/O thread is still running; shutdown may be incomplete")
-        }
+        self.abort.abort();
     }
 }
 
@@ -104,8 +102,7 @@ struct BlockingInputProxies {
 }
 
 impl AsyncInputProxies {
-    async fn new(conn: &Connection, console_path: &str) -> Self {
-        let path = console_path.to_string();
+    async fn new(conn: &Connection, path: String) -> Self {
         let keyboard = match KeyboardProxy::new(conn, path.clone()).await {
             Ok(proxy) => Some(proxy),
             Err(e) => {
@@ -156,15 +153,14 @@ pub struct InputBusSetup {
 impl InputBusSetup {
     /// Finalizes setup.
     ///
-    /// Returns:
-    /// `InputHandler`: command entry for input events and watcher updates.
-    /// `AsyncReceiver<InputStateEvent>`: watcher-produced input state events.
-    /// `InputDaemon`: guard that owns shutdown hooks and the worker thread.
+    /// - `InputHandler`: synchronous entry point for input commands and capability updates.
+    /// - `AsyncReceiver<InputStateEvent>`: watcher-produced input state events.
+    /// - `InputDaemon`: shutdown guard for the worker thread and property watchers.
     pub async fn dispatch(self) -> MksResult<(InputHandler, AsyncReceiver<InputStateEvent>, InputDaemon)> {
         let Self { conn, console_path, with_keyboard, with_mouse, with_multitouch } = self;
         // Initial capabilities are derived from setup flags.
         let init_cap = Capability { keyboard: with_keyboard, mouse: with_mouse, multitouch: with_multitouch };
-        let async_proxies = AsyncInputProxies::new(&conn, &console_path).await;
+        let async_proxies = AsyncInputProxies::new(&conn, console_path).await;
         let blocking_proxies = async_proxies.clone().into_blocking();
         // Small buffer: only capability updates and manager shutdown.
         let (watch_cmd_tx, watch_cmd_rx) = kanal::bounded_async::<WatchCommand>(2);
@@ -186,19 +182,17 @@ impl InputBusSetup {
             }
         });
         let shutdown_prop = Box::new(move || {
-            if let Err(e) = watch_cmd_tx.try_send(WatchCommand::Shutdown) {
+            if let Err(e) = watch_cmd_tx.as_sync().send(WatchCommand::Shutdown) {
                 mks_error!(error:? =e; "Failed to send shutdown command to watcher manager");
             }
         });
-        let thread = spawn_blocking_input_thread(blocking_proxies, input_cmd_rx)?;
-        let daemon = InputDaemon { thread, shutdown: Some(shutdown), shutdown_prop: Some(shutdown_prop) };
+        let abort = spawn_blocking_input_thread(blocking_proxies, input_cmd_rx);
+        let daemon = InputDaemon { abort, shutdown: Some(shutdown), shutdown_prop: Some(shutdown_prop) };
         Ok((handler, state_rx, daemon))
     }
 }
 
-fn spawn_blocking_input_thread(
-    proxies: BlockingInputProxies, cmd_rx: Receiver<InputCommand>,
-) -> io::Result<thread::JoinHandle<()>> {
+fn spawn_blocking_input_thread(proxies: BlockingInputProxies, cmd_rx: Receiver<InputCommand>) -> AbortHandle {
     let f = move || {
         // Process commands from the synchronous blocking channel.
         while let Ok(mut cmd) = cmd_rx.recv() {
@@ -219,10 +213,10 @@ fn spawn_blocking_input_thread(
             }
         }
     };
-    thread::Builder::new().name("mks-input-io".to_string()).spawn(f)
+    spawn_blocking(f).abort_handle()
 }
 
-/// Return `true` if need shutdown
+/// Returns `true` when the worker should shut down.
 fn handle_cmd(cmd: InputCommand, proxies: &BlockingInputProxies, pending_move: &mut PendingMove) -> bool {
     use InputCommand::*;
     use PendingMove::*;

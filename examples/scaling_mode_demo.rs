@@ -6,13 +6,13 @@ use libmks_rs::{
         listener::Event,
     },
     display::{
-        input_handler::{Capability, InputHandler},
+        input_event_controller::{Capability, InputHandler},
         vm_display::{GrabShortcut, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::info;
-use relm4::{Controller, gtk::prelude::*, prelude::*};
-use std::time::Duration;
+use relm4::{Controller, adw, gtk::prelude::*, prelude::*};
+use std::{num::NonZeroU32, time::Duration};
 use tokio::sync::watch;
 
 struct AppModel {
@@ -55,7 +55,7 @@ impl SimpleComponent for AppModel {
                     },
                 },
                 #[local_ref]
-                display_widget -> gtk::Overlay {
+                display_widget -> adw::ToastOverlay {
                     set_hexpand: true,
                     set_vexpand: true,
                 },
@@ -81,7 +81,7 @@ impl SimpleComponent for AppModel {
                 match cmd {
                     console::Command::SetUiInfo { width, height, .. } => {
                         info!("[Console] SetUiInfo => guest resize to {}x{}", width, height);
-                        let _ = ui_size_tx.send((width, height));
+                        let _ = ui_size_tx.send((width.get(), height.get()));
                     }
                     other => {
                         info!("[Console] Command: {:?}", other);
@@ -116,6 +116,10 @@ impl SimpleComponent for AppModel {
     }
 }
 
+/// Creates a mock console controller pair for the demo.
+///
+/// - `ConsoleController`: sender exposed to the UI model.
+/// - `AsyncReceiver<console::Command>`: backend-side command receiver.
 fn create_mock_console_controller() -> (ConsoleController, kanal::AsyncReceiver<console::Command>) {
     let (console_tx, console_rx) = kanal::unbounded_async();
     (ConsoleController::from(console_tx), console_rx)
@@ -136,6 +140,8 @@ fn generate_frame(width: u32, height: u32, tick: u32) -> Vec<u8> {
     data
 }
 
+fn nz(value: u32) -> NonZeroU32 { NonZeroU32::new(value).expect("example always uses non-zero dimensions") }
+
 async fn mock_qemu_backend(tx: AsyncSender<Event>, ui_size_rx: watch::Receiver<(u32, u32)>) {
     let mut width = 800u32;
     let mut height = 600u32;
@@ -155,8 +161,15 @@ async fn mock_qemu_backend(tx: AsyncSender<Event>, ui_size_rx: watch::Receiver<(
         }
 
         let data = generate_frame(width, height, tick);
+        let stride = width.checked_mul(4).expect("example frame stride fits in u32");
         let _ = tx
-            .send(Event::Scanout { width, height, stride: width * 4, pixman_format: 0x20028888, data: data.into() })
+            .send(Event::Scanout {
+                width: nz(width),
+                height: nz(height),
+                stride: nz(stride),
+                pixman_format: 0x20028888.into(),
+                data: data.into(),
+            })
             .await;
     }
 }

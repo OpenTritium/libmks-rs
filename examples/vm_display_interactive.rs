@@ -6,14 +6,14 @@ use libmks_rs::{
         listener::Event,
     },
     display::{
-        input_daemon::InputCommand,
-        input_handler::{Capability, InputHandler},
-        vm_display::{GrabShortcut, InputMode, ScalingMode, VmDisplayInit, VmDisplayModel},
+        input_event_bus::InputCommand,
+        input_event_controller::{Capability, InputHandler},
+        vm_display::{GrabShortcut, PointerPolicy, ScalingMode, VmDisplayInit, VmDisplayModel},
     },
 };
 use log::info;
-use relm4::{Controller, gtk::prelude::*, prelude::*};
-use std::{thread, time::Duration};
+use relm4::{Controller, adw, gtk::prelude::*, prelude::*};
+use std::{num::NonZeroU32, thread, time::Duration};
 use tokio::sync::watch;
 
 struct AppModel {
@@ -23,7 +23,7 @@ struct AppModel {
 #[derive(Debug)]
 enum AppMsg {
     SetScalingMode(ScalingMode),
-    SetInputMode(InputMode),
+    SetInputMode(PointerPolicy),
     Ignore,
 }
 
@@ -71,7 +71,7 @@ impl SimpleComponent for AppModel {
                 },
 
                 #[local_ref]
-                display_widget -> gtk::Overlay {
+                display_widget -> adw::ToastOverlay {
                     set_hexpand: true,
                     set_vexpand: true,
                 },
@@ -103,7 +103,7 @@ impl SimpleComponent for AppModel {
                 match cmd {
                     console::Command::SetUiInfo { width, height, .. } => {
                         info!("[Console] SetUiInfo => guest resize to {}x{}", width, height);
-                        let _ = ui_size_tx.send((width, height));
+                        let _ = ui_size_tx.send((width.get(), height.get()));
                     }
                     other => {
                         info!("[Console] Command: {:?}", other);
@@ -148,8 +148,8 @@ impl SimpleComponent for AppModel {
 
         widgets.input_dropdown.connect_selected_item_notify(move |dropdown| {
             let mode = match dropdown.selected() {
-                0 => InputMode::Seamless,
-                1 => InputMode::Confined,
+                0 => PointerPolicy::Auto,
+                1 => PointerPolicy::Locked,
                 _ => return,
             };
             sender.input(AppMsg::SetInputMode(mode));
@@ -171,6 +171,10 @@ impl SimpleComponent for AppModel {
     }
 }
 
+/// Creates a mock console controller pair for the demo.
+///
+/// - `ConsoleController`: sender exposed to the UI model.
+/// - `AsyncReceiver<console::Command>`: backend-side command receiver.
 fn create_mock_console_controller() -> (ConsoleController, kanal::AsyncReceiver<console::Command>) {
     let (console_tx, console_rx) = kanal::unbounded_async();
     (ConsoleController::from(console_tx), console_rx)
@@ -195,6 +199,8 @@ fn generate_frame(width: u32, height: u32, tick: u32) -> Vec<u8> {
     data
 }
 
+fn nz(value: u32) -> NonZeroU32 { NonZeroU32::new(value).expect("example always uses non-zero dimensions") }
+
 async fn mock_qemu_backend(
     tx: AsyncSender<Event>, ui_size_rx: watch::Receiver<(u32, u32)>, mouse_pos_rx: watch::Receiver<(i32, i32, bool)>,
 ) {
@@ -205,10 +211,12 @@ async fn mock_qemu_backend(
     let mut ui_size_rx = ui_size_rx;
     let mut mouse_pos_rx = mouse_pos_rx;
 
-    let cursor_w = 64i32;
-    let cursor_h = 64i32;
+    let cursor_w = 64u32;
+    let cursor_h = 64u32;
     let cursor_hot_x = cursor_w / 2;
     let cursor_hot_y = cursor_h / 2;
+    let cursor_hot_x_i32 = cursor_hot_x as i32;
+    let cursor_hot_y_i32 = cursor_hot_y as i32;
     let mut cursor_data = vec![0u8; (cursor_w * cursor_h * 4) as usize];
     for y in 0..cursor_h {
         for x in 0..cursor_w {
@@ -226,8 +234,8 @@ async fn mock_qemu_backend(
     }
     let _ = tx
         .send(Event::CursorDefine {
-            width: cursor_w,
-            height: cursor_h,
+            width: nz(cursor_w),
+            height: nz(cursor_h),
             hot_x: cursor_hot_x,
             hot_y: cursor_hot_y,
             data: cursor_data.into(),
@@ -246,19 +254,26 @@ async fn mock_qemu_backend(
         }
 
         let data = generate_frame(width, height, tick);
+        let stride = width.checked_mul(4).expect("example frame stride fits in u32");
         let _ = tx
-            .send(Event::Scanout { width, height, stride: width * 4, pixman_format: 0x20028888, data: data.into() })
+            .send(Event::Scanout {
+                width: nz(width),
+                height: nz(height),
+                stride: nz(stride),
+                pixman_format: 0x20028888.into(),
+                data: data.into(),
+            })
             .await;
 
         let (x, y, visible) = *mouse_pos_rx.borrow_and_update();
         // VmDisplay currently positions guest cursor by image top-left, so convert center -> top-left.
-        let min_top_left_x = -cursor_hot_x;
-        let min_top_left_y = -cursor_hot_y;
-        let max_top_left_x = width.saturating_sub(1) as i32 - cursor_hot_x;
-        let max_top_left_y = height.saturating_sub(1) as i32 - cursor_hot_y;
-        let top_left_x = (x - cursor_hot_x).clamp(min_top_left_x, max_top_left_x);
-        let top_left_y = (y - cursor_hot_y).clamp(min_top_left_y, max_top_left_y);
-        let _ = tx.send(Event::MouseSet { x: top_left_x, y: top_left_y, on: i32::from(visible) }).await;
+        let min_top_left_x = -cursor_hot_x_i32;
+        let min_top_left_y = -cursor_hot_y_i32;
+        let max_top_left_x = width.saturating_sub(1) as i32 - cursor_hot_x_i32;
+        let max_top_left_y = height.saturating_sub(1) as i32 - cursor_hot_y_i32;
+        let top_left_x = (x - cursor_hot_x_i32).clamp(min_top_left_x, max_top_left_x);
+        let top_left_y = (y - cursor_hot_y_i32).clamp(min_top_left_y, max_top_left_y);
+        let _ = tx.send(Event::MouseSet { x: top_left_x, y: top_left_y, on: visible }).await;
     }
 }
 
