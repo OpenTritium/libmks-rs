@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-ISO_PATH="livecd.ubuntu.iso"
+ISO_PATH="livecd.fedora.iso"
 RAM_SIZE="8G"
 CPU_CORES="8"
 
@@ -135,6 +135,11 @@ sleep 1
 # -----------------------------------------------------------------------------
 # 4. Build and Execute QEMU Command
 # -----------------------------------------------------------------------------
+# Enable Vulkan validation and VirGL debugging
+export VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation"
+export VIRGL_DEBUG="all,guest_errors"
+# export VKR_DEBUG=no_async
+
 echo -e "${GREEN}Starting QEMU...${NC}"
 echo "QEMU will register on D-Bus session bus as 'org.qemu'"
 echo ""
@@ -158,10 +163,14 @@ QEMU_CMD=(
     -net user
     -k en-us
     -no-reboot
+    -d guest_errors
 )
 
 echo -e "${CYAN}Executing: ${QEMU_CMD[*]}${NC}"
 echo "------------------------------------------------------------------"
+
+# Enable core dump generation (required for debugging crashes)
+ulimit -c unlimited
 
 "${QEMU_CMD[@]}"
 

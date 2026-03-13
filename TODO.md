@@ -1,1 +1,1 @@
-- safe type
+- xe 驱动有问题导致 venus 崩溃
