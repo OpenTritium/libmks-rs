@@ -3,7 +3,10 @@ use super::{
     BackendNotReady, Error, crop::CropInfo, gpu_passthrough::GpuPassthrough, memmap::ImportedTexture,
     software_rasterizer::SoftwareRasterizer,
 };
-use crate::{dbus::listener::Event, mks_error, mks_trace};
+use crate::{
+    dbus::listener::{AckGuard, Event},
+    mks_error, mks_trace,
+};
 use RenderBackend::*;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
@@ -15,7 +18,6 @@ use std::{
     num::NonZeroU32,
     os::fd::OwnedFd,
 };
-use tokio::sync::oneshot;
 
 const LOG_TARGET: &str = "mks.display.event";
 
@@ -191,10 +193,10 @@ impl Screen {
     /// Applies one display event and returns dirty flags for frame/cursor refresh
     /// along with an optional VSync ACK sender for pipelined rendering.
     #[inline]
-    pub fn handle_event(&mut self, event: Event) -> Result<(DirtyFlags, Option<oneshot::Sender<()>>), Error> {
+    pub fn handle_event(&mut self, event: Event) -> Result<(DirtyFlags, AckGuard), Error> {
         use Event::*;
         let mut flags = DirtyFlags::default();
-        let mut extracted_ack: Option<oneshot::Sender<()>> = Option::None;
+        let mut extracted_ack = AckGuard::none();
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
                 self.y0_top = false;
@@ -214,7 +216,7 @@ impl Screen {
                 }
                 swapchain.partial_update_texture(x, y, width, height, stride, pixman_format, data)?;
                 flags.frame = true;
-                extracted_ack = Some(ack);
+                extracted_ack = ack;
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
                 self.y0_top = y0_top;
@@ -306,29 +308,36 @@ impl Screen {
                 // Redraw the texture from the imported buffer
                 cache.redraw()?;
                 flags.frame = true;
-                extracted_ack = Some(ack);
+                extracted_ack = ack; // Return guard to caller
             }
-            UpdateDmabuf { x, y, width, height, ack } => {
+            UpdateDmabuf { x, y, width, height, mut ack } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
                 let GpuPassthrough(gpu) = &mut self.backend else {
                     return Err(BackendNotReady::GpuPassthrough.into());
                 };
                 match gpu.commit_update(x, y, width, height) {
-                    Ok(true) => flags.frame = true,
+                    Ok(true) => {
+                        flags.frame = true;
+                        extracted_ack = ack; // Return guard to caller
+                    }
                     Ok(false) => {
+                        // No-op: ACK internally, return None to caller
                         mks_trace!(
-                            "Skipping frame signal after UpdateDMABUF: commit was a no-op (invalid damage or missing \
-                             active/pending frame)"
+                            "UpdateDMABUF: commit was a no-op (invalid damage or missing active/pending frame); \
+                             sending ACK immediately"
                         );
+                        ack.ack();
+                        extracted_ack = AckGuard::none();
                     }
                     Err(e) => {
+                        // Error: guard.drop() will send emergency ACK
                         mks_error!(
                             error:? = e;
                             "Failed to commit DMABUF update; keeping previous texture"
                         );
+                        return Err(e);
                     }
                 }
-                extracted_ack = Some(ack);
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
                 if !self.cursor.looks_same(width, height, hot_x, hot_y, &data) {

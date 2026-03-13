@@ -7,7 +7,11 @@ use super::{
     wayland_confine::ConfineState,
 };
 use crate::{
-    dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent},
+    dbus::{
+        console::ConsoleController,
+        keyboard::PressAction,
+        listener::{AckGuard, Event as QemuEvent},
+    },
     mks_debug, mks_error, mks_info, mks_trace, mks_warn,
 };
 use gdk4_wayland::{WaylandSurface, prelude::*, wayland_client::protocol::wl_surface::WlSurface};
@@ -33,19 +37,16 @@ use std::{
     sync::Once,
     time::Duration,
 };
-use tokio::{sync::oneshot, task::AbortHandle, time::sleep};
+use tokio::{task::AbortHandle, time::sleep};
 
 const LOG_TARGET: &str = "mks.display.vm";
 const INCH_TO_MM: f32 = 25.4;
 const DEFAULT_DPI: f32 = 96.;
 const DEFAULT_PIXEL_PITCH_MM: f32 = INCH_TO_MM / DEFAULT_DPI;
 const TOAST_DURATION_SECS: u32 = 3;
-const RELATIVE_SEAMLESS_UNSUPPORTED_TOAST: &str =
-    "Relative mouse mode does not support seamless capture. Switch to confined mode manually.";
-const CONFINED_CAPTURE_UNAVAILABLE_TOAST: &str =
-    "Confined capture is unavailable in the current environment. Falling back to seamless mode.";
-const RELATIVE_CONFINED_UNSUPPORTED_TOAST: &str =
-    "Relative capture requires Wayland relative-pointer protocol, which is unavailable in this environment.";
+const RELATIVE_SEAMLESS_UNSUPPORTED_TOAST: &str = "Relative mouse: seamless unavailable. Use confined mode.";
+const CONFINED_CAPTURE_UNAVAILABLE_TOAST: &str = "Confined capture unavailable. Using seamless mode.";
+const RELATIVE_CONFINED_UNSUPPORTED_TOAST: &str = "Relative capture needs Wayland protocol.";
 
 /// Loads the component CSS once per process.
 ///
@@ -184,7 +185,7 @@ pub struct VmDisplayModel {
     capture_state: CaptureState,
     requested_input_mode: PointerPolicy,
     /// Pending VSync ACK sender for pipelined rendering.
-    pending_ack: Option<oneshot::Sender<()>>,
+    pending_ack: AckGuard,
     /// Whether a GTK tick callback is currently scheduled.
     tick_scheduled: bool,
     /// Watchdog timer handle for 100ms timeout fallback.
@@ -444,7 +445,7 @@ impl Component for VmDisplayModel {
             input: init.input_handler,
             capture_state: CaptureState::new(),
             requested_input_mode: PointerPolicy::Auto,
-            pending_ack: None,
+            pending_ack: AckGuard::none(),
             tick_scheduled: false,
             vsync_timer: None,
         };
@@ -650,7 +651,7 @@ impl Component for VmDisplayModel {
             }
 
             Qemu(event) => match self.screen.handle_event(event) {
-                Ok((flags, ack)) => {
+                Ok((flags, mut ack)) => {
                     let (w, h) = self.screen.resolution().map(|(w, h)| (w.get(), h.get())).unwrap_or_default();
                     #[cfg(debug_assertions)]
                     {
@@ -661,35 +662,36 @@ impl Component for VmDisplayModel {
                     self.coord_system.set_vm_resolution(w, h);
                     self.dirty_flags.merge(flags);
 
-                    // ==========================================
                     // Pipelined VSync logic
-                    // ==========================================
-                    if let Some(new_ack) = ack {
-                        if flags.frame {
-                            // Valid frame: release pending ACK, allow QEMU to render 1 frame ahead
-                            if let Some(old_ack) = self.pending_ack.replace(new_ack) {
-                                let _ = old_ack.send(());
-                            }
-
-                            // Store new ACK, start 100ms watchdog timer
-                            if let Some(handle) = self.vsync_timer.take() {
-                                handle.abort();
-                            }
-                            let sender_timeout = sender.clone();
-                            self.vsync_timer = Some(
-                                relm4::spawn(async move {
-                                    sleep(Duration::from_millis(100)).await;
-                                    sender_timeout.input(Message::VsyncTimeout);
-                                })
-                                .abort_handle(),
-                            );
-                        } else {
-                            // Invalid frame: release immediately, don't block pipeline
-                            let _ = new_ack.send(());
+                    if flags.frame {
+                        // Valid frame: release pending ACK, allow QEMU to render 1 frame ahead
+                        self.pending_ack = ack;
+                        // Store new ACK, start 100ms watchdog timer
+                        if let Some(handle) = self.vsync_timer.take() {
+                            handle.abort();
+                        }
+                        let sender_timeout = sender.clone();
+                        self.vsync_timer = Some(
+                            relm4::spawn(async move {
+                                sleep(Duration::from_millis(100)).await;
+                                sender_timeout.input(Message::VsyncTimeout);
+                            })
+                            .abort_handle(),
+                        );
+                    } else {
+                        // Invalid frame: release immediately, don't block pipeline
+                        // Also cancel watchdog for invalid frames (Problem 1: race condition)
+                        ack.ack(); // Drop will auto-ack if already None
+                        if let Some(handle) = self.vsync_timer.take() {
+                            handle.abort();
                         }
                     }
                 }
                 Err(e) => {
+                    // Error case: cancel watchdog (Problem 1) as the interaction is complete
+                    if let Some(handle) = self.vsync_timer.take() {
+                        handle.abort();
+                    }
                     mks_error!("Failed to process QEMU display event: {e}");
                 }
             },
@@ -701,9 +703,7 @@ impl Component for VmDisplayModel {
                     handle.abort();
                 }
                 // Unlock QEMU
-                if let Some(ack) = self.pending_ack.take() {
-                    let _ = ack.send(());
-                }
+                self.pending_ack.ack();
             }
 
             VsyncTimeout => {
@@ -711,9 +711,7 @@ impl Component for VmDisplayModel {
                 // Release current ACK to let VM degrade to 10 FPS
                 // Keep tick_scheduled=true to avoid GTK callback overhead for silent frames
                 // until window restores and old callback wakes up
-                if let Some(ack) = self.pending_ack.take() {
-                    let _ = ack.send(());
-                }
+                self.pending_ack.ack();
             }
             SetScalingMode(mode) => {
                 self.scaling_mode = mode;
@@ -843,9 +841,8 @@ impl Component for VmDisplayModel {
 
         // Register GTK tick callback for VSync if we have a pending frame and ACK.
         // This binds to the physical display refresh rate.
-        if dirty_flags.frame && self.pending_ack.is_some() && !self.tick_scheduled {
+        if dirty_flags.frame && !self.tick_scheduled {
             self.tick_scheduled = true;
-
             // add_tick_callback registers a closure to be called after each frame is painted.
             // This is the ultimate VSync binding - it fires when the Wayland compositor
             // has finished presenting the frame.

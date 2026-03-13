@@ -37,7 +37,9 @@ use libmks_rs::{
     display::{
         input_event_bus::{InputBusSetup, InputDaemon, InputStateEvent},
         input_event_controller::InputHandler,
-        vm_display::{GrabShortcut, PointerPolicy, Message as VmDisplayMsg, ScalingMode, VmDisplayInit, VmDisplayModel},
+        vm_display::{
+            GrabShortcut, Message as VmDisplayMsg, PointerPolicy, ScalingMode, VmDisplayInit, VmDisplayModel,
+        },
     },
 };
 use log::{error, info, warn};
@@ -72,9 +74,7 @@ enum AppMsg {
     Ignore,
     SetScalingMode(ScalingMode),
     SetInputMode(PointerPolicy),
-    GuestMouseModeChanged {
-        is_absolute: bool,
-    },
+    GuestMouseModeChanged { is_absolute: bool },
     Connected(Box<ConnectedData>),
     ConnectFailed(String),
 }

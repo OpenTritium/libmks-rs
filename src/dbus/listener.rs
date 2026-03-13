@@ -30,6 +30,32 @@ pub enum EmitError {
     ChannelClosed(String),
 }
 
+/// RAII guard that ensures ACK is sent on drop (even on error).
+#[derive(Debug, Default)]
+pub struct AckGuard(Option<oneshot::Sender<()>>);
+
+impl AckGuard {
+    #[inline]
+    pub fn none() -> Self { Self::default() }
+
+    /// Creates a new AckGuard wrapping the given sender.
+    #[inline]
+    pub fn new(tx: oneshot::Sender<()>) -> Self { Self(tx.into()) }
+
+    /// Sends the ACK immediately.
+    #[inline]
+    pub fn ack(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for AckGuard {
+    #[inline]
+    fn drop(&mut self) { self.ack(); }
+}
+
 /// Byte payload wrapper used in listener events.
 #[derive(Clone, PartialEq, Eq, AsRef, Deref, From, Into, Type)]
 pub struct Blob(pub Vec<u8>);
@@ -57,7 +83,7 @@ pub enum Event {
         stride: NonZeroU32,
         pixman_format: Pixman,
         data: Blob,
-        ack: oneshot::Sender<()>,
+        ack: AckGuard,
     },
     /// Framebuffer export through a single DMABUF fd.
     ScanoutDmabuf {
@@ -70,7 +96,7 @@ pub enum Event {
         y0_top: bool,
     },
     /// Partial update for the current DMABUF scanout.
-    UpdateDmabuf { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: oneshot::Sender<()> },
+    UpdateDmabuf { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: AckGuard },
     /// Disable display output.
     Disable,
     /// Update host cursor position/visibility.
@@ -104,7 +130,7 @@ pub enum Event {
         pixman_format: Pixman,
     },
     /// Partial update for the current mapped scanout.
-    UpdateMap { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: oneshot::Sender<()> },
+    UpdateMap { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: AckGuard },
 }
 
 trait EventEmitter {
@@ -116,16 +142,17 @@ trait EventEmitter {
 
     /// Emits an event with VSync-backed ACK mechanism.
     ///
-    /// Creates a oneshot channel, embeds the sender in the event, and waits for the receiver
+    /// Creates a oneshot channel, embeds the AckGuard in the event, and waits for the receiver
     /// to be signaled (typically from GTK FrameClock tick). The 100ms timeout decision
     /// is delegated to the UI thread to avoid reactor conflicts in the zbus thread.
     async fn emit_with_ack<F>(&self, make_event: F) -> Result<(), EmitError>
     where
-        F: FnOnce(oneshot::Sender<()>) -> Event,
+        F: FnOnce(AckGuard) -> Event,
     {
         let (tx, rx) = oneshot::channel();
-        self.emit(make_event(tx)).await?;
-
+        let guard = AckGuard::new(tx);
+        // Move guard into event (the receiver will get it)
+        self.emit(make_event(guard)).await?;
         // Wait for UI thread to signal via the ACK channel.
         // Timeout handling is now done in the UI thread to avoid reactor conflicts.
         let _ = rx.await;
