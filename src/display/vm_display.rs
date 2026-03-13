@@ -10,19 +10,19 @@ use crate::{
     dbus::{console::ConsoleController, keyboard::PressAction, listener::Event as QemuEvent},
     mks_debug, mks_error, mks_info, mks_trace, mks_warn,
 };
-use gdk4_wayland::{
-    WaylandSurface,
-    gdk::{Key, ModifierType, Texture},
-    prelude::*,
-    wayland_client::protocol::wl_surface::WlSurface,
-};
+use gdk4_wayland::{WaylandSurface, prelude::*, wayland_client::protocol::wl_surface::WlSurface};
 use kanal::AsyncReceiver;
 use relm4::{
     Component, ComponentParts, ComponentSender,
     adw::{self, Toast, ToastOverlay},
     gtk::{
         Align, ContentFit, CssProvider, DrawingArea, Fixed, Overlay, Picture, STYLE_PROVIDER_PRIORITY_APPLICATION,
-        accelerator_get_label, gdk::Display, graphene::Point, gsk::Transform, prelude::*,
+        accelerator_get_label,
+        gdk::{Display, Key, ModifierType, Texture},
+        glib::ControlFlow,
+        graphene::Point,
+        gsk::Transform,
+        prelude::*,
         style_context_add_provider_for_display,
     },
 };
@@ -33,7 +33,7 @@ use std::{
     sync::Once,
     time::Duration,
 };
-use tokio::{task::AbortHandle, time::sleep};
+use tokio::{sync::oneshot, task::AbortHandle, time::sleep};
 
 const LOG_TARGET: &str = "mks.display.vm";
 const INCH_TO_MM: f32 = 25.4;
@@ -132,19 +132,41 @@ impl PointerCaptureEvent {
 #[derive(Debug)]
 pub enum Message {
     Qemu(QemuEvent),
-    CanvasResize { logical_width: f32, logical_height: f32 },
-    MouseMove { x: f32, y: f32 },
-    MouseButton { button: u32, transition: PressAction },
-    Scroll { dy: f64 },
-    Key { keycode: u32, transition: PressAction },
-    UpdateMonitorInfo { pixel_pitch_mm: f32 },
+    CanvasResize {
+        logical_width: f32,
+        logical_height: f32,
+    },
+    MouseMove {
+        x: f32,
+        y: f32,
+    },
+    MouseButton {
+        button: u32,
+        transition: PressAction,
+    },
+    Scroll {
+        dy: f64,
+    },
+    Key {
+        keycode: u32,
+        transition: PressAction,
+    },
+    UpdateMonitorInfo {
+        pixel_pitch_mm: f32,
+    },
     SetScalingMode(ScalingMode),
     SetConfined(PointerCaptureEvent),
     ShowToast(Cow<'static, str>),
     UpdateCaptureView, // View-only refresh for capture visuals (for example host cursor visibility).
     MouseLeave,
     SetInputCaptureMode(PointerPolicy),
-    MouseModeChanged { is_absolute: bool },
+    MouseModeChanged {
+        is_absolute: bool,
+    },
+    /// Signal from GTK FrameClock tick indicating the frame has been presented.
+    FramePresented,
+    /// Triggered when GTK stops refreshing (e.g., window minimized) as a 10 FPS fallback to prevent VM deadlock.
+    VsyncTimeout,
 }
 
 pub struct VmDisplayModel {
@@ -161,6 +183,12 @@ pub struct VmDisplayModel {
     input: InputHandler,
     capture_state: CaptureState,
     requested_input_mode: PointerPolicy,
+    /// Pending VSync ACK sender for pipelined rendering.
+    pending_ack: Option<oneshot::Sender<()>>,
+    /// Whether a GTK tick callback is currently scheduled.
+    tick_scheduled: bool,
+    /// Watchdog timer handle for 100ms timeout fallback.
+    vsync_timer: Option<AbortHandle>,
 }
 
 pub struct VmDisplayWidgets {
@@ -415,6 +443,9 @@ impl Component for VmDisplayModel {
             input: init.input_handler,
             capture_state: CaptureState::new(),
             requested_input_mode: PointerPolicy::Auto,
+            pending_ack: None,
+            tick_scheduled: false,
+            vsync_timer: None,
         };
 
         // 在输入层挂载 resize 控制器
@@ -620,7 +651,7 @@ impl Component for VmDisplayModel {
             }
 
             Qemu(event) => match self.screen.handle_event(event) {
-                Ok(flags) => {
+                Ok((flags, ack)) => {
                     let (w, h) = self.screen.resolution().map(|(w, h)| (w.get(), h.get())).unwrap_or_default();
                     #[cfg(debug_assertions)]
                     {
@@ -630,12 +661,62 @@ impl Component for VmDisplayModel {
                     }
                     self.coord_system.set_vm_resolution(w, h);
                     self.dirty_flags.merge(flags);
+
+                    // ==========================================
+                    // 完美流水线 VSync 逻辑 (Pipelined VSync)
+                    // ==========================================
+                    if let Some(new_ack) = ack {
+                        if flags.frame {
+                            // 是有效帧，立刻放行前面积压的旧帧，允许 QEMU 超前渲染 1 帧
+                            if let Some(old_ack) = self.pending_ack.replace(new_ack) {
+                                let _ = old_ack.send(());
+                            }
+
+                            // 每次存入新的 ACK，启动 100ms 安全看门狗
+                            if let Some(handle) = self.vsync_timer.take() {
+                                handle.abort();
+                            }
+                            let sender_timeout = sender.clone();
+                            self.vsync_timer = Some(
+                                relm4::spawn(async move {
+                                    sleep(Duration::from_millis(100)).await;
+                                    sender_timeout.input(Message::VsyncTimeout);
+                                })
+                                .abort_handle(),
+                            );
+                        } else {
+                            // 不是有效帧，立即放行，不阻塞流水线
+                            let _ = new_ack.send(());
+                        }
+                    }
                 }
                 Err(e) => {
                     mks_error!("Failed to process QEMU display event: {e}");
                 }
             },
 
+            FramePresented => {
+                self.tick_scheduled = false;
+                // 屏幕物理刷新成功，销毁看门狗定时器
+                if let Some(handle) = self.vsync_timer.take() {
+                    handle.abort();
+                }
+                // 解锁 QEMU
+                if let Some(ack) = self.pending_ack.take() {
+                    let _ = ack.send(());
+                }
+            }
+
+            VsyncTimeout => {
+                // 看门狗报警：GTK Tick 超过 100ms 未触发 (窗口不可见/最小化)
+                // 立即释放当前的 ACK，让虚拟机降级到 10 FPS 运行
+                // 精髓：故意不重置 self.tick_scheduled，保持 true 状态
+                // 这样后续静默渲染的帧就不会再去调用 GTK 注册回调空耗性能，
+                // 直到窗口恢复显示，旧的回调被唤醒，一切自动恢复正常。
+                if let Some(ack) = self.pending_ack.take() {
+                    let _ = ack.send(());
+                }
+            }
             SetScalingMode(mode) => {
                 self.scaling_mode = mode;
                 // 切换缩放模式会变更虚拟机分辨率
@@ -753,17 +834,35 @@ impl Component for VmDisplayModel {
             widgets.toast_overlay.add_toast(toast);
         }
         let was_forwarding_input = self.capture_state.should_forward();
+        let sender_clone = sender.clone();
         self.update(message, sender, root);
         if was_forwarding_input && !self.capture_state.should_forward() {
             self.input.release_all_keys();
         }
         let dirty_flags = mem::take(&mut self.dirty_flags);
         self.render_view(widgets, dirty_flags);
+
+        // Register GTK tick callback for VSync if we have a pending frame and ACK.
+        // This binds to the physical display refresh rate.
+        if dirty_flags.frame && self.pending_ack.is_some() && !self.tick_scheduled {
+            self.tick_scheduled = true;
+
+            // add_tick_callback registers a closure to be called after each frame is painted.
+            // This is the ultimate VSync binding - it fires when the Wayland compositor
+            // has finished presenting the frame.
+            widgets.vm_fixed.add_tick_callback(move |_, _| {
+                sender_clone.input(Message::FramePresented);
+                ControlFlow::Break // Unregister after one shot
+            });
+        }
     }
 
     fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
         self.confine_state = None;
         if let Some(handle) = self.resize_timer.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.vsync_timer.take() {
             handle.abort();
         }
     }

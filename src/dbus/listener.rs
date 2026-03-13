@@ -17,6 +17,7 @@ use Event::*;
 use derive_more::{AsRef, Deref, From, Into};
 use kanal::{AsyncReceiver, AsyncSender};
 use std::{borrow::Borrow, fmt, num::NonZeroU32};
+use tokio::sync::oneshot;
 use typed_builder::TypedBuilder;
 use zbus::{Connection, DBusError, interface};
 use zvariant::{OwnedFd, Type};
@@ -43,7 +44,7 @@ impl Borrow<[u8]> for Blob {
 }
 
 /// Unified event stream for all listener interfaces.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Event {
     /// Full framebuffer image.
     Scanout { width: NonZeroU32, height: NonZeroU32, stride: NonZeroU32, pixman_format: Pixman, data: Blob },
@@ -56,6 +57,7 @@ pub enum Event {
         stride: NonZeroU32,
         pixman_format: Pixman,
         data: Blob,
+        ack: oneshot::Sender<()>,
     },
     /// Framebuffer export through a single DMABUF fd.
     ScanoutDmabuf {
@@ -68,7 +70,7 @@ pub enum Event {
         y0_top: bool,
     },
     /// Partial update for the current DMABUF scanout.
-    UpdateDmabuf { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32 },
+    UpdateDmabuf { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: oneshot::Sender<()> },
     /// Disable display output.
     Disable,
     /// Update host cursor position/visibility.
@@ -102,7 +104,7 @@ pub enum Event {
         pixman_format: Pixman,
     },
     /// Partial update for the current mapped scanout.
-    UpdateMap { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32 },
+    UpdateMap { x: u32, y: u32, width: NonZeroU32, height: NonZeroU32, ack: oneshot::Sender<()> },
 }
 
 trait EventEmitter {
@@ -110,6 +112,24 @@ trait EventEmitter {
 
     async fn emit(&self, event: Event) -> Result<(), EmitError> {
         self.sender().send(event).await.map_err(|e| EmitError::ChannelClosed(e.to_string()))
+    }
+
+    /// Emits an event with VSync-backed ACK mechanism.
+    ///
+    /// Creates a oneshot channel, embeds the sender in the event, and waits for the receiver
+    /// to be signaled (typically from GTK FrameClock tick). The 100ms timeout decision
+    /// is delegated to the UI thread to avoid reactor conflicts in the zbus thread.
+    async fn emit_with_ack<F>(&self, make_event: F) -> Result<(), EmitError>
+    where
+        F: FnOnce(oneshot::Sender<()>) -> Event,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.emit(make_event(tx)).await?;
+
+        // Wait for UI thread to signal via the ACK channel.
+        // Timeout handling is now done in the UI thread to avoid reactor conflicts.
+        let _ = rx.await;
+        Ok(())
     }
 }
 
@@ -146,12 +166,12 @@ impl Listener {
         let x = x.try_into().unwrap();
         let y = y.try_into().unwrap();
         let width: u32 = width.try_into().unwrap();
-        let width = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
         let height: u32 = height.try_into().unwrap();
-        let height = height.try_into().unwrap();
+        let height: NonZeroU32 = height.try_into().unwrap();
         let stride = stride.try_into().unwrap();
         let pixman_format = pixman_format.into();
-        self.emit(Update { x, y, width, height, stride, pixman_format, data: data.into() }).await
+        self.emit_with_ack(|ack| Update { x, y, width, height, stride, pixman_format, data: data.into(), ack }).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -171,10 +191,10 @@ impl Listener {
         let x = x.try_into().unwrap();
         let y = y.try_into().unwrap();
         let width: u32 = width.try_into().unwrap();
-        let width = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
         let height: u32 = height.try_into().unwrap();
-        let height = height.try_into().unwrap();
-        self.emit(UpdateDmabuf { x, y, width, height }).await
+        let height: NonZeroU32 = height.try_into().unwrap();
+        self.emit_with_ack(|ack| UpdateDmabuf { x, y, width, height, ack }).await
     }
 
     async fn disable(&self) -> Result<(), EmitError> { self.emit(Event::Disable).await }
@@ -305,10 +325,10 @@ impl MapHandler {
         let x = x.try_into().unwrap();
         let y = y.try_into().unwrap();
         let width: u32 = width.try_into().unwrap();
-        let width = width.try_into().unwrap();
+        let width: NonZeroU32 = width.try_into().unwrap();
         let height: u32 = height.try_into().unwrap();
-        let height = height.try_into().unwrap();
-        self.emit(UpdateMap { x, y, width, height }).await
+        let height: NonZeroU32 = height.try_into().unwrap();
+        self.emit_with_ack(|ack| UpdateMap { x, y, width, height, ack }).await
     }
 }
 

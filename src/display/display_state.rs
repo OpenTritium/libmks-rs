@@ -1,10 +1,9 @@
 //! Screen and cursor state model.
-use super::{crop::CropInfo, gpu_passthrough::GpuPassthrough};
-use crate::{
-    dbus::listener::Event,
-    display::{BackendNotReady, Error, memmap::ImportedTexture, software_rasterizer::SoftwareRasterizer},
-    mks_error, mks_trace,
+use super::{
+    BackendNotReady, Error, crop::CropInfo, gpu_passthrough::GpuPassthrough, memmap::ImportedTexture,
+    software_rasterizer::SoftwareRasterizer,
 };
+use crate::{dbus::listener::Event, mks_error, mks_trace};
 use RenderBackend::*;
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
@@ -16,6 +15,7 @@ use std::{
     num::NonZeroU32,
     os::fd::OwnedFd,
 };
+use tokio::sync::oneshot;
 
 const LOG_TARGET: &str = "mks.display.event";
 
@@ -188,11 +188,13 @@ pub struct Screen {
 impl Screen {
     pub fn new() -> Self { Self::default() }
 
-    /// Applies one display event and returns dirty flags for frame/cursor refresh.
+    /// Applies one display event and returns dirty flags for frame/cursor refresh
+    /// along with an optional VSync ACK sender for pipelined rendering.
     #[inline]
-    pub fn handle_event(&mut self, event: Event) -> Result<DirtyFlags, Error> {
+    pub fn handle_event(&mut self, event: Event) -> Result<(DirtyFlags, Option<oneshot::Sender<()>>), Error> {
         use Event::*;
         let mut flags = DirtyFlags::default();
+        let mut extracted_ack: Option<oneshot::Sender<()>> = Option::None;
         match event {
             Scanout { width, height, stride, pixman_format, data } => {
                 self.y0_top = false;
@@ -201,7 +203,7 @@ impl Screen {
                 swapchain.full_update_texture(width, height, stride, pixman_format, data)?;
                 flags.frame = true;
             }
-            Update { x, y, width, height, stride, pixman_format, data } => {
+            Update { x, y, width, height, stride, pixman_format, data, ack } => {
                 mks_trace!(
                     "Update: rect=({x},{y} {width}x{height}), stride={stride}, pixman=0x{pixman_format:08x}, \
                      bytes={data:?}"
@@ -212,6 +214,7 @@ impl Screen {
                 }
                 swapchain.partial_update_texture(x, y, width, height, stride, pixman_format, data)?;
                 flags.frame = true;
+                extracted_ack = Some(ack);
             }
             ScanoutDmabuf { dmabuf, width, height, stride, fourcc, modifier, y0_top } => {
                 self.y0_top = y0_top;
@@ -294,7 +297,7 @@ impl Screen {
                 let (cache, _) = self.backend.ensure_direct_mapped();
                 cache.import(memfd.into(), offset, width, height, stride, pixman_format)?;
             }
-            UpdateMap { x, y, width, height } => {
+            UpdateMap { x, y, width, height, ack } => {
                 mks_trace!("UpdateMap: rect=({x},{y} {width}x{height})");
                 let (cache, new_created) = self.backend.ensure_direct_mapped();
                 if unlikely(new_created) {
@@ -303,8 +306,9 @@ impl Screen {
                 // Redraw the texture from the imported buffer
                 cache.redraw()?;
                 flags.frame = true;
+                extracted_ack = Some(ack);
             }
-            UpdateDmabuf { x, y, width, height } => {
+            UpdateDmabuf { x, y, width, height, ack } => {
                 mks_trace!("UpdateDMABUF: rect=({x},{y} {width}x{height})");
                 let GpuPassthrough(gpu) = &mut self.backend else {
                     return Err(BackendNotReady::GpuPassthrough.into());
@@ -324,6 +328,7 @@ impl Screen {
                         );
                     }
                 }
+                extracted_ack = Some(ack);
             }
             CursorDefine { width, height, hot_x, hot_y, data } => {
                 if !self.cursor.looks_same(width, height, hot_x, hot_y, &data) {
@@ -361,7 +366,7 @@ impl Screen {
                 flags.cursor = true;
             }
         }
-        Ok(flags)
+        Ok((flags, extracted_ack))
     }
 
     #[inline]

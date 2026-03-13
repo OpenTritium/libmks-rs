@@ -2,7 +2,7 @@ use super::{
     Error,
     pixman_4cc::{FourCC, Pixman},
 };
-use crate::{dbus::listener::Blob, mks_trace};
+use crate::{dbus::listener::Blob, mks_error, mks_trace};
 use relm4::gtk::{
     gdk::{MemoryFormat, MemoryTexture, Texture},
     glib::Bytes,
@@ -49,10 +49,19 @@ impl RasterSurface {
             let dst_end = dst_start + src_row_bytes;
             let src_start = i * src_stride;
             let src_end = src_start + src_row_bytes;
-            debug_assert!(
-                dst_end > self.buf.len() || src_end > src_buf.len(),
-                "Out of bounds in partial update! Skipping remaining rows."
-            );
+
+            // Safe runtime check: skip row if out of bounds instead of panicking.
+            // QEMU may send inconsistent data during resolution switches.
+            if unlikely(dst_end > self.buf.len() || src_end > src_buf.len()) {
+                mks_error!(
+                    "Out of bounds in partial update! Row {i}/{h} skipped. (dst_end={dst_end}, buf_len={}, \
+                     src_end={src_end}, src_buf_len={})",
+                    self.buf.len(),
+                    src_buf.len()
+                );
+                continue;
+            }
+
             self.buf[dst_start..dst_end].copy_from_slice(&src_buf[src_start..src_end]);
         }
     }
@@ -118,7 +127,8 @@ impl SoftwareRasterizer {
         let aw = surface.width.get();
         let ah = surface.height.get();
         if unlikely(x >= aw || y >= ah) {
-            return Err(Error::PartialUpdateOffScreen);
+            mks_trace!("Partial update entirely off-screen (x={x}, y={y} >= aw={aw}, ah={ah}). Ignoring.");
+            return Ok(());
         }
 
         // Apply clipping logic
