@@ -60,57 +60,6 @@ struct DmabufState {
     crop_height: NonZeroU32, // Viewport height
 }
 
-/// Pending DMABUF scanout metadata without imported texture.
-///
-/// This lets us defer GTK/EGL import until `UpdateDmabuf`, so the imported
-/// texture reflects a fully rendered guest frame instead of an in-progress one.
-#[derive(Debug)]
-pub struct DmabufScanout {
-    width: u32,
-    height: u32,
-    planes: Box<[PlaneDesc]>,
-    fourcc: FourCC,
-    modifier: u64,
-}
-
-impl DmabufScanout {
-    #[inline]
-    pub fn new(
-        dmabuf_fds: Vec<OwnedFd>, width: u32, height: u32, plane_strides: Vec<u32>, plane_offsets: &[u32], fourcc: u32,
-        modifier: u64,
-    ) -> Self {
-        let planes: Box<[PlaneDesc]> = dmabuf_fds
-            .into_iter()
-            .zip(plane_strides)
-            .zip(plane_offsets.iter().copied())
-            .map(|((fd, stride), offset)| PlaneDesc { fd: Arc::new(fd), stride, offset })
-            .collect();
-        Self { width, height, planes, fourcc: FourCC::from(fourcc), modifier }
-    }
-
-    #[inline]
-    pub fn import(self) -> Result<GpuPassthrough, Error> {
-        let (texture, fourcc) = GpuPassthrough::build_texture(
-            self.width,
-            self.height,
-            self.fourcc,
-            self.modifier,
-            &self.planes,
-            None,
-            None,
-        )?;
-        Ok(GpuPassthrough {
-            texture,
-            planes: self.planes,
-            fourcc,
-            modifier: self.modifier,
-            width: self.width,
-            height: self.height,
-            pending_presentation: true,
-        })
-    }
-}
-
 /// GPU-backed scanout state for DMA-BUF paths.
 ///
 /// Prepare (`Scanout*`) only stages state. Commit (`UpdateDMABUF`) performs
