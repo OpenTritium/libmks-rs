@@ -344,7 +344,7 @@ impl InputHandler {
     }
 }
 
-/// 挂载所有与输入相关的 GTK Event Controllers 并将事件映射到 Message 转发给主模型
+/// Attaches all input-related GTK Event Controllers and maps events to Messages for the main model
 pub fn attach_gtk_controllers(
     input_overlay: &DrawingArea, root: &ToastOverlay, sender: &ComponentSender<VmDisplayModel>,
     grab_shortcut: GrabShortcut,

@@ -49,6 +49,7 @@ impl Coordinate {
 
     /// Returns the physical canvas size.
     ///
+    /// Returns `(physical_width, physical_height)`:
     /// - `physical_width`: canvas width in physical pixels.
     /// - `physical_height`: canvas height in physical pixels.
     ///
@@ -108,6 +109,7 @@ impl Coordinate {
 
     /// Maps a widget logical point to clamped VM coordinates.
     ///
+    /// Returns `(guest_x, guest_y)`:
     /// - `guest_x`: guest X coordinate in pixels.
     /// - `guest_y`: guest Y coordinate in pixels.
     #[inline]
@@ -134,9 +136,7 @@ impl Coordinate {
     /// - `width`: display width in widget logical coordinates.
     /// - `height`: display height in widget logical coordinates.
     ///
-    /// Returns `None` when VM resolution is unknown (`vm_w == 0 || vm_h == 0`) or
-    /// widget dimensions are invalid (`widget_w <= 0 || widget_h <= 0`), such as during
-    /// initial setup or when the display is disabled.
+    /// Returns `None` when VM resolution is unknown or widget dimensions are invalid.
     #[inline]
     pub fn vm_display_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         let viewport = self.get_cached_viewport()?;

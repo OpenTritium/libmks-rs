@@ -241,8 +241,9 @@ impl VmDisplayModel {
         .into();
     }
 
-    /// Returns the input overlay bounds for pointer confinement.
+    /// Returns input overlay bounds for pointer confinement.
     ///
+    /// Returns `(x, y, width, height)`:
     /// - `x`: left edge in native-surface coordinates.
     /// - `y`: top edge in native-surface coordinates.
     /// - `width`: confined width in pixels.
@@ -300,22 +301,22 @@ impl VmDisplayModel {
             if let Some((offset_x, offset_y, viewport_w, viewport_h)) = self.coord_system.vm_display_bounds() {
                 let req_w = viewport_w.ceil().max(1.) as i32;
                 let req_h = viewport_h.ceil().max(1.) as i32;
-                // 调整画面大小
+                // Resize frame to match host window
                 if widgets.vm_picture.width_request() != req_w || widgets.vm_picture.height_request() != req_h {
                     widgets.vm_picture.set_size_request(req_w, req_h);
                 }
 
-                // 从 GPU buffer 原始尺寸到显示尺寸的缩放系数
+                // Scale from GPU buffer raw dimensions to display dimensions
                 let crop = self.screen.crop_info();
                 let scale = viewport_w / crop.map(|c| c.width).unwrap_or(viewport_w);
 
-                // 这里根据 y0 top 垂直翻转一下画面
+                // Flip vertically based on y0_top orientation
                 let mut matrix = if self.screen.y0_top {
                     Transform::new().translate(&Point::new(offset_x, offset_y + viewport_h)).scale(1., -1.)
                 } else {
                     Transform::new().translate(&Point::new(offset_x, offset_y))
                 };
-                // 如果 crop 中的 x y 偏移不为0,我们还得变换一下
+                // Apply x/y offset from crop if non-zero
                 if let Some(c) = crop
                     && (c.x != 0. || c.y != 0.)
                 {
@@ -326,7 +327,7 @@ impl VmDisplayModel {
                 widgets.vm_fixed.set_child_transform(&widgets.vm_picture, None);
             }
 
-            // 设置背景画面
+            // Set background frame
             let texture = self.screen.get_background_texture();
             if let Some(texture) = texture {
                 mks_trace!(
@@ -342,9 +343,9 @@ impl VmDisplayModel {
             }
         }
         let cursor = &self.screen.cursor;
-        // qemu发送的硬件光标是否可见 && 当前是否允许输入转发 可以决定当前画面上是否显示光标
+        // Cursor visibility: QEMU hardware cursor visible && input forwarding allowed
         let cursor_visible = cursor.visible && is_interactive;
-        // 设置光标显示
+        // Set cursor visibility
         widgets.cursor_picture.set_visible(cursor_visible);
         if !cursor_visible {
             return;
@@ -356,14 +357,14 @@ impl VmDisplayModel {
         widgets.cursor_picture.set_paintable(Some(texture));
         let tex_w = texture.width();
         let tex_h = texture.height();
-        // 调整鼠标大小
+        // Resize cursor to match texture
         if widgets.cursor_picture.width_request() != tex_w || widgets.cursor_picture.height_request() != tex_h {
             widgets.cursor_picture.set_size_request(tex_w, tex_h);
         }
         let Some(transform) = self.coord_system.get_cached_viewport() else {
             return;
         };
-        //  VM 画面在 widget 中的显示缩放比例
+        // VM frame display scale within widget
         let scale = transform.scale;
         let (offset_x, offset_y) = (transform.offset_x, transform.offset_y);
         // Intentionally align by cursor image top-left, not hotspot.
@@ -373,7 +374,7 @@ impl VmDisplayModel {
         let anchor_y = offset_y + guest_y as f32 * scale;
         let draw_x = anchor_x.round();
         let draw_y = anchor_y.round();
-        // 光标也要跟着缩放
+        // Cursor also needs to be scaled
         let matrix = Transform::new().translate(&Point::new(draw_x, draw_y)).scale(scale, scale);
         widgets.cursor_fixed.set_child_transform(&widgets.cursor_picture, Some(&matrix));
     }
@@ -448,9 +449,9 @@ impl Component for VmDisplayModel {
             vsync_timer: None,
         };
 
-        // 在输入层挂载 resize 控制器
+        // Attach resize handlers to input layer
         monitor_metrics::attach_resize_handlers(&input_overlay, &sender);
-        // 在输入层挂载诸多控制器
+        // Attach various controllers to input layer
         attach_gtk_controllers(&input_overlay, &root, &sender, grab_shortcut);
 
         // Set up overlays
@@ -461,7 +462,7 @@ impl Component for VmDisplayModel {
         view_stack.set_measure_overlay(&cursor_fixed, false);
         root.set_child(Some(&view_stack));
 
-        // 将qemu 的事件转发到组件事件循环
+        // Forward QEMU events to component event loop
         relm4::spawn(async move {
             while let Ok(event) = init.rx.recv().await {
                 sender.input(Qemu(event));
@@ -486,9 +487,9 @@ impl Component for VmDisplayModel {
         use Message::*;
         match msg {
             SetInputCaptureMode(mode) => {
-                // 我想将输入设置到这个模式
+                // Requested input capture mode
                 self.requested_input_mode = mode;
-                // 如果你想设置到无缝模式但是没有绝对指针,我们会选择不采纳你的请求,并重置一系列状态
+                // Seamless mode requires absolute pointer; reject request and reset state if unavailable
                 if mode == PointerPolicy::Auto && !self.input.is_absolute {
                     mks_warn!("Seamless capture requires absolute guest mouse mode; ignoring request");
                     mks_debug!(
@@ -505,19 +506,19 @@ impl Component for VmDisplayModel {
                     sender.input(UpdateCaptureView);
                     return;
                 }
-                // 如果当前已经是这个输入模式了就直接返回
+                // Already in requested mode; skip
                 if self.current_input_policy() == mode {
                     mks_debug!("Input capture mode already set to {mode:?}; ignoring duplicate request");
                     return;
                 }
-                // 下面的情况一定是输入模式不一样
+                // Mode mismatch requires transition
                 self.capture_state.release();
-                // 注销 wayland confine
+                // Disconnect Wayland confine
                 if self.confine_state.take().is_some() {
                     sender.input(UpdateCaptureView);
                     return;
                 }
-                // 没有鼠标能力,你往鼠标 proxy 发送消息没用,记得检查一下什么时候更新鼠标能力
+                // Mouse capability unavailable; cannot enter confined mode
                 if !self.input.capability.mouse {
                     mks_error!("Mouse capability unavailable; cannot enter confined mode (keeping seamless mode)");
                     return;
@@ -549,7 +550,7 @@ impl Component for VmDisplayModel {
             }
 
             MouseMove { x, y } => {
-                // 如果当前是无缝模式,但不支持绝对指针
+                // Seamless mode without absolute pointer support
                 if self.current_input_policy() == PointerPolicy::Auto && !self.input.is_absolute {
                     let had_capture = self.capture_state.should_forward();
                     self.capture_state.release();
@@ -562,7 +563,7 @@ impl Component for VmDisplayModel {
                 let current_capture = self.capture_state.current();
                 let is_in_viewport = self.coord_system.is_in_viewport(x, y);
                 match (current_mode, current_capture, is_in_viewport) {
-                    //当前无缝,但没捕获且光标进入画面 -> 先移动光标到捕获位置,切换捕获状态,再展示
+                    // Seamless mode, not captured, cursor enters viewport: move cursor, transition state, then render
                     (PointerPolicy::Auto, PointerState::Inactive, true) => {
                         // Move mouse to new position before showing cursor to avoid flicker
                         self.input.move_mouse_to(x, y, &self.coord_system);
@@ -570,19 +571,18 @@ impl Component for VmDisplayModel {
                         sender.input(UpdateCaptureView);
                     }
 
-                    // 当前无缝,并且捕获也无缝,但是鼠标出画面了,更新捕获状态再展示
+                    // Seamless mode: cursor left viewport, update capture state
                     (PointerPolicy::Auto, PointerState::Tracking, false) => {
                         self.capture_state.leave();
                         sender.input(UpdateCaptureView);
                     }
-                    // 考虑这种奇葩情况,没有 confined state 但是 捕获状态却是
-                    // confined,这是严重的状态不同步几乎不太可能触发
+                    // Edge case: confined state without confine_state (severe desync)
                     (PointerPolicy::Auto, PointerState::Captured, _) => {
                         unreachable!("")
                     }
-                    // 这里不关心
+                    // Not relevant here
                     (_, _, true) => {
-                        // 让限制模式下的鼠标移动事件别穿透进去
+                        // Prevent mouse events from leaking through in confined mode
                         if !self.capture_state.should_forward() {
                             return;
                         }
@@ -591,19 +591,19 @@ impl Component for VmDisplayModel {
                     _ => {}
                 }
             }
-            // 创建 confine 和 设置 confine 是两个事件,这个事件基于 confine_state 已经被创建的前提下工作
+            // SetConfined event requires confine_state to be already created
             SetConfined(event) => {
                 let mode = self.current_input_policy();
                 if mode != PointerPolicy::Locked {
                     mks_warn!("Ignore set-confined Event {event:?}");
-                    // 只有在指针策略为锁定的时候这个事件才有意义
+                    // Only meaningful when pointer policy is locked
                     return;
                 }
                 let should_capture = event.should_capture();
-                // 假如事件告诉你应该取消捕获,我们就 unconfine,然后提前返回
+                // Release capture if event indicates stop
                 if !should_capture {
                     self.capture_state.release();
-                    // 没错一切基于 confine_state 已经创建
+                    // Assume confine_state already exists
                     let Some(confine) = &mut self.confine_state else {
                         mks_error!("Confined state unavailable while stopping pointer capture");
                         return;
@@ -613,13 +613,12 @@ impl Component for VmDisplayModel {
                     sender.input(UpdateCaptureView);
                     return;
                 }
-                // 如果当前已经处于捕获状态，直接忽略重复的捕获请求
-                // 防止每次在虚拟机内点击鼠标时都向 Wayland 发送重复的 confine 请求
+                // Already captured; ignore duplicate requests to avoid repeated Wayland confine calls
                 if self.capture_state.current() == PointerState::Captured {
                     mks_trace!("Pointer is already captured; ignoring duplicate capture request");
                     return;
                 }
-                // 到这里我们进入了 confine 分支
+                // Enter confine branch
                 let widget_rect = self.confined_widget_rect();
                 let click_pos = event.click_pos();
                 let vm_coords = click_pos.and_then(|(x, y)| self.coord_system.widget_to_guest(x, y));
@@ -631,7 +630,7 @@ impl Component for VmDisplayModel {
                 let confine_ok = self.confine_state.as_ref().is_some_and(|confine| {
                     confine.wayland_confine.borrow_mut().confine_pointer(&wl_surface, widget_rect, prefer_relative)
                 });
-                // 很抱歉囚禁失败
+                // Confine failed
                 if !confine_ok {
                     mks_error!("Failed to establish Wayland pointer confinement");
                     self.show_confined_capture_unavailable_toast(prefer_relative, &sender);
@@ -663,16 +662,16 @@ impl Component for VmDisplayModel {
                     self.dirty_flags.merge(flags);
 
                     // ==========================================
-                    // 完美流水线 VSync 逻辑 (Pipelined VSync)
+                    // Pipelined VSync logic
                     // ==========================================
                     if let Some(new_ack) = ack {
                         if flags.frame {
-                            // 是有效帧，立刻放行前面积压的旧帧，允许 QEMU 超前渲染 1 帧
+                            // Valid frame: release pending ACK, allow QEMU to render 1 frame ahead
                             if let Some(old_ack) = self.pending_ack.replace(new_ack) {
                                 let _ = old_ack.send(());
                             }
 
-                            // 每次存入新的 ACK，启动 100ms 安全看门狗
+                            // Store new ACK, start 100ms watchdog timer
                             if let Some(handle) = self.vsync_timer.take() {
                                 handle.abort();
                             }
@@ -685,7 +684,7 @@ impl Component for VmDisplayModel {
                                 .abort_handle(),
                             );
                         } else {
-                            // 不是有效帧，立即放行，不阻塞流水线
+                            // Invalid frame: release immediately, don't block pipeline
                             let _ = new_ack.send(());
                         }
                     }
@@ -697,29 +696,28 @@ impl Component for VmDisplayModel {
 
             FramePresented => {
                 self.tick_scheduled = false;
-                // 屏幕物理刷新成功，销毁看门狗定时器
+                // Physical screen refresh succeeded, destroy watchdog timer
                 if let Some(handle) = self.vsync_timer.take() {
                     handle.abort();
                 }
-                // 解锁 QEMU
+                // Unlock QEMU
                 if let Some(ack) = self.pending_ack.take() {
                     let _ = ack.send(());
                 }
             }
 
             VsyncTimeout => {
-                // 看门狗报警：GTK Tick 超过 100ms 未触发 (窗口不可见/最小化)
-                // 立即释放当前的 ACK，让虚拟机降级到 10 FPS 运行
-                // 精髓：故意不重置 self.tick_scheduled，保持 true 状态
-                // 这样后续静默渲染的帧就不会再去调用 GTK 注册回调空耗性能，
-                // 直到窗口恢复显示，旧的回调被唤醒，一切自动恢复正常。
+                // Watchdog triggered: GTK Tick not fired for 100ms (window invisible/minimized)
+                // Release current ACK to let VM degrade to 10 FPS
+                // Keep tick_scheduled=true to avoid GTK callback overhead for silent frames
+                // until window restores and old callback wakes up
                 if let Some(ack) = self.pending_ack.take() {
                     let _ = ack.send(());
                 }
             }
             SetScalingMode(mode) => {
                 self.scaling_mode = mode;
-                // 切换缩放模式会变更虚拟机分辨率
+                // Scaling mode change triggers VM resolution update
                 if mode == ScalingMode::ResizeGuest
                     && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
                 {
@@ -728,9 +726,9 @@ impl Component for VmDisplayModel {
             }
 
             CanvasResize { logical_width, logical_height } => {
-                // 更新坐标系统中的控件大小
+                // Update coordinate system widget size
                 self.coord_system.set_widget_size(logical_width, logical_height);
-                // 用于检查 widget 是否已附加到窗口。如果未附加，scale_factor() 返回的值是未定义/无效的。
+                // Check if widget is attached to window; scale_factor() returns undefined if not
                 if self.input_overlay.native().is_some() {
                     self.coord_system.ui_scale = self.input_overlay.scale_factor() as f32;
                 }
