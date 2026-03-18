@@ -219,26 +219,30 @@ impl VmDisplayModel {
     }
 
     fn set_keyboard_shortcuts_inhibit(&mut self, inhibit: bool) {
-        let Some(surface) = self.current_wayland_surface() else {
-            if inhibit {
+        if inhibit {
+            let Some(surface) = self.current_wayland_surface() else {
                 mks_error!("Failed to resolve wl_surface proxy; cannot inhibit shortcuts");
-            }
-            return;
-        };
-        // Lazily connect to Wayland when we first need shortcut inhibition.
-        if self.confine_state.is_none() {
-            let Some(tx) = self.input.input_cmd_tx().cloned() else {
-                mks_error!("Input command channel unavailable; cannot connect to Wayland for shortcut inhibition");
                 return;
             };
-            self.confine_state = ConfineState::connect_to_wayland(tx);
-        }
-        let Some(confine) = self.confine_state.as_mut() else {
-            return;
-        };
-        if inhibit {
+            // Lazily connect to Wayland when we first need shortcut inhibition.
+            if self.confine_state.is_none() {
+                let Some(tx) = self.input.input_cmd_tx().cloned() else {
+                    mks_error!(
+                        "Input command channel unavailable; cannot connect to Wayland for shortcut inhibition"
+                    );
+                    return;
+                };
+                self.confine_state = ConfineState::connect_to_wayland(tx);
+            }
+            let Some(confine) = self.confine_state.as_mut() else {
+                return;
+            };
             confine.wayland_confine.borrow_mut().inhibit_shortcuts(&surface);
         } else {
+            // No active confine session; nothing to uninhibit.
+            let Some(confine) = self.confine_state.as_mut() else {
+                return;
+            };
             confine.wayland_confine.borrow_mut().uninhibit_shortcuts();
         }
     }
@@ -683,7 +687,14 @@ impl Component for VmDisplayModel {
                 }
                 self.capture_state.capture(mode);
                 if let Some(confine) = self.confine_state.as_mut() {
-                    confine.wayland_confine.borrow_mut().inhibit_shortcuts(&wl_surface);
+                    let shortcuts_ok =
+                        confine.wayland_confine.borrow_mut().inhibit_shortcuts(&wl_surface);
+                    if !shortcuts_ok {
+                        mks_warn!(
+                            "Pointer confinement active but failed to inhibit keyboard shortcuts; \
+                             host shortcuts may remain available during locked capture"
+                        );
+                    }
                 }
                 self.show_toast(format!("Press {} to release mouse", self.grab_shortcut), sender.clone());
                 if self.input.is_absolute
@@ -875,14 +886,18 @@ impl Component for VmDisplayModel {
             toast.set_timeout(TOAST_DURATION_SECS);
             widgets.toast_overlay.add_toast(toast);
         }
+        let prev_policy = self.effective_input_policy();
         let was_forwarding_input = self.capture_state.should_forward();
         let sender_clone = sender.clone();
         self.update(message, sender, root);
         let now_forwarding_input = self.capture_state.should_forward();
-        if was_forwarding_input != now_forwarding_input {
-            // Exclusive keyboard behavior: Locked => active when captured, Auto => active when in viewport.
-            // We reuse the capture state machine's "should_forward" decision.
-            self.set_keyboard_shortcuts_inhibit(now_forwarding_input);
+        let next_policy = self.effective_input_policy();
+        let prev_inhibit = prev_policy == PointerPolicy::Locked && was_forwarding_input;
+        let next_inhibit = next_policy == PointerPolicy::Locked && now_forwarding_input;
+        if prev_inhibit != next_inhibit {
+            // Exclusive keyboard behavior: only inhibit host shortcuts when in locked mode
+            // and the pointer is actively captured.
+            self.set_keyboard_shortcuts_inhibit(next_inhibit);
         }
         if was_forwarding_input && !now_forwarding_input {
             self.input.release_all_keys();
