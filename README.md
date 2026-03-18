@@ -12,3 +12,8 @@ A Rust library for interacting with QEMU virtual machines via D-Bus, providing d
 - **Input Control**: Mouse, keyboard, and multitouch event handling
 - **Wayland Support**: Wayland pointer constraints protocol
 - **Async Architecture**: Built on tokio async runtime
+
+## TODO
+
+- xe 驱动有问题导致 venus 崩溃
+- userspace vhost

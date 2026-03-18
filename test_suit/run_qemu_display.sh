@@ -1,177 +1,75 @@
 #!/bin/bash
 
-# Configuration
-ISO_PATH="livecd.ubuntu.iso"
-RAM_SIZE="8G"
-CPU_CORES="8"
+# 配置
+ISO="livecd.fedora.iso"
+RAM="8G"
+CPU="8"
 
-# Default settings
-GPU_MODE="virtgpu"
-MOUSE_MODE="relative"
+# 默认设置
+GPU="virtgpu"
+NET="user"
+MOUSE="relative"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# Print Help
-print_help() {
-    echo -e "${CYAN}Usage: $0 [OPTIONS]${NC}"
-    echo ""
-    echo "Options:"
-    echo "  -g, --gpu <mode>     Set GPU mode: ${YELLOW}vga, virtgpu, virtgpu-vulkan${NC} (default: $GPU_MODE)"
-    echo "  -m, --mouse <mode>   Set Mouse mode: ${YELLOW}relative, absolute${NC} (default: $MOUSE_MODE)"
-    echo "  -h, --help           Show this help message"
-    echo ""
-    echo "Mouse Drivers (Using Latest VirtIO):"
-    echo "  relative -> virtio-mouse-pci   (Best for gaming/FPS, sends raw dx/dy)"
-    echo "  absolute -> virtio-tablet-pci  (Best for UI/Desktop, perfectly syncs cursor)"
-    echo ""
-    echo "Examples:"
-    echo "  $0 -g virtgpu -m relative"
-    echo "  $0 --gpu virtgpu-vulkan --mouse absolute"
-    exit 0
+# 清理进程
+cleanup() {
+    [ -n "$QEMU_PID" ] && kill -TERM "$QEMU_PID" 2>/dev/null
+    [ -n "$PASST_PID" ] && kill -TERM "$PASST_PID" 2>/dev/null
+    rm -f /tmp/vm_net_$$.socket
 }
+trap cleanup EXIT INT TERM
 
-# Parse command line arguments
+# 参数解析
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -g|--gpu)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                echo -e "${RED}Error: Missing value for $1${NC}"
-                print_help
-            fi
-            GPU_MODE="$2"
-            shift 2
-            ;;
-        -m|--mouse)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                echo -e "${RED}Error: Missing value for $1${NC}"
-                print_help
-            fi
-            MOUSE_MODE="$2"
-            shift 2
-            ;;
-        -h|--help)
-            print_help
-            ;;
-        *)
-            echo -e "${RED}Unknown option: $1${NC}"
-            print_help
-            ;;
+        -g|--gpu) GPU="$2"; shift 2 ;;
+        -n|--net) NET="$2"; shift 2 ;;
+        -m|--mouse) MOUSE="$2"; shift 2 ;;
+        *) exit 1 ;;
     esac
 done
 
-echo -e "${YELLOW}=== Starting QEMU with D-Bus Display ===${NC}"
-echo "GPU Mode:   $GPU_MODE"
-echo "Mouse Mode: $MOUSE_MODE"
+# 构建参数组
+ARGS=(
+    -enable-kvm -smp "$CPU" -m "$RAM"
+    -name "Fedora-VM" -uuid "12345678-1234-5678-1234-567812345678"
+    -machine "q35,memory-backend=mem"
+    -object "memory-backend-memfd,id=mem,size=$RAM,share=on"
+    -cdrom "$ISO"
+    -no-reboot
+    -device "virtio-keyboard-pci"
+)
 
-# -----------------------------------------------------------------------------
-# 1. Configure Mouse Arguments
-# -----------------------------------------------------------------------------
-if [[ "$MOUSE_MODE" == "absolute" ]]; then
-    # Modern virtio-tablet instead of legacy usb-tablet
-    MOUSE_ARGS=("-device" "virtio-tablet-pci")
-elif [[ "$MOUSE_MODE" == "relative" ]]; then
-    MOUSE_ARGS=("-device" "virtio-mouse-pci")
-else
-    echo -e "${RED}Error: Invalid mouse mode '$MOUSE_MODE'. Use 'relative' or 'absolute'.${NC}"
-    exit 1
-fi
-
-# -----------------------------------------------------------------------------
-# 2. Configure GPU, Display, and Machine/Memory Arguments
-# -----------------------------------------------------------------------------
-# Base machine args (will be appended with shared memory if needed)
-MACHINE_ARGS=("-machine" "q35")
-MEMORY_ARGS=("-m" "$RAM_SIZE")
-DISPLAY_ARGS=()
-VGA_ARGS=()
-
-case "$GPU_MODE" in
+# GPU 逻辑
+case "$GPU" in
     vga)
-        # VirtIO 2D mode: modern driver path without OpenGL/shared-memory requirements
-        MACHINE_ARGS=("-machine" "q35")
-        MEMORY_ARGS=("-m" "$RAM_SIZE")
-        DISPLAY_ARGS=("-display" "dbus")
-        VGA_ARGS=("-device" "virtio-vga,max_outputs=1,xres=1920,yres=1080")
+        ARGS+=("-display" "dbus" "-device" "virtio-vga")
         ;;
     virtgpu)
-        # VirtIO GPU with VirGL 3D (requires OpenGL on DBus and Shared Memory for DMABUF)
-        MACHINE_ARGS=("-machine" "q35,memory-backend=mem")
-        MEMORY_ARGS=("-object" "memory-backend-memfd,id=mem,size=$RAM_SIZE,share=on" "-m" "$RAM_SIZE")
-        DISPLAY_ARGS=("-display" "dbus,gl=on")
-        VGA_ARGS=("-device" "virtio-vga-gl,max_outputs=1,xres=1920,yres=1080")
+        ARGS+=("-display" "dbus,gl=on" "-device" "virtio-vga-gl")
         ;;
     virtgpu-vulkan)
-        # VirtIO GPU with Venus Vulkan support (Requires hostmem, blob, and Venus enabled)
-        MACHINE_ARGS=("-machine" "q35,memory-backend=mem")
-        MEMORY_ARGS=("-object" "memory-backend-memfd,id=mem,size=$RAM_SIZE,share=on" "-m" "$RAM_SIZE")
-        DISPLAY_ARGS=("-display" "dbus,gl=on")
-        # hostmem requires a size; blob=true and venus=on are required for Vulkan support.
-        VGA_ARGS=("-device" "virtio-vga-gl,max_outputs=1,xres=1920,yres=1080,blob=true,hostmem=4G,venus=on")
-        ;;
-    *)
-        echo -e "${RED}Error: Invalid GPU mode '$GPU_MODE'. Use 'vga', 'virtgpu', or 'virtgpu-vulkan'.${NC}"
-        exit 1
+        ARGS+=("-display" "dbus,gl=on" "-device" "virtio-vga-gl,blob=true,hostmem=4G,venus=on")
         ;;
 esac
 
-# -----------------------------------------------------------------------------
-# 3. Pre-flight Checks & Cleanup
-# -----------------------------------------------------------------------------
-if [ ! -f "$ISO_PATH" ]; then
-    echo -e "${RED}Error: ISO file $ISO_PATH not found${NC}"
-    exit 1
+# 网络逻辑
+if [[ "$NET" == "passt-vhost" ]]; then
+    passt --vhost-user -1 -t none -u none -s /tmp/vm_net_$$.socket & PASST_PID=$!
+    ARGS+=("-chardev" "socket,id=net0,path=/tmp/vm_net_$$.socket" "-netdev" "vhost-user,id=net0,chardev=net0" "-device" "virtio-net-pci,netdev=net0")
+else
+    ARGS+=("-netdev" "user,id=net0" "-device" "virtio-net-pci,netdev=net0")
 fi
 
-# Clean up any existing QEMU process
-echo "Cleaning up existing processes..."
-pkill -9 qemu-system-x86_64 2>/dev/null || true
-sleep 1
+# 鼠标逻辑
+ARGS+=("-device" "$([[ "$MOUSE" == "absolute" ]] && echo "virtio-tablet-pci" || echo "virtio-mouse-pci")")
 
-# -----------------------------------------------------------------------------
-# 4. Build and Execute QEMU Command
-# -----------------------------------------------------------------------------
-# Enable Vulkan validation and VirGL debugging
-export VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation"
-export VIRGL_DEBUG="all,guest_errors"
-# export VKR_DEBUG=no_async
+# 打印命令（使用 printf 将数组优雅地展示出来）
+echo -e "\033[0;32mStarting QEMU command:\033[0m"
+printf "%s " qemu-system-x86_64 "${ARGS[@]}"
+echo -e "\n"
 
-echo -e "${GREEN}Starting QEMU...${NC}"
-echo "QEMU will register on D-Bus session bus as 'org.qemu'"
-echo ""
-echo "In another terminal, run your rust client based on the mode you chose."
+# 启动
+qemu-system-x86_64 "${ARGS[@]}" &
+QEMU_PID=$!
 
-QEMU_CMD=(
-    qemu-system-x86_64
-    "${MACHINE_ARGS[@]}"
-    "${MEMORY_ARGS[@]}"
-    -smp "$CPU_CORES"
-    -cdrom "$ISO_PATH"
-    -boot d
-    -enable-kvm
-    "${DISPLAY_ARGS[@]}"
-    -device virtio-keyboard-pci
-    "${VGA_ARGS[@]}"
-    -usb
-    "${MOUSE_ARGS[@]}"
-    -device usb-kbd
-    -net nic,model=virtio
-    -net user
-    -k en-us
-    -no-reboot
-    -d guest_errors
-)
-
-echo -e "${CYAN}Executing: ${QEMU_CMD[*]}${NC}"
-echo "------------------------------------------------------------------"
-
-# Enable core dump generation (required for debugging crashes)
-ulimit -c unlimited
-
-"${QEMU_CMD[@]}"
-
-echo -e "${YELLOW}QEMU exited${NC}"
+wait "$QEMU_PID"
