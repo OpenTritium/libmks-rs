@@ -30,6 +30,10 @@ use wayland_protocols::wp::{
         zwp_locked_pointer_v1::ZwpLockedPointerV1,
         zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
     },
+    keyboard_shortcuts_inhibit::zv1::client::{
+        zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+    },
     relative_pointer::zv1::client::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
@@ -41,9 +45,13 @@ const LOG_TARGET: &str = "mks.display.wayland";
 pub struct WaylandState {
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
+    shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     compositor: Option<WlCompositor>,
+    seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
+    shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     pointer_capture: PointerCapture,
+    seat_global: Option<u32>,
     input_tx: Sender<InputCommand>,
     rel_x_residue: f64,
     rel_y_residue: f64,
@@ -54,9 +62,13 @@ impl WaylandState {
         Self {
             pointer_constraints: None,
             relative_pointer_manager: None,
+            shortcuts_inhibit_manager: None,
             compositor: None,
+            seat: None,
             pointer: None,
+            shortcuts_inhibitor: None,
             pointer_capture: PointerCapture::None,
+            seat_global: None,
             input_tx,
             rel_x_residue: 0.,
             rel_y_residue: 0.,
@@ -178,6 +190,41 @@ impl WaylandConfine {
         }
     }
 
+    /// Inhibits compositor/global shortcuts for the given surface.
+    ///
+    /// Returns `true` only when the inhibitor is active (or already active).
+    pub fn inhibit_shortcuts(&mut self, surface: &WlSurface) -> bool {
+        if self.state.shortcuts_inhibitor.is_some() {
+            return true;
+        }
+        let Some(manager) = self.state.shortcuts_inhibit_manager.as_ref() else {
+            mks_warn!("Wayland keyboard-shortcuts-inhibit protocol unavailable; cannot inhibit shortcuts");
+            return false;
+        };
+        let Some(seat) = self.state.seat.as_ref() else {
+            mks_error!("Wayland seat unavailable; cannot inhibit shortcuts");
+            return false;
+        };
+        let inhibitor = manager.inhibit_shortcuts(surface, seat, &self.handle, ());
+        self.state.shortcuts_inhibitor = Some(inhibitor);
+        if let Err(e) = self.conn.flush() {
+            mks_error!(error:? = e; "Failed to flush Wayland connection after shortcut inhibit");
+        }
+        mks_info!("Keyboard shortcuts inhibited for surface");
+        true
+    }
+
+    pub fn uninhibit_shortcuts(&mut self) {
+        let Some(inhibitor) = self.state.shortcuts_inhibitor.take() else {
+            return;
+        };
+        inhibitor.destroy();
+        if let Err(e) = self.conn.flush() {
+            mks_error!(error:? = e; "Failed to flush Wayland connection after shortcut uninhibit");
+        }
+        mks_info!("Keyboard shortcuts inhibition released");
+    }
+
     #[inline]
     pub fn dispatch_pending(&mut self) {
         if let Err(e) = self.queue.dispatch_pending(&mut self.state) {
@@ -201,22 +248,43 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
         state: &mut Self, registry: &WlRegistry, event: wl_registry::Event, _: &(), _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version: _ } = event {
-            match interface.as_str() {
-                "zwp_pointer_constraints_v1" => {
-                    state.pointer_constraints = Some(registry.bind(name, 1, qh, ()));
+        match event {
+            wl_registry::Event::Global { name, interface, version: _ } => {
+                match interface.as_str() {
+                    "zwp_pointer_constraints_v1" => {
+                        state.pointer_constraints = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
+                        state.shortcuts_inhibit_manager = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    "zwp_relative_pointer_manager_v1" => {
+                        state.relative_pointer_manager = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    "wl_seat" => {
+                        // Track a single seat for now; support replacement via GlobalRemove.
+                        if state.seat.is_none() {
+                            state.seat = Some(registry.bind(name, 1, qh, ()));
+                            state.seat_global = Some(name);
+                        }
+                    }
+                    "wl_compositor" => {
+                        state.compositor = Some(registry.bind(name, 1, qh, ()));
+                    }
+                    _ => {}
                 }
-                "zwp_relative_pointer_manager_v1" => {
-                    state.relative_pointer_manager = Some(registry.bind(name, 1, qh, ()));
-                }
-                "wl_seat" => {
-                    let _seat: WlSeat = registry.bind(name, 1, qh, ());
-                }
-                "wl_compositor" => {
-                    state.compositor = Some(registry.bind(name, 1, qh, ()));
-                }
-                _ => {}
             }
+            wl_registry::Event::GlobalRemove { name } => {
+                // Handle dynamic removal of globals so we don't keep stale objects.
+                if state.seat_global == Some(name) {
+                    mks_info!("Seat global removed; clearing seat, pointer, and shortcuts inhibitor state");
+                    state.seat_global = None;
+                    state.seat = None;
+                    state.pointer = None;
+                    state.shortcuts_inhibitor = None;
+                    state.pointer_capture = PointerCapture::None;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -282,6 +350,8 @@ macro_rules! empty_dispatch {
 
 empty_dispatch!(
     ZwpPointerConstraintsV1,
+    ZwpKeyboardShortcutsInhibitManagerV1,
+    ZwpKeyboardShortcutsInhibitorV1,
     ZwpRelativePointerManagerV1,
     ZwpConfinedPointerV1,
     ZwpLockedPointerV1,
@@ -318,6 +388,7 @@ impl Drop for ConfineState {
         if let Some(source) = self.poll_source.take() {
             source.remove();
         }
+        self.wayland_confine.borrow_mut().uninhibit_shortcuts();
         self.wayland_confine.borrow_mut().unconfine();
     }
 }

@@ -211,11 +211,35 @@ pub struct VmDisplayInit {
 
 impl VmDisplayModel {
     #[inline]
-    const fn current_input_policy(&self) -> PointerPolicy {
-        if self.confine_state.is_some() {
-            PointerPolicy::Locked
+    const fn effective_input_policy(&self) -> PointerPolicy {
+        match self.requested_input_mode {
+            PointerPolicy::Locked if self.confine_state.is_some() => PointerPolicy::Locked,
+            _ => PointerPolicy::Auto,
+        }
+    }
+
+    fn set_keyboard_shortcuts_inhibit(&mut self, inhibit: bool) {
+        let Some(surface) = self.current_wayland_surface() else {
+            if inhibit {
+                mks_error!("Failed to resolve wl_surface proxy; cannot inhibit shortcuts");
+            }
+            return;
+        };
+        // Lazily connect to Wayland when we first need shortcut inhibition.
+        if self.confine_state.is_none() {
+            let Some(tx) = self.input.input_cmd_tx().cloned() else {
+                mks_error!("Input command channel unavailable; cannot connect to Wayland for shortcut inhibition");
+                return;
+            };
+            self.confine_state = ConfineState::connect_to_wayland(tx);
+        }
+        let Some(confine) = self.confine_state.as_mut() else {
+            return;
+        };
+        if inhibit {
+            confine.wayland_confine.borrow_mut().inhibit_shortcuts(&surface);
         } else {
-            PointerPolicy::Auto
+            confine.wayland_confine.borrow_mut().uninhibit_shortcuts();
         }
     }
 
@@ -488,6 +512,7 @@ impl Component for VmDisplayModel {
         use Message::*;
         match msg {
             SetInputCaptureMode(mode) => {
+                let prev_requested = self.requested_input_mode;
                 // Requested input capture mode
                 self.requested_input_mode = mode;
                 // Seamless mode requires absolute pointer; reject request and reset state if unavailable
@@ -501,6 +526,7 @@ impl Component for VmDisplayModel {
                         self.input.is_absolute,
                         self.input.capability
                     );
+                    self.requested_input_mode = prev_requested;
                     self.capture_state.release();
                     self.confine_state = None;
                     self.show_toast(RELATIVE_SEAMLESS_UNSUPPORTED_TOAST, sender.clone());
@@ -508,40 +534,50 @@ impl Component for VmDisplayModel {
                     return;
                 }
                 // Already in requested mode; skip
-                if self.current_input_policy() == mode {
+                if prev_requested == mode {
                     mks_debug!("Input capture mode already set to {mode:?}; ignoring duplicate request");
                     return;
                 }
                 // Mode mismatch requires transition
                 self.capture_state.release();
-                // Disconnect Wayland confine
-                if self.confine_state.take().is_some() {
+                // Leaving locked mode: release any active pointer confine and shortcut inhibition.
+                if mode == PointerPolicy::Auto {
+                    self.set_keyboard_shortcuts_inhibit(false);
+                    if let Some(confine) = self.confine_state.as_mut() {
+                        confine.wayland_confine.borrow_mut().unconfine();
+                    }
                     sender.input(UpdateCaptureView);
                     return;
                 }
-                // Mouse capability unavailable; cannot enter confined mode
+
+                // Entering locked mode requires Wayland confinement support and mouse capability.
                 if !self.input.capability.mouse {
-                    mks_error!("Mouse capability unavailable; cannot enter confined mode (keeping seamless mode)");
+                    mks_error!("Mouse capability unavailable; cannot enter locked mode");
+                    self.requested_input_mode = prev_requested;
                     return;
                 }
                 let Some(tx) = self.input.input_cmd_tx() else {
-                    mks_error!("Input command channel unavailable; cannot enter confined mode (keeping seamless mode)");
+                    mks_error!("Input command channel unavailable; cannot enter locked mode");
+                    self.requested_input_mode = prev_requested;
                     return;
                 };
-                let Some(confine) = ConfineState::connect_to_wayland(tx.clone()) else {
-                    mks_error!("Failed to connect to Wayland session; keeping seamless input mode");
-                    mks_debug!(
-                        "CONFINED_CAPTURE_UNAVAILABLE: capture_state={:?}, requested_input_mode={:?}, \
-                         confine_state.is_some()={}, capability={:?}",
-                        self.capture_state.current(),
-                        self.requested_input_mode,
-                        self.confine_state.is_some(),
-                        self.input.capability
-                    );
-                    self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
-                    return;
-                };
-                self.confine_state = Some(confine);
+                if self.confine_state.is_none() {
+                    let Some(confine) = ConfineState::connect_to_wayland(tx.clone()) else {
+                        mks_error!("Failed to connect to Wayland session; staying in auto mode");
+                        mks_debug!(
+                            "CONFINED_CAPTURE_UNAVAILABLE: capture_state={:?}, requested_input_mode={:?}, \
+                             confine_state.is_some()={}, capability={:?}",
+                            self.capture_state.current(),
+                            self.requested_input_mode,
+                            self.confine_state.is_some(),
+                            self.input.capability
+                        );
+                        self.requested_input_mode = prev_requested;
+                        self.show_toast(CONFINED_CAPTURE_UNAVAILABLE_TOAST, sender.clone());
+                        return;
+                    };
+                    self.confine_state = Some(confine);
+                }
                 sender.input(UpdateCaptureView);
             }
 
@@ -552,7 +588,7 @@ impl Component for VmDisplayModel {
 
             MouseMove { x, y } => {
                 // Seamless mode without absolute pointer support
-                if self.current_input_policy() == PointerPolicy::Auto && !self.input.is_absolute {
+                if self.effective_input_policy() == PointerPolicy::Auto && !self.input.is_absolute {
                     let had_capture = self.capture_state.should_forward();
                     self.capture_state.release();
                     if had_capture {
@@ -560,7 +596,7 @@ impl Component for VmDisplayModel {
                     }
                     return;
                 }
-                let current_mode = self.current_input_policy();
+                let current_mode = self.effective_input_policy();
                 let current_capture = self.capture_state.current();
                 let is_in_viewport = self.coord_system.is_in_viewport(x, y);
                 match (current_mode, current_capture, is_in_viewport) {
@@ -594,7 +630,7 @@ impl Component for VmDisplayModel {
             }
             // SetConfined event requires confine_state to be already created
             SetConfined(event) => {
-                let mode = self.current_input_policy();
+                let mode = self.effective_input_policy();
                 if mode != PointerPolicy::Locked {
                     mks_warn!("Ignore set-confined Event {event:?}");
                     // Only meaningful when pointer policy is locked
@@ -609,6 +645,7 @@ impl Component for VmDisplayModel {
                         mks_error!("Confined state unavailable while stopping pointer capture");
                         return;
                     };
+                    confine.wayland_confine.borrow_mut().uninhibit_shortcuts();
                     confine.wayland_confine.borrow_mut().unconfine();
                     mks_info!("Pointer confinement released");
                     sender.input(UpdateCaptureView);
@@ -639,6 +676,9 @@ impl Component for VmDisplayModel {
                     return;
                 }
                 self.capture_state.capture(mode);
+                if let Some(confine) = self.confine_state.as_mut() {
+                    confine.wayland_confine.borrow_mut().inhibit_shortcuts(&wl_surface);
+                }
                 self.show_toast(format!("Press {} to release mouse", self.grab_shortcut), sender.clone());
                 if self.input.is_absolute
                     && let Some((x, y)) = vm_coords
@@ -776,7 +816,7 @@ impl Component for VmDisplayModel {
             MouseModeChanged { is_absolute } => {
                 mks_info!("Guest mouse mode switched to {}", if is_absolute { "absolute" } else { "relative" });
                 self.input.set_mouse_mode(is_absolute);
-                if self.current_input_policy() == PointerPolicy::Locked && self.capture_state.should_forward() {
+                if self.effective_input_policy() == PointerPolicy::Locked && self.capture_state.should_forward() {
                     let widget_rect = self.confined_widget_rect();
                     let Some(proxy) = self.current_wayland_surface() else {
                         mks_error!("Failed to resolve wl_surface proxy; cannot reconfigure confined capture");
@@ -803,7 +843,7 @@ impl Component for VmDisplayModel {
                 }
                 if !is_absolute
                     && self.requested_input_mode == PointerPolicy::Auto
-                    && self.current_input_policy() == PointerPolicy::Auto
+                    && self.effective_input_policy() == PointerPolicy::Auto
                 {
                     let had_capture = self.capture_state.should_forward();
                     self.capture_state.release();
@@ -832,7 +872,13 @@ impl Component for VmDisplayModel {
         let was_forwarding_input = self.capture_state.should_forward();
         let sender_clone = sender.clone();
         self.update(message, sender, root);
-        if was_forwarding_input && !self.capture_state.should_forward() {
+        let now_forwarding_input = self.capture_state.should_forward();
+        if was_forwarding_input != now_forwarding_input {
+            // Exclusive keyboard behavior: Locked => active when captured, Auto => active when in viewport.
+            // We reuse the capture state machine's "should_forward" decision.
+            self.set_keyboard_shortcuts_inhibit(now_forwarding_input);
+        }
+        if was_forwarding_input && !now_forwarding_input {
             self.input.release_all_keys();
             self.input.release_all_mouse_buttons();
         }
