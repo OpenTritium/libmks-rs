@@ -632,7 +632,13 @@ impl Component for VmDisplayModel {
             SetConfined(event) => {
                 let mode = self.effective_input_policy();
                 if mode != PointerPolicy::Locked {
-                    mks_warn!("Ignore set-confined Event {event:?}");
+                    if self.requested_input_mode == PointerPolicy::Locked {
+                        // User asked for locked capture, but we cannot currently enter locked mode.
+                        mks_warn!("Ignore set-confined Event {event:?} (locked requested but unavailable)");
+                    } else {
+                        // In auto mode this message can be emitted unconditionally by the input controller.
+                        mks_trace!("Ignore set-confined Event {event:?} (not in locked mode)");
+                    }
                     // Only meaningful when pointer policy is locked
                     return;
                 }
