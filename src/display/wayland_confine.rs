@@ -47,6 +47,10 @@ pub struct WaylandState {
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
     shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     compositor: Option<WlCompositor>,
+    pointer_constraints_global: Option<u32>,
+    relative_pointer_manager_global: Option<u32>,
+    shortcuts_inhibit_manager_global: Option<u32>,
+    compositor_global: Option<u32>,
     seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
@@ -64,6 +68,10 @@ impl WaylandState {
             relative_pointer_manager: None,
             shortcuts_inhibit_manager: None,
             compositor: None,
+            pointer_constraints_global: None,
+            relative_pointer_manager_global: None,
+            shortcuts_inhibit_manager_global: None,
+            compositor_global: None,
             seat: None,
             pointer: None,
             shortcuts_inhibitor: None,
@@ -253,12 +261,15 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                 match interface.as_str() {
                     "zwp_pointer_constraints_v1" => {
                         state.pointer_constraints = Some(registry.bind(name, 1, qh, ()));
+                        state.pointer_constraints_global = Some(name);
                     }
                     "zwp_keyboard_shortcuts_inhibit_manager_v1" => {
                         state.shortcuts_inhibit_manager = Some(registry.bind(name, 1, qh, ()));
+                        state.shortcuts_inhibit_manager_global = Some(name);
                     }
                     "zwp_relative_pointer_manager_v1" => {
                         state.relative_pointer_manager = Some(registry.bind(name, 1, qh, ()));
+                        state.relative_pointer_manager_global = Some(name);
                     }
                     "wl_seat" => {
                         // Track a single seat for now; support replacement via GlobalRemove.
@@ -269,6 +280,7 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                     }
                     "wl_compositor" => {
                         state.compositor = Some(registry.bind(name, 1, qh, ()));
+                        state.compositor_global = Some(name);
                     }
                     _ => {}
                 }
@@ -282,6 +294,28 @@ impl Dispatch<WlRegistry, ()> for WaylandState {
                     state.pointer = None;
                     state.shortcuts_inhibitor = None;
                     state.pointer_capture = PointerCapture::None;
+                }
+                if state.pointer_constraints_global == Some(name) {
+                    mks_info!("Pointer-constraints global removed; disabling pointer confinement capabilities");
+                    state.pointer_constraints_global = None;
+                    state.pointer_constraints = None;
+                    state.pointer_capture = PointerCapture::None;
+                }
+                if state.relative_pointer_manager_global == Some(name) {
+                    mks_info!("Relative-pointer-manager global removed; disabling relative motion support");
+                    state.relative_pointer_manager_global = None;
+                    state.relative_pointer_manager = None;
+                }
+                if state.shortcuts_inhibit_manager_global == Some(name) {
+                    mks_info!("Keyboard-shortcuts-inhibit-manager global removed; disabling shortcut inhibition");
+                    state.shortcuts_inhibit_manager_global = None;
+                    state.shortcuts_inhibit_manager = None;
+                    state.shortcuts_inhibitor = None;
+                }
+                if state.compositor_global == Some(name) {
+                    mks_info!("Compositor global removed; clearing compositor handle");
+                    state.compositor_global = None;
+                    state.compositor = None;
                 }
             }
             _ => {}

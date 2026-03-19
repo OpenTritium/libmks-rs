@@ -219,31 +219,35 @@ impl VmDisplayModel {
     }
 
     fn set_keyboard_shortcuts_inhibit(&mut self, inhibit: bool) {
-        if inhibit {
-            let Some(surface) = self.current_wayland_surface() else {
-                mks_error!("Failed to resolve wl_surface proxy; cannot inhibit shortcuts");
-                return;
-            };
-            // Lazily connect to Wayland when we first need shortcut inhibition.
-            if self.confine_state.is_none() {
-                let Some(tx) = self.input.input_cmd_tx().cloned() else {
-                    mks_error!(
-                        "Input command channel unavailable; cannot connect to Wayland for shortcut inhibition"
-                    );
-                    return;
-                };
-                self.confine_state = ConfineState::connect_to_wayland(tx);
-            }
-            let Some(confine) = self.confine_state.as_mut() else {
-                return;
-            };
-            confine.wayland_confine.borrow_mut().inhibit_shortcuts(&surface);
-        } else {
+        if !inhibit {
             // No active confine session; nothing to uninhibit.
             let Some(confine) = self.confine_state.as_mut() else {
                 return;
             };
             confine.wayland_confine.borrow_mut().uninhibit_shortcuts();
+            return;
+        }
+        let Some(surface) = self.current_wayland_surface() else {
+            mks_error!("Failed to resolve wl_surface proxy; cannot inhibit shortcuts");
+            return;
+        };
+        // Lazily connect to Wayland when we first need shortcut inhibition.
+        if self.confine_state.is_none() {
+            let Some(tx) = self.input.input_cmd_tx().cloned() else {
+                mks_error!("Input command channel unavailable; cannot connect to Wayland for shortcut inhibition");
+                return;
+            };
+            self.confine_state = ConfineState::connect_to_wayland(tx);
+        }
+        let Some(confine) = self.confine_state.as_mut() else {
+            return;
+        };
+        let shortcuts_ok = confine.wayland_confine.borrow_mut().inhibit_shortcuts(&surface);
+        if !shortcuts_ok {
+            mks_warn!(
+                "Pointer confinement active but failed to inhibit keyboard shortcuts; host shortcuts may remain \
+                 available during locked capture"
+            );
         }
     }
 
@@ -305,9 +309,8 @@ impl VmDisplayModel {
     #[inline]
     fn show_confined_capture_unavailable_toast(&mut self, prefer_relative: bool, sender: &ComponentSender<Self>) {
         mks_debug!(
-            "show_confined_capture_unavailable_toast: prefer_relative={}, capture_state={:?}, \
+            "show_confined_capture_unavailable_toast: prefer_relative={prefer_relative}, capture_state={:?}, \
              requested_input_mode={:?}, confine_state.is_some()={}, capability={:?}",
-            prefer_relative,
             self.capture_state.current(),
             self.requested_input_mode,
             self.confine_state.is_some(),
@@ -636,12 +639,15 @@ impl Component for VmDisplayModel {
             SetConfined(event) => {
                 let mode = self.effective_input_policy();
                 if mode != PointerPolicy::Locked {
-                    if self.requested_input_mode == PointerPolicy::Locked {
-                        // User asked for locked capture, but we cannot currently enter locked mode.
-                        mks_warn!("Ignore set-confined Event {event:?} (locked requested but unavailable)");
-                    } else {
-                        // In auto mode this message can be emitted unconditionally by the input controller.
-                        mks_trace!("Ignore set-confined Event {event:?} (not in locked mode)");
+                    #[cfg(debug_assertions)]
+                    {
+                        if self.requested_input_mode == PointerPolicy::Locked {
+                            // User asked for locked capture, but we cannot currently enter locked mode.
+                            mks_warn!("Ignore set-confined Event {event:?} (locked requested but unavailable)");
+                        } else {
+                            // In auto mode this message can be emitted unconditionally by the input controller.
+                            mks_trace!("Ignore set-confined Event {event:?} (not in locked mode)");
+                        }
                     }
                     // Only meaningful when pointer policy is locked
                     return;
@@ -687,12 +693,11 @@ impl Component for VmDisplayModel {
                 }
                 self.capture_state.capture(mode);
                 if let Some(confine) = self.confine_state.as_mut() {
-                    let shortcuts_ok =
-                        confine.wayland_confine.borrow_mut().inhibit_shortcuts(&wl_surface);
+                    let shortcuts_ok = confine.wayland_confine.borrow_mut().inhibit_shortcuts(&wl_surface);
                     if !shortcuts_ok {
                         mks_warn!(
-                            "Pointer confinement active but failed to inhibit keyboard shortcuts; \
-                             host shortcuts may remain available during locked capture"
+                            "Pointer confinement active but failed to inhibit keyboard shortcuts; host shortcuts may \
+                             remain available during locked capture"
                         );
                     }
                 }
@@ -718,31 +723,29 @@ impl Component for VmDisplayModel {
                     }
                     self.coord_system.set_vm_resolution(w, h);
                     self.dirty_flags.merge(flags);
-
-                    // Pipelined VSync logic
-                    if flags.frame {
-                        // Valid frame: release pending ACK, allow QEMU to render 1 frame ahead
-                        self.pending_ack = ack;
-                        // Store new ACK, start 100ms watchdog timer
-                        if let Some(handle) = self.vsync_timer.take() {
-                            handle.abort();
-                        }
-                        let sender_timeout = sender.clone();
-                        self.vsync_timer = Some(
-                            relm4::spawn(async move {
-                                sleep(Duration::from_millis(100)).await;
-                                sender_timeout.input(Message::VsyncTimeout);
-                            })
-                            .abort_handle(),
-                        );
-                    } else {
-                        // Invalid frame: release immediately, don't block pipeline
+                    // Invalid frame: release immediately, don't block pipeline
+                    if !flags.frame {
                         // Also cancel watchdog for invalid frames (Problem 1: race condition)
                         ack.ack(); // Drop will auto-ack if already None
                         if let Some(handle) = self.vsync_timer.take() {
                             handle.abort();
                         }
+                        return;
                     }
+                    // Valid frame: release pending ACK, allow QEMU to render 1 frame ahead
+                    self.pending_ack = ack;
+                    // Store new ACK, start 100ms watchdog timer
+                    if let Some(handle) = self.vsync_timer.take() {
+                        handle.abort();
+                    }
+                    let sender_timeout = sender.clone();
+                    self.vsync_timer = Some(
+                        relm4::spawn(async move {
+                            sleep(Duration::from_millis(100)).await;
+                            sender_timeout.input(Message::VsyncTimeout);
+                        })
+                        .abort_handle(),
+                    );
                 }
                 Err(e) => {
                     // Error case: cancel watchdog (Problem 1) as the interaction is complete
@@ -774,9 +777,9 @@ impl Component for VmDisplayModel {
                 self.scaling_mode = mode;
                 // Scaling mode change triggers VM resolution update
                 if mode == ScalingMode::ResizeGuest
-                    && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
+                    && let Some((w, h)) = self.coord_system.physical_canvas_size()
                 {
-                    self.reset_resize_timer(w_nz, h_nz);
+                    self.reset_resize_timer(w, h);
                 }
             }
 
@@ -789,9 +792,9 @@ impl Component for VmDisplayModel {
                 }
                 self.dirty_flags.set_frame_and_cursor_dirty();
                 if self.scaling_mode == ScalingMode::ResizeGuest
-                    && let Some((w_nz, h_nz)) = self.coord_system.physical_canvas_size()
+                    && let Some((w, h)) = self.coord_system.physical_canvas_size()
                 {
-                    self.reset_resize_timer(w_nz, h_nz);
+                    self.reset_resize_timer(w, h);
                 }
             }
 

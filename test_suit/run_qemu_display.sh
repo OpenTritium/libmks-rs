@@ -54,8 +54,24 @@ esac
 
 # 网络逻辑
 if [[ "$NET" == "passt-vhost" ]]; then
-    passt --vhost-user -1 -t none -u none -s /tmp/vm_net_$$.socket & PASST_PID=$!
-    ARGS+=("-chardev" "socket,id=net0,path=/tmp/vm_net_$$.socket" "-netdev" "vhost-user,id=net0,chardev=net0" "-device" "virtio-net-pci,netdev=net0")
+    SOCKET_PATH="/tmp/vm_net_$$.socket"
+    passt --vhost-user -1 -t none -u none -s "$SOCKET_PATH" & PASST_PID=$!
+    # 等待 Unix socket 就绪，避免 QEMU 在 socket 尚未创建时启动失败。
+    for _ in {1..50}; do
+        if [[ -S "$SOCKET_PATH" ]]; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ ! -S "$SOCKET_PATH" ]]; then
+        echo "passt socket not available at $SOCKET_PATH; aborting" >&2
+        exit 1
+    fi
+    ARGS+=(
+        "-chardev" "socket,id=net0,path=$SOCKET_PATH"
+        "-netdev" "vhost-user,id=net0,chardev=net0"
+        "-device" "virtio-net-pci,netdev=net0"
+    )
 else
     ARGS+=("-netdev" "user,id=net0" "-device" "virtio-net-pci,netdev=net0")
 fi
