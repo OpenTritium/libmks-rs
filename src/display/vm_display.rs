@@ -245,8 +245,8 @@ impl VmDisplayModel {
         let shortcuts_ok = confine.wayland_confine.borrow_mut().inhibit_shortcuts(&surface);
         if !shortcuts_ok {
             mks_warn!(
-                "Pointer confinement active but failed to inhibit keyboard shortcuts; host shortcuts may remain \
-                 available during locked capture"
+                "Pointer capture active but failed to inhibit keyboard shortcuts; host shortcuts may remain available \
+                 during VM capture"
             );
         }
     }
@@ -889,17 +889,15 @@ impl Component for VmDisplayModel {
             toast.set_timeout(TOAST_DURATION_SECS);
             widgets.toast_overlay.add_toast(toast);
         }
-        let prev_policy = self.effective_input_policy();
         let was_forwarding_input = self.capture_state.should_forward();
         let sender_clone = sender.clone();
         self.update(message, sender, root);
         let now_forwarding_input = self.capture_state.should_forward();
-        let next_policy = self.effective_input_policy();
-        let prev_inhibit = prev_policy == PointerPolicy::Locked && was_forwarding_input;
-        let next_inhibit = next_policy == PointerPolicy::Locked && now_forwarding_input;
+        let prev_inhibit = was_forwarding_input;
+        let next_inhibit = now_forwarding_input;
         if prev_inhibit != next_inhibit {
-            // Exclusive keyboard behavior: only inhibit host shortcuts when in locked mode
-            // and the pointer is actively captured.
+            // Exclusive keyboard behavior: inhibit host shortcuts whenever the VM
+            // has active pointer capture, regardless of the current pointer policy.
             self.set_keyboard_shortcuts_inhibit(next_inhibit);
         }
         if was_forwarding_input && !now_forwarding_input {
